@@ -6,8 +6,10 @@ the core has no dependencies, and `task_asio.hh` binds it to standalone Asio.
 ## What it is
 
 - `task::task<T>`: a lazy coroutine. Awaiting it runs it and resumes the awaiter
-  through symmetric transfer, so chains of synchronous completions run in constant
-  stack. When a task finishes on a different scheduler than its awaiter's, the
+  without growing the stack, so chains of synchronous completions run in constant
+  stack on every compiler and optimization level: symmetric transfer on Clang, a
+  per-thread trampoline on GCC (whose tail calls disappear at `-O0`/`-O1` and under
+  sanitizers). When a task finishes on a different scheduler than its awaiter's, the
   awaiter is posted back to its own scheduler (executor affinity).
 - Schedulers: anything with `post(handle)` and `now()`, optionally
   `post_demoted(handle)`. The library owns no run queue; the host's loop is the
@@ -59,8 +61,14 @@ Intel i9-9980HK, macOS, Apple clang `-O3`:
 
 | Measurement | Result |
 |---|---:|
-| Create, await, and destroy a no-op task | 17.9 ns, 0 allocations |
-| Yield to resume through `asio_scheduler`, idle loop | p50 123 ns, p99 175 ns |
+| Create, await, and destroy a no-op task (macOS, Apple clang) | 17.9 ns, 0 allocations |
+| Same, Linux VM, Clang 18 (symmetric transfer) | 15.3 ns |
+| Same, Linux VM, GCC 13 (trampoline) | 21.5 ns |
+| Same, Linux VM, GCC 13 with `TASK_SYMMETRIC_TRANSFER=1` | 13.9 ns |
+| Yield to resume through `asio_scheduler`, idle loop (macOS) | p50 123 ns, p99 175 ns |
+
+`TASK_SYMMETRIC_TRANSFER=1` is safe on GCC only for optimized builds without
+sanitizers.
 
 `bench/bench.cc` reproduces both, counting allocations with a global `operator new`.
 
@@ -78,6 +86,9 @@ threads, budget demotion (two busy tasks interleave), cancellation at a checkpoi
 `TASK_ASIO=OFF` builds the core without fetching Asio.
 
 ## Limits
+
+- Constant stack under GCC comes from the trampoline, which costs about 8 ns per
+  transfer over symmetric transfer.
 
 - A frame freed on another thread joins that thread's pool; memory migrates with the
   work rather than returning home.

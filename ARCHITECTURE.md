@@ -10,6 +10,17 @@ keeps chains in constant stack. Otherwise it posts the continuation to the await
 scheduler and returns `noop_coroutine()`. Values and exceptions are stored in the
 promise and delivered by `await_resume`.
 
+## Transfers
+
+Constant stack for chains of synchronous completions needs every resume-by-return to
+become a tail call. Clang guarantees it; GCC emits it only when optimizing without
+sanitizers, and otherwise recurses until the stack overflows. `detail::transfer(h)`
+hides the difference: with `TASK_SYMMETRIC_TRANSFER` (the default on Clang) it returns
+`h`; without it, it appends `h` to a per-thread queue and either returns to the loop
+already draining that queue or becomes that loop, resuming queued handles one after
+another. A queue rather than a single slot is needed because `when_all` resumes
+several children from one `await_suspend`.
+
 ## Schedulers
 
 `scheduler_ref` erases a scheduler to its address plus two function pointers

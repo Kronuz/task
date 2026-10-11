@@ -199,6 +199,55 @@ struct pooled_frame {
 }  // namespace detail
 
 // ---------------------------------------------------------------------------------------------
+// Transfers between coroutines
+
+// Symmetric transfer keeps chains of synchronous completions in constant stack only when
+// the compiler turns the resume into a tail call. Clang always does; GCC does only when
+// optimizing without sanitizers. Elsewhere, transfers go through a per-thread trampoline
+// that resumes queued handles in a loop instead of recursing.
+#ifndef TASK_SYMMETRIC_TRANSFER
+#if defined(__clang__)
+#define TASK_SYMMETRIC_TRANSFER 1
+#else
+#define TASK_SYMMETRIC_TRANSFER 0
+#endif
+#endif
+
+namespace detail {
+
+#if !TASK_SYMMETRIC_TRANSFER
+struct trampoline {
+	std::vector<std::coroutine_handle<>> queue;
+	std::size_t head = 0;
+	bool active = false;
+};
+
+inline trampoline& local_trampoline() {
+	thread_local trampoline t;
+	return t;
+}
+#endif
+
+// What an await_suspend returns to continue with h without growing the stack.
+inline std::coroutine_handle<> transfer(std::coroutine_handle<> h) {
+#if TASK_SYMMETRIC_TRANSFER
+	return h;
+#else
+	trampoline& t = local_trampoline();
+	t.queue.push_back(h);
+	if (t.active) { return std::noop_coroutine(); }  // the running loop resumes it
+	t.active = true;
+	while (t.head < t.queue.size()) { t.queue[t.head++].resume(); }
+	t.queue.clear();
+	t.head = 0;
+	t.active = false;
+	return std::noop_coroutine();
+#endif
+}
+
+}  // namespace detail
+
+// ---------------------------------------------------------------------------------------------
 // task<T>
 
 template <typename T = void>
@@ -220,7 +269,7 @@ struct promise_base : pooled_frame {
 			promise_base& p = h.promise();
 			if (!p.continuation) { return std::noop_coroutine(); }
 			// Same scheduler (or none recorded): transfer directly; otherwise go home first.
-			if (!p.continuation_scheduler || p.continuation_scheduler == current()) { return p.continuation; }
+			if (!p.continuation_scheduler || p.continuation_scheduler == current()) { return transfer(p.continuation); }
 			p.continuation_scheduler.post(p.continuation);
 			return std::noop_coroutine();
 		}
@@ -287,7 +336,7 @@ public:
 			std::coroutine_handle<> await_suspend(std::coroutine_handle<> awaiting) noexcept {
 				h.promise().continuation = awaiting;
 				h.promise().continuation_scheduler = current();
-				return h;
+				return detail::transfer(h);
 			}
 			T await_resume() { return h.promise().take(); }
 		};
@@ -507,7 +556,7 @@ struct when_all_child {
 			std::coroutine_handle<> await_suspend(std::coroutine_handle<promise_type> h) noexcept {
 				when_all_state* s = h.promise().state;
 				h.destroy();
-				if (s->pending.fetch_sub(1, std::memory_order_acq_rel) == 1) { return s->parent; }
+				if (s->pending.fetch_sub(1, std::memory_order_acq_rel) == 1) { return transfer(s->parent); }
 				return std::noop_coroutine();
 			}
 			void await_resume() noexcept {}
