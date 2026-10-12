@@ -460,7 +460,8 @@ inline std::uint64_t read() noexcept {
 #endif
 }
 
-// Counter ticks per nanosecond, measured against steady_clock over about 2 ms.
+// Counter ticks per nanosecond, measured against steady_clock over about 2 ms on first
+// use. Hosts call calibrate() at startup so no event loop pays that wait.
 inline double per_ns() {
 	static const double ratio = [] {
 		auto t0 = std::chrono::steady_clock::now();
@@ -472,6 +473,8 @@ inline double per_ns() {
 	}();
 	return ratio;
 }
+
+inline void calibrate() { (void)per_ns(); }
 
 }  // namespace cycles
 

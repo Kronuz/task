@@ -123,8 +123,24 @@ task::task<int> cancellable(task::cancel_token token, int* progress) {
 	}
 }
 
+// A child that yields is later resumed by the scheduler, not from inside a transfer; its
+// completion then starts the transfer loop, and the awaiter destroys the child's frame
+// (the temporary task) from inside that loop. ASan checks nothing touches the frame after.
+task::task<int> yields_then_returns(int v) {
+	co_await task::yield();
+	co_return v;
+}
+
+task::task<int> awaits_temporaries(int n) {
+	int sum = 0;
+	for (int i = 0; i < n; ++i) { sum += co_await yields_then_returns(i); }
+	co_return sum;
+}
+
 int main(int argc, char** argv) {
+	task::cycles::calibrate();
 	task::inline_scheduler s;
+	CHECK(task::run(s, awaits_temporaries(1000)) == 499500);
 
 	// Values, void, exceptions, nesting.
 	CHECK(task::run(s, answer()) == 42);

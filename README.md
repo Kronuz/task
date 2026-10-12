@@ -20,6 +20,8 @@ the core has no dependencies, and `task_asio.hh` binds it to standalone Asio.
   spent, the coroutine requeues as demoted, so a long computation cannot hold a loop
   for more than one slice. Checkpoints also observe a `cancel_token` and throw
   `task::cancelled`.
+- `cycles::calibrate()` measures the cycle counter once; call it at startup so the first
+  budget does not busy-wait 2 ms on an event loop.
 - `yield()`, `schedule_on{s}`, `when_all(...)` (variadic and vectors), `spawn`, and
   `run` (drive a task to completion on an `inline_scheduler`).
 - Frames come from per-thread size-class pools: after warm-up a task allocates
