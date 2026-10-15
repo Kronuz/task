@@ -1,5 +1,7 @@
 # task
 
+[![CI](https://github.com/Kronuz/task/actions/workflows/ci.yml/badge.svg)](https://github.com/Kronuz/task/actions/workflows/ci.yml)
+
 C++20 coroutine tasks for code that runs on someone else's event loop. Header-only;
 the core has no dependencies, and `task_asio.hh` binds it to standalone Asio.
 
