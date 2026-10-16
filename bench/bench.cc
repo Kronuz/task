@@ -16,7 +16,20 @@
 #include <asio/io_context.hpp>
 #endif
 
+// TSan's runtime replaces operator new itself, so its builds cannot count allocations.
+#if defined(__SANITIZE_THREAD__)
+#define TASK_COUNTS_ALLOCATIONS 0
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define TASK_COUNTS_ALLOCATIONS 0
+#endif
+#endif
+#ifndef TASK_COUNTS_ALLOCATIONS
+#define TASK_COUNTS_ALLOCATIONS 1
+#endif
+
 static std::size_t allocations = 0;
+#if TASK_COUNTS_ALLOCATIONS
 void* operator new(std::size_t n) {
 	++allocations;
 	if (void* p = std::malloc(n ? n : 1)) { return p; }
@@ -24,6 +37,7 @@ void* operator new(std::size_t n) {
 }
 void operator delete(void* p) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+#endif
 
 task::task<int> noop() { co_return 1; }
 
@@ -48,7 +62,11 @@ int main() {
 		if (sum != n) { return 1; }
 		best = std::min(best, ns);
 	}
-	std::printf("no-op task create+await+destroy: %.2f ns, %zu allocations for %ld tasks (outer task and run scaffolding included)\n", best, allocs, n);
+	if (TASK_COUNTS_ALLOCATIONS) {
+		std::printf("no-op task create+await+destroy: %.2f ns, %zu allocations for %ld tasks (outer task and run scaffolding included)\n", best, allocs, n);
+	} else {
+		std::printf("no-op task create+await+destroy: %.2f ns (allocations not counted under TSan)\n", best);
+	}
 
 #if TASK_BENCH_ASIO
 	asio::io_context io;
