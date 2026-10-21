@@ -178,7 +178,12 @@ struct sentinel {
 	std::atomic<bool>* destroyed;
 	sentinel(std::atomic<bool>* d) : destroyed(d) {}
 	sentinel(sentinel&& o) noexcept : destroyed(std::exchange(o.destroyed, nullptr)) {}
-	~sentinel() { if (destroyed) { destroyed->store(true); } }
+	~sentinel() {
+		if (destroyed) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));  // widens the window a late destroy would lose
+			destroyed->store(true);
+		}
+	}
 };
 task::task<int> hop_holding(task::scheduler_ref where, sentinel) {
 	co_await task::schedule_on{where};
@@ -311,7 +316,7 @@ int main(int argc, char** argv) {
 		CHECK(was_cancelled);
 
 		// The task's frame is gone by the time the caller wakes.
-		for (int i = 0; i < 200; ++i) {
+		for (int i = 0; i < 20; ++i) {
 			std::atomic<bool> destroyed{false};
 			CHECK(task::sync_wait(hop_holding(w, sentinel(&destroyed))) == 9);
 			CHECK(destroyed.load());
