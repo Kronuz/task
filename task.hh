@@ -34,12 +34,14 @@
 #include <atomic>
 #include <chrono>
 #include <concepts>
+#include <condition_variable>
 #include <coroutine>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <exception>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <optional>
 #include <tuple>
@@ -113,6 +115,13 @@ private:
 	scheduler_ref previous_;
 };
 
+class inline_scheduler;
+
+namespace detail {
+// The inline_scheduler whose run() is draining on this thread, if any.
+inline thread_local inline_scheduler* draining_scheduler = nullptr;
+}
+
 // A deterministic single-threaded scheduler: FIFO, demoted handles only when nothing
 // else is ready, and a manual clock. For tests and simulation.
 class inline_scheduler {
@@ -125,6 +134,11 @@ public:
 	// Runs until no handle is queued; returns how many ran.
 	std::size_t run() {
 		running_on scope(scheduler_ref::of(*this));
+		struct mark {
+			inline_scheduler* previous = detail::draining_scheduler;
+			~mark() { detail::draining_scheduler = previous; }
+		} marker;
+		detail::draining_scheduler = this;
 		std::size_t n = 0;
 		while (!ready_.empty() || !demoted_.empty()) {
 			auto& queue = ready_.empty() ? demoted_ : ready_;
@@ -421,6 +435,66 @@ T run(inline_scheduler& s, task<T> t) {
 		if (error) { std::rethrow_exception(error); }
 		return std::move(*result);
 	}
+}
+
+// Blocks the calling thread until t completes on whatever scheduler it resumes on, then
+// returns its value or rethrows its exception. It must never run on a thread the awaited
+// work needs (a reactor, or a pool's only worker): that deadlocks. t starts on the calling
+// thread with no current scheduler, so it resumes its awaiter wherever it finishes; when
+// the caller is draining an inline_scheduler, that scheduler is drained before blocking.
+template <typename T>
+T sync_wait(task<T> t) {
+	using result = std::conditional_t<std::is_void_v<T>, std::monostate, T>;
+	struct state {
+		std::mutex mutex;
+		std::condition_variable cv;
+		bool done = false;
+		std::exception_ptr error;
+		std::optional<result> value;
+	} st;
+	auto drive = [](task<T> work, state& s) -> detail::detached {
+		std::exception_ptr e;
+		std::optional<result> v;
+		try {
+			task<T> mine = std::move(work);  // destroyed before the caller wakes
+			if constexpr (std::is_void_v<T>) {
+				co_await std::move(mine);
+				v.emplace();
+			} else {
+				v.emplace(co_await std::move(mine));
+			}
+		} catch (...) {
+			e = std::current_exception();
+		}
+		std::lock_guard lock(s.mutex);
+		s.error = std::move(e);
+		s.value = std::move(v);
+		s.done = true;
+		s.cv.notify_one();
+	};
+	{
+#if !TASK_SYMMETRIC_TRANSFER
+		// Inside a trampoline loop, a transfer only queues; run this one on a fresh loop.
+		detail::trampoline outer;
+		detail::trampoline& local = detail::local_trampoline();
+		const bool nested = local.active;
+		if (nested) { std::swap(local, outer); }
+		struct restore {
+			detail::trampoline& local;
+			detail::trampoline& outer;
+			bool nested;
+			~restore() { if (nested) { std::swap(local, outer); } }
+		} guard{local, outer, nested};
+#endif
+		auto d = drive(std::move(t), st);
+		running_on scope{scheduler_ref{}};
+		d.h.resume();  // d may already be gone when this returns
+		if (auto* s = detail::draining_scheduler) { s->run(); }
+	}
+	std::unique_lock lock(st.mutex);
+	st.cv.wait(lock, [&] { return st.done; });
+	if (st.error) { std::rethrow_exception(st.error); }
+	if constexpr (!std::is_void_v<T>) { return std::move(*st.value); }
 }
 
 // ---------------------------------------------------------------------------------------------
