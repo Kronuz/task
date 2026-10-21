@@ -48,6 +48,13 @@ task::inline_scheduler s;
 int total = task::run(s, score(docs, {}));
 ```
 
+From a plain thread, blocking until the task finishes wherever it runs (never on a thread
+the task's work needs, such as a reactor loop):
+
+```cpp
+int total = task::sync_wait(score(docs, {}));
+```
+
 From Asio:
 
 ```cpp

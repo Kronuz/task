@@ -1,8 +1,10 @@
 // task: values and exceptions, symmetric transfer in constant stack, executor affinity
 // (single- and multi-threaded), budgets and demotion, cancellation, when_all, and a
-// randomized cancellation stress run (argv[1] tasks, default 1,000,000).
+// sync_wait (threads, ordering, restore, pool bound), and a randomized cancellation stress run (argv[1] tasks, default 1,000,000).
 #include "task.hh"
 
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -137,6 +139,106 @@ task::task<int> awaits_temporaries(int n) {
 	co_return sum;
 }
 
+// Helpers for sync_wait: hop to a scheduler, then work there.
+task::task<std::thread::id> hop_id(task::scheduler_ref where) {
+	co_await task::schedule_on{where};
+	co_await task::yield();
+	co_return std::this_thread::get_id();
+}
+task::task<int> hop_value(task::scheduler_ref where, int n) {
+	co_await task::schedule_on{where};
+	int sum = 0;
+	for (int i = 0; i < n; ++i) {
+		co_await task::yield();
+		sum += i;
+	}
+	co_return sum;
+}
+task::task<void> hop_void(task::scheduler_ref where, std::atomic<int>* ran) {
+	co_await task::schedule_on{where};
+	++*ran;
+}
+task::task<int> hop_fail(task::scheduler_ref where) {
+	co_await task::schedule_on{where};
+	throw std::runtime_error("worker boom");
+	co_return 0;
+}
+task::task<int> hop_until_cancelled(task::scheduler_ref where, task::cancel_token token) {
+	co_await task::schedule_on{where};
+	task::budget b(std::chrono::seconds(10), token);
+	int n = 0;
+	for (;;) {
+		co_await task::yield();
+		co_await b.checkpoint();
+		++n;
+	}
+	co_return n;
+}
+struct sentinel {
+	std::atomic<bool>* destroyed;
+	sentinel(std::atomic<bool>* d) : destroyed(d) {}
+	sentinel(sentinel&& o) noexcept : destroyed(std::exchange(o.destroyed, nullptr)) {}
+	~sentinel() {
+		if (destroyed) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));  // widens the window a late destroy would lose
+			destroyed->store(true);
+		}
+	}
+};
+task::task<int> hop_holding(task::scheduler_ref where, sentinel) {
+	co_await task::schedule_on{where};
+	co_return 9;
+}
+task::task<int> sync_inside(task::scheduler_ref where) { co_return task::sync_wait(hop_value(where, 10)); }
+
+// Calls sync_wait and records whether the caller's current scheduler survived it.
+task::task<void> restores_current(task::scheduler_ref where, bool* restored) {
+	auto before = task::current();
+	task::sync_wait(hop_value(where, 3));
+	*restored = bool(before) && task::current() == before;
+	co_return;
+}
+
+// Appends to a trace around a sync_wait of work that is already done or hops to `where`.
+task::task<void> traced_sync(std::vector<std::string>* trace, task::scheduler_ref where, bool hop) {
+	trace->push_back("A:before");
+	if (hop) { task::sync_wait(hop_value(where, 1)); } else { task::sync_wait(answer()); }
+	trace->push_back("A:after");
+	co_return;
+}
+task::task<void> traced(std::vector<std::string>* trace, const char* name) {
+	trace->push_back(name);
+	co_return;
+}
+
+// Results that are move-constructible only, and moves that throw.
+struct pinned {
+	int value;
+	int& ref;
+	pinned(int v, int& r) : value(v), ref(r) {}
+	pinned(pinned&&) = default;  // not move-assignable: reference member
+};
+task::task<pinned> make_pinned(int& r) { co_return pinned(5, r); }
+
+inline int move_budget = -1;  // the move constructor that makes this reach zero throws
+struct shaky {
+	int value = 0;
+	explicit shaky(int v) : value(v) {}
+	shaky(shaky&& o) : value(o.value) {
+		if (move_budget >= 0 && move_budget-- == 0) { throw std::runtime_error("move"); }
+	}
+};
+task::task<shaky> make_shaky(task::scheduler_ref where) {
+	co_await task::schedule_on{where};
+	co_return shaky(3);
+}
+
+// Frames allocated here and freed on `where`'s thread; reports that thread's cached frames.
+task::task<std::size_t> worker_cached(task::scheduler_ref where) {
+	co_await task::schedule_on{where};
+	co_return task::detail::pool().cached();
+}
+
 int main(int argc, char** argv) {
 	task::cycles::calibrate();
 	task::inline_scheduler s;
@@ -227,6 +329,123 @@ int main(int argc, char** argv) {
 		try { task::run(s, task::when_all(answer(), fails())); } catch (const std::runtime_error&) { caught = true; }
 		CHECK(caught);
 		CHECK(task::run(s, task::when_all(std::vector<task::task<int>>{})).empty());
+	}
+
+	// sync_wait: blocks the caller until a task finishes on another thread.
+	{
+		thread_scheduler worker;
+		auto w = task::scheduler_ref::of(worker);
+		CHECK(task::sync_wait(hop_id(w)) == worker.id());
+		CHECK(task::sync_wait(hop_value(w, 100)) == 4950);
+		CHECK(task::sync_wait(answer()) == 42);  // completes synchronously
+		task::sync_wait(nothing());
+		std::atomic<int> ran{0};
+		task::sync_wait(hop_void(w, &ran));
+		CHECK(ran == 1);
+
+		bool caught = false;
+		try { task::sync_wait(hop_fail(w)); } catch (const std::runtime_error& e) { caught = std::string(e.what()) == "worker boom"; }
+		CHECK(caught);
+		caught = false;
+		try { task::sync_wait(fails()); } catch (const std::runtime_error&) { caught = true; }
+		CHECK(caught);
+
+		// Cancellation requested from another thread is observed on the worker and rethrown.
+		task::cancel_source source;
+		std::thread canceller([&] {
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+			source.request();
+		});
+		bool was_cancelled = false;
+		try { task::sync_wait(hop_until_cancelled(w, source.token())); } catch (const task::cancelled&) { was_cancelled = true; }
+		canceller.join();
+		CHECK(was_cancelled);
+
+		// The task's frame is gone by the time the caller wakes.
+		for (int i = 0; i < 20; ++i) {
+			std::atomic<bool> destroyed{false};
+			CHECK(task::sync_wait(hop_holding(w, sentinel(&destroyed))) == 9);
+			CHECK(destroyed.load());
+		}
+
+		// A caller that is itself inside a scheduler still waits for another one.
+		{
+			thread_scheduler home;
+			CHECK(task::sync_wait(sync_inside(w)) == 45);
+			std::promise<int> done;
+			task::spawn(task::scheduler_ref::of(home), sync_inside(w),
+				[&](std::exception_ptr, std::optional<int> v) { done.set_value(v.value_or(-1)); });
+			CHECK(done.get_future().get() == 45);
+		}
+
+		// Concurrent waiters (TSan).
+		std::vector<std::thread> callers;
+		std::atomic<int> total{0};
+		for (int c = 0; c < 4; ++c) {
+			callers.emplace_back([&] {
+				for (int i = 0; i < 500; ++i) { total += task::sync_wait(hop_value(w, 3)); }
+			});
+		}
+		for (auto& t : callers) { t.join(); }
+		CHECK(total == 4 * 500 * 3);
+	}
+
+	// sync_wait on a thread that is draining an inline_scheduler drains it instead of deadlocking.
+	{
+		task::inline_scheduler inl;
+		auto r = task::scheduler_ref::of(inl);
+		CHECK(task::run(inl, sync_inside(r)) == 45);
+
+		// The caller's current scheduler is restored, on a worker and under an inline run().
+		bool restored = false;
+		task::run(inl, restores_current(r, &restored));
+		CHECK(restored);
+		CHECK(!task::current());
+		thread_scheduler worker, home;
+		restored = false;
+		std::promise<void> done;
+		task::spawn(task::scheduler_ref::of(home), restores_current(task::scheduler_ref::of(worker), &restored),
+			[&](std::exception_ptr) { done.set_value(); });
+		done.get_future().get();
+		CHECK(restored);
+
+		// A task that is already done leaves queued work alone: FIFO order holds.
+		std::vector<std::string> trace;
+		task::spawn(r, traced_sync(&trace, r, false));
+		task::spawn(r, traced(&trace, "B"));
+		task::spawn(r, traced(&trace, "C"));
+		inl.run();
+		CHECK((trace == std::vector<std::string>{"A:before", "A:after", "B", "C"}));
+
+		// One that hops to the same scheduler waits behind B and C only, not work queued after it.
+		trace.clear();
+		task::spawn(r, traced_sync(&trace, r, true));
+		task::spawn(r, traced(&trace, "B"));
+		task::spawn(r, traced(&trace, "C"));
+		inl.run();
+		CHECK((trace == std::vector<std::string>{"A:before", "B", "C", "A:after"}));
+	}
+
+	// sync_wait needs only move-constructible results, and a throwing move reaches the caller.
+	{
+		int x = 1;
+		CHECK(task::sync_wait(make_pinned(x)).value == 5);
+		thread_scheduler worker;
+		int thrown = 0;
+		for (int n = 0; n < 8; ++n) {
+			move_budget = n;
+			try { CHECK(task::sync_wait(make_shaky(task::scheduler_ref::of(worker))).value == 3); } catch (const std::runtime_error&) { ++thrown; }
+		}
+		move_budget = -1;
+		CHECK(thrown >= 3);
+	}
+
+	// Frames freed on another thread cannot pile up without bound in its pool.
+	{
+		thread_scheduler worker;
+		auto w = task::scheduler_ref::of(worker);
+		for (int i = 0; i < 20000; ++i) { task::sync_wait(hop_value(w, 1)); }
+		CHECK(task::sync_wait(worker_cached(w)) <= 4 * task::detail::frame_pool::cap);
 	}
 
 	// Stress: many tasks with random yields and random cancellation, all accounted for.
