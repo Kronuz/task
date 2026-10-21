@@ -133,6 +133,12 @@ public:
 
 	// Runs until no handle is queued; returns how many ran.
 	std::size_t run() {
+		return run_until([] { return false; });
+	}
+
+	// Like run(), but stops as soon as stop() is true, checked before each handle.
+	template <typename P>
+	std::size_t run_until(P&& stop) {
 		running_on scope(scheduler_ref::of(*this));
 		struct mark {
 			inline_scheduler* previous = detail::draining_scheduler;
@@ -140,7 +146,7 @@ public:
 		} marker;
 		detail::draining_scheduler = this;
 		std::size_t n = 0;
-		while (!ready_.empty() || !demoted_.empty()) {
+		while (!stop() && (!ready_.empty() || !demoted_.empty())) {
 			auto& queue = ready_.empty() ? demoted_ : ready_;
 			auto h = queue.front();
 			queue.pop_front();
@@ -163,10 +169,11 @@ private:
 namespace detail {
 
 // Per-thread free lists in 64-byte size classes up to 2 KiB; larger frames use operator new.
-// A frame freed on another thread joins that thread's lists.
+// A frame freed on another thread joins that thread's lists, each class holding at most
+// `cap` frames so one-way cross-thread flows cannot grow a list without bound.
 class frame_pool {
 public:
-	static constexpr std::size_t granularity = 64, classes = 32;
+	static constexpr std::size_t granularity = 64, classes = 32, cap = 1024;
 
 	~frame_pool() {
 		for (auto*& head : free_) {
@@ -179,6 +186,7 @@ public:
 		if (c > classes) { return ::operator new(n); }
 		if (node* p = free_[c - 1]) {
 			free_[c - 1] = p->next;
+			--count_[c - 1];
 			return p;
 		}
 		return ::operator new(c * granularity);
@@ -190,14 +198,27 @@ public:
 			::operator delete(p);
 			return;
 		}
+		if (count_[c - 1] >= cap) {
+			::operator delete(p);
+			return;
+		}
 		auto* f = static_cast<node*>(p);
 		f->next = free_[c - 1];
 		free_[c - 1] = f;
+		++count_[c - 1];
+	}
+
+	// Frames held across all classes.
+	std::size_t cached() const noexcept {
+		std::size_t n = 0;
+		for (auto c : count_) { n += c; }
+		return n;
 	}
 
 private:
 	struct node { node* next; };
 	node* free_[classes] = {};
+	std::uint32_t count_[classes] = {};
 };
 
 inline frame_pool& pool() {
@@ -441,7 +462,8 @@ T run(inline_scheduler& s, task<T> t) {
 // returns its value or rethrows its exception. It must never run on a thread the awaited
 // work needs (a reactor, or a pool's only worker): that deadlocks. t starts on the calling
 // thread with no current scheduler, so it resumes its awaiter wherever it finishes; when
-// the caller is draining an inline_scheduler, that scheduler is drained before blocking.
+// the caller is draining an inline_scheduler, only that scheduler is run (queued handles
+// ahead of the task, nested, until it finishes). T needs only to be move-constructible.
 template <typename T>
 T sync_wait(task<T> t) {
 	using result = std::conditional_t<std::is_void_v<T>, std::monostate, T>;
@@ -453,22 +475,19 @@ T sync_wait(task<T> t) {
 		std::optional<result> value;
 	} st;
 	auto drive = [](task<T> work, state& s) -> detail::detached {
-		std::exception_ptr e;
-		std::optional<result> v;
 		try {
 			task<T> mine = std::move(work);  // destroyed before the caller wakes
 			if constexpr (std::is_void_v<T>) {
 				co_await std::move(mine);
-				v.emplace();
+				s.value.emplace();
 			} else {
-				v.emplace(co_await std::move(mine));
+				s.value.emplace(co_await std::move(mine));
 			}
 		} catch (...) {
-			e = std::current_exception();
+			s.error = std::current_exception();
 		}
+		// Only the caller reads error and value, after taking this lock.
 		std::lock_guard lock(s.mutex);
-		s.error = std::move(e);
-		s.value = std::move(v);
 		s.done = true;
 		s.cv.notify_one();
 	};
@@ -489,7 +508,12 @@ T sync_wait(task<T> t) {
 		auto d = drive(std::move(t), st);
 		running_on scope{scheduler_ref{}};
 		d.h.resume();  // d may already be gone when this returns
-		if (auto* s = detail::draining_scheduler) { s->run(); }
+		if (auto* s = detail::draining_scheduler) {
+			s->run_until([&] {
+				std::lock_guard lock(st.mutex);
+				return st.done;
+			});
+		}
 	}
 	std::unique_lock lock(st.mutex);
 	st.cv.wait(lock, [&] { return st.done; });

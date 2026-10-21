@@ -1,6 +1,6 @@
 // task: values and exceptions, symmetric transfer in constant stack, executor affinity
 // (single- and multi-threaded), budgets and demotion, cancellation, when_all, and a
-// sync_wait, and a randomized cancellation stress run (argv[1] tasks, default 1,000,000).
+// sync_wait (threads, ordering, restore, pool bound), and a randomized cancellation stress run (argv[1] tasks, default 1,000,000).
 #include "task.hh"
 
 #include <atomic>
@@ -189,8 +189,54 @@ task::task<int> hop_holding(task::scheduler_ref where, sentinel) {
 	co_await task::schedule_on{where};
 	co_return 9;
 }
-task::task<int> sync_inside(task::scheduler_ref inner_home, task::scheduler_ref where) {
-	co_return task::sync_wait(hop_value(where, 10)) + (inner_home ? 0 : 1);
+task::task<int> sync_inside(task::scheduler_ref where) { co_return task::sync_wait(hop_value(where, 10)); }
+
+// Calls sync_wait and records whether the caller's current scheduler survived it.
+task::task<void> restores_current(task::scheduler_ref where, bool* restored) {
+	auto before = task::current();
+	task::sync_wait(hop_value(where, 3));
+	*restored = bool(before) && task::current() == before;
+	co_return;
+}
+
+// Appends to a trace around a sync_wait of work that is already done or hops to `where`.
+task::task<void> traced_sync(std::vector<std::string>* trace, task::scheduler_ref where, bool hop) {
+	trace->push_back("A:before");
+	if (hop) { task::sync_wait(hop_value(where, 1)); } else { task::sync_wait(answer()); }
+	trace->push_back("A:after");
+	co_return;
+}
+task::task<void> traced(std::vector<std::string>* trace, const char* name) {
+	trace->push_back(name);
+	co_return;
+}
+
+// Results that are move-constructible only, and moves that throw.
+struct pinned {
+	int value;
+	int& ref;
+	pinned(int v, int& r) : value(v), ref(r) {}
+	pinned(pinned&&) = default;  // not move-assignable: reference member
+};
+task::task<pinned> make_pinned(int& r) { co_return pinned(5, r); }
+
+inline int move_budget = -1;  // the move constructor that makes this reach zero throws
+struct shaky {
+	int value = 0;
+	explicit shaky(int v) : value(v) {}
+	shaky(shaky&& o) : value(o.value) {
+		if (move_budget >= 0 && move_budget-- == 0) { throw std::runtime_error("move"); }
+	}
+};
+task::task<shaky> make_shaky(task::scheduler_ref where) {
+	co_await task::schedule_on{where};
+	co_return shaky(3);
+}
+
+// Frames allocated here and freed on `where`'s thread; reports that thread's cached frames.
+task::task<std::size_t> worker_cached(task::scheduler_ref where) {
+	co_await task::schedule_on{where};
+	co_return task::detail::pool().cached();
 }
 
 int main(int argc, char** argv) {
@@ -325,9 +371,9 @@ int main(int argc, char** argv) {
 		// A caller that is itself inside a scheduler still waits for another one.
 		{
 			thread_scheduler home;
-			CHECK(task::sync_wait(sync_inside(task::scheduler_ref::of(home), w)) == 45);
+			CHECK(task::sync_wait(sync_inside(w)) == 45);
 			std::promise<int> done;
-			task::spawn(task::scheduler_ref::of(home), sync_inside(task::scheduler_ref::of(home), w),
+			task::spawn(task::scheduler_ref::of(home), sync_inside(w),
 				[&](std::exception_ptr, std::optional<int> v) { done.set_value(v.value_or(-1)); });
 			CHECK(done.get_future().get() == 45);
 		}
@@ -348,7 +394,58 @@ int main(int argc, char** argv) {
 	{
 		task::inline_scheduler inl;
 		auto r = task::scheduler_ref::of(inl);
-		CHECK(task::run(inl, sync_inside(r, r)) == 45);
+		CHECK(task::run(inl, sync_inside(r)) == 45);
+
+		// The caller's current scheduler is restored, on a worker and under an inline run().
+		bool restored = false;
+		task::run(inl, restores_current(r, &restored));
+		CHECK(restored);
+		CHECK(!task::current());
+		thread_scheduler worker, home;
+		restored = false;
+		std::promise<void> done;
+		task::spawn(task::scheduler_ref::of(home), restores_current(task::scheduler_ref::of(worker), &restored),
+			[&](std::exception_ptr) { done.set_value(); });
+		done.get_future().get();
+		CHECK(restored);
+
+		// A task that is already done leaves queued work alone: FIFO order holds.
+		std::vector<std::string> trace;
+		task::spawn(r, traced_sync(&trace, r, false));
+		task::spawn(r, traced(&trace, "B"));
+		task::spawn(r, traced(&trace, "C"));
+		inl.run();
+		CHECK((trace == std::vector<std::string>{"A:before", "A:after", "B", "C"}));
+
+		// One that hops to the same scheduler waits behind B and C only, not work queued after it.
+		trace.clear();
+		task::spawn(r, traced_sync(&trace, r, true));
+		task::spawn(r, traced(&trace, "B"));
+		task::spawn(r, traced(&trace, "C"));
+		inl.run();
+		CHECK((trace == std::vector<std::string>{"A:before", "B", "C", "A:after"}));
+	}
+
+	// sync_wait needs only move-constructible results, and a throwing move reaches the caller.
+	{
+		int x = 1;
+		CHECK(task::sync_wait(make_pinned(x)).value == 5);
+		thread_scheduler worker;
+		int thrown = 0;
+		for (int n = 0; n < 8; ++n) {
+			move_budget = n;
+			try { CHECK(task::sync_wait(make_shaky(task::scheduler_ref::of(worker))).value == 3); } catch (const std::runtime_error&) { ++thrown; }
+		}
+		move_budget = -1;
+		CHECK(thrown >= 3);
+	}
+
+	// Frames freed on another thread cannot pile up without bound in its pool.
+	{
+		thread_scheduler worker;
+		auto w = task::scheduler_ref::of(worker);
+		for (int i = 0; i < 20000; ++i) { task::sync_wait(hop_value(w, 1)); }
+		CHECK(task::sync_wait(worker_cached(w)) <= 4 * task::detail::frame_pool::cap);
 	}
 
 	// Stress: many tasks with random yields and random cancellation, all accounted for.

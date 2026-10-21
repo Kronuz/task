@@ -4,8 +4,9 @@ project(task LANGUAGES CXX)
 include(FetchContent)
 find_package(Threads REQUIRED)
 
-# Header-only: task.hh has no dependencies.
+# Header-only: task.hh needs only the standard library and threads (sync_wait blocks).
 add_library(task INTERFACE)
+target_link_libraries(task INTERFACE Threads::Threads)
 target_include_directories(task INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_features(task INTERFACE cxx_std_20)
 add_library(task::task ALIAS task)
