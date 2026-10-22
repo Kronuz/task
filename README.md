@@ -1,5 +1,7 @@
 # task
 
+Part of [Kronuz C++ Libraries](https://github.com/Kronuz/cpp-libraries), a collection of small, reusable C++ libraries.
+
 [![CI](https://github.com/Kronuz/task/actions/workflows/ci.yml/badge.svg)](https://github.com/Kronuz/task/actions/workflows/ci.yml)
 
 C++20 coroutine tasks for code that runs on someone else's event loop. Header-only;
