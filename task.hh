@@ -32,6 +32,7 @@
 #pragma once
 
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <concepts>
 #include <condition_variable>
@@ -54,7 +55,58 @@
 #include <x86intrin.h>
 #endif
 
+// Frames cached for reuse stay poisoned under AddressSanitizer, so a use after free of a
+// pooled block is reported instead of reading a recycled one.
+#if defined(__SANITIZE_ADDRESS__)
+#define TASK_ASAN 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define TASK_ASAN 1
+#endif
+#endif
+#ifdef TASK_ASAN
+#include <sanitizer/asan_interface.h>
+#define TASK_POISON(p, n) ASAN_POISON_MEMORY_REGION(p, n)
+#define TASK_UNPOISON(p, n) ASAN_UNPOISON_MEMORY_REGION(p, n)
+#else
+#define TASK_POISON(p, n) ((void)(p), (void)(n))
+#define TASK_UNPOISON(p, n) ((void)(p), (void)(n))
+#endif
+
 namespace task {
+
+// A monotonic cycle counter calibrated to nanoseconds once per process.
+namespace cycles {
+
+inline std::uint64_t read() noexcept {
+#if defined(__x86_64__) || defined(_M_X64)
+	return __rdtsc();
+#elif defined(__aarch64__)
+	std::uint64_t v;
+	asm volatile("mrs %0, cntvct_el0" : "=r"(v));
+	return v;
+#else
+	return std::uint64_t(std::chrono::steady_clock::now().time_since_epoch().count());
+#endif
+}
+
+// Counter ticks per nanosecond, measured against steady_clock over about 2 ms on first
+// use. Hosts call calibrate() at startup so no event loop pays that wait.
+inline double per_ns() {
+	static const double ratio = [] {
+		auto t0 = std::chrono::steady_clock::now();
+		auto c0 = read();
+		while (std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(2)) {}
+		auto c1 = read();
+		auto ns = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count();
+		return double(c1 - c0) / ns;
+	}();
+	return ratio;
+}
+
+inline void calibrate() { (void)per_ns(); }
+
+}  // namespace cycles
 
 // ---------------------------------------------------------------------------------------------
 // Schedulers
@@ -98,21 +150,32 @@ private:
 
 namespace detail {
 inline thread_local scheduler_ref current_scheduler;
+// When the current resume began, in cycle-counter ticks; budgets measure their slice from it.
+inline thread_local std::uint64_t slice_start = 0;
 }
 
 // The scheduler running on this thread right now (empty outside any scheduler).
 inline scheduler_ref current() noexcept { return detail::current_scheduler; }
 
-// Marks code as running on a scheduler; schedulers wrap each resume in one.
+// Marks code as running on a scheduler; schedulers wrap each resume in one. Entering a scope
+// starts a time slice (see budget), and leaving it restores the enclosing scope's.
 class running_on {
 public:
-	explicit running_on(scheduler_ref s) noexcept : previous_(detail::current_scheduler) { detail::current_scheduler = s; }
-	~running_on() { detail::current_scheduler = previous_; }
+	explicit running_on(scheduler_ref s) noexcept
+		: previous_(detail::current_scheduler), previous_start_(detail::slice_start) {
+		detail::current_scheduler = s;
+		detail::slice_start = cycles::read();
+	}
+	~running_on() {
+		detail::current_scheduler = previous_;
+		detail::slice_start = previous_start_;
+	}
 	running_on(const running_on&) = delete;
 	running_on& operator=(const running_on&) = delete;
 
 private:
 	scheduler_ref previous_;
+	std::uint64_t previous_start_;
 };
 
 class inline_scheduler;
@@ -150,6 +213,7 @@ public:
 			auto& queue = ready_.empty() ? demoted_ : ready_;
 			auto h = queue.front();
 			queue.pop_front();
+			detail::slice_start = cycles::read();  // each resume is its own slice
 			h.resume();
 			++n;
 		}
@@ -174,10 +238,15 @@ namespace detail {
 class frame_pool {
 public:
 	static constexpr std::size_t granularity = 64, classes = 32, cap = 1024;
+	static constexpr std::size_t poison_from = 16;  // the free-list link stays readable
 
 	~frame_pool() {
-		for (auto*& head : free_) {
-			while (head) { ::operator delete(std::exchange(head, head->next)); }
+		for (std::size_t c = 0; c < classes; ++c) {
+			while (node* p = free_[c]) {
+				TASK_UNPOISON(p, (c + 1) * granularity);
+				free_[c] = p->next;
+				::operator delete(p);
+			}
 		}
 	}
 
@@ -185,6 +254,7 @@ public:
 		std::size_t c = (n + granularity - 1) / granularity;
 		if (c > classes) { return ::operator new(n); }
 		if (node* p = free_[c - 1]) {
+			TASK_UNPOISON(p, c * granularity);
 			free_[c - 1] = p->next;
 			--count_[c - 1];
 			return p;
@@ -206,6 +276,7 @@ public:
 		f->next = free_[c - 1];
 		free_[c - 1] = f;
 		++count_[c - 1];
+		TASK_POISON(static_cast<char*>(p) + poison_from, c * granularity - poison_from);
 	}
 
 	// Frames held across all classes.
@@ -543,39 +614,6 @@ struct schedule_on {
 	void await_resume() const noexcept {}
 };
 
-// A monotonic cycle counter calibrated to nanoseconds once per process.
-namespace cycles {
-
-inline std::uint64_t read() noexcept {
-#if defined(__x86_64__) || defined(_M_X64)
-	return __rdtsc();
-#elif defined(__aarch64__)
-	std::uint64_t v;
-	asm volatile("mrs %0, cntvct_el0" : "=r"(v));
-	return v;
-#else
-	return std::uint64_t(std::chrono::steady_clock::now().time_since_epoch().count());
-#endif
-}
-
-// Counter ticks per nanosecond, measured against steady_clock over about 2 ms on first
-// use. Hosts call calibrate() at startup so no event loop pays that wait.
-inline double per_ns() {
-	static const double ratio = [] {
-		auto t0 = std::chrono::steady_clock::now();
-		auto c0 = read();
-		while (std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(2)) {}
-		auto c1 = read();
-		auto ns = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count();
-		return double(c1 - c0) / ns;
-	}();
-	return ratio;
-}
-
-inline void calibrate() { (void)per_ns(); }
-
-}  // namespace cycles
-
 struct cancelled : std::exception {
 	const char* what() const noexcept override { return "task cancelled"; }
 };
@@ -603,14 +641,18 @@ private:
 };
 
 // A time slice. checkpoint() is free while the slice lasts; once it is spent, it
-// requeues the coroutine as demoted and starts a new slice. Both throw cancelled
-// when the token is set.
+// requeues the coroutine as demoted. Both throw cancelled when the token is set.
+// On a scheduler the slice is the current resume: time spent suspended does not count,
+// and a task resumed after an event, a lock or a completion starts a fresh slice. Off a
+// scheduler it runs from construction, or from the last demotion.
 class budget {
 public:
 	explicit budget(std::chrono::nanoseconds slice, cancel_token token = {})
 		: slice_(std::uint64_t(double(slice.count()) * cycles::per_ns())), deadline_(cycles::read() + slice_), token_(std::move(token)) {}
 
-	bool exhausted() const noexcept { return cycles::read() >= deadline_; }
+	bool exhausted() const noexcept {
+		return cycles::read() >= (current() ? detail::slice_start + slice_ : deadline_);
+	}
 	const cancel_token& token() const noexcept { return token_; }
 
 	auto checkpoint() noexcept {
@@ -630,6 +672,307 @@ private:
 	std::uint64_t slice_;
 	std::uint64_t deadline_;
 	cancel_token token_;
+};
+
+// ---------------------------------------------------------------------------------------------
+// Events and locks
+
+// Resumes h on s, or on the calling thread when no scheduler was recorded.
+namespace detail {
+inline void resume_on(scheduler_ref s, std::coroutine_handle<> h) {
+	if (s) { s.post(h); } else { h.resume(); }
+}
+}  // namespace detail
+
+// A one-shot completion. Awaiting it suspends until set(); each waiter resumes through the
+// scheduler it suspended on, in the order it began waiting, so a waiter never runs inside
+// set(). set() is idempotent and callable from any thread. Waiters must run to completion:
+// the event's destructor asserts that none is left.
+class event {
+public:
+	event() = default;
+	event(const event&) = delete;
+	event& operator=(const event&) = delete;
+	~event() { assert(head_.load(std::memory_order_relaxed) == set_marker() || head_.load(std::memory_order_relaxed) == nullptr); }
+
+	bool is_set() const noexcept { return head_.load(std::memory_order_acquire) == set_marker(); }
+
+	void set() noexcept {
+		node* list = head_.exchange(set_marker(), std::memory_order_acq_rel);
+		if (list == set_marker()) { return; }
+		node* first = nullptr;  // the stack holds the newest waiter first
+		while (list) {
+			node* n = list;
+			list = n->next;
+			n->next = first;
+			first = n;
+		}
+		while (first) {
+			node* n = std::exchange(first, first->next);  // read before n's frame can end
+			detail::resume_on(n->sched, n->handle);
+		}
+	}
+
+	struct awaiter {
+		event& e;
+		std::coroutine_handle<> handle;
+		scheduler_ref sched;
+		awaiter* next = nullptr;
+		bool await_ready() const noexcept { return e.is_set(); }
+		bool await_suspend(std::coroutine_handle<> h) noexcept {
+			handle = h;
+			sched = current();
+			node* head = e.head_.load(std::memory_order_acquire);
+			do {
+				if (head == set_marker()) { return false; }
+				next = head;
+			} while (!e.head_.compare_exchange_weak(head, this, std::memory_order_acq_rel, std::memory_order_acquire));
+			return true;  // set() may already be resuming this frame: touch nothing more
+		}
+		void await_resume() const noexcept {}
+	};
+	awaiter operator co_await() noexcept { return awaiter{*this, {}, {}}; }
+
+private:
+	using node = awaiter;
+	static node* set_marker() noexcept { return reinterpret_cast<node*>(std::uintptr_t(1)); }
+	std::atomic<node*> head_{nullptr};
+};
+
+class async_mutex;
+
+namespace detail {
+
+// One queued lock request. The queue entry, the awaiter in the waiting frame, and a timer
+// handler each hold a reference, so whichever ends last frees it: a frame that ends after
+// a timeout, or a timer that fires after a grant, never meets freed state. Exactly one of
+// grant and timeout settles it.
+struct lock_waiter : pooled_frame {
+	enum : int { waiting, granted, timed_out };
+	lock_waiter* next = nullptr;
+	std::coroutine_handle<> handle;
+	scheduler_ref sched;
+	std::atomic<int> state{waiting};
+	std::atomic<int> refs{2};  // the queue entry and the awaiter
+	std::atomic<bool> parked{false};
+
+	void retain() noexcept { refs.fetch_add(1, std::memory_order_relaxed); }
+	void release() noexcept {
+		if (refs.fetch_sub(1, std::memory_order_acq_rel) == 1) { delete this; }
+	}
+	bool settle(int outcome) noexcept {
+		int expected = waiting;
+		return state.compare_exchange_strong(expected, outcome, std::memory_order_acq_rel, std::memory_order_acquire);
+	}
+	// The outcome is settled. The waiter resumes now, or, if its await_suspend has not
+	// finished, there: that call then returns false and the frame continues in place.
+	void wake() noexcept {
+		if (parked.exchange(true, std::memory_order_acq_rel)) { resume_on(sched, handle); }
+	}
+	// The last step of await_suspend: true to suspend (wake() resumes later), false when
+	// the outcome is already settled.
+	bool park() noexcept { return !parked.exchange(true, std::memory_order_acq_rel); }
+};
+
+// What a timer callback does when its deadline passes. It owns one reference, dropped
+// whether or not it ever runs.
+class lock_timeout {
+public:
+	explicit lock_timeout(lock_waiter* w) noexcept : w_(w) { w_->retain(); }
+	lock_timeout(lock_timeout&& o) noexcept : w_(std::exchange(o.w_, nullptr)) {}
+	lock_timeout(const lock_timeout&) = delete;
+	lock_timeout& operator=(const lock_timeout&) = delete;
+	~lock_timeout() {
+		if (w_) { w_->release(); }
+	}
+	void operator()() noexcept {
+		if (w_->settle(lock_waiter::timed_out)) { w_->wake(); }
+	}
+
+private:
+	lock_waiter* w_;
+};
+
+}  // namespace detail
+
+// A FIFO mutex for coroutines, usable from every scheduler at once. A waiter suspends
+// instead of blocking and resumes through the scheduler it suspended on when the holder
+// unlocks, which hands the lock over without releasing it, so a late arrival cannot barge
+// in. The holder need not be the coroutine's thread: a guard may be released anywhere.
+// Internally a short mutex guards a queue; no critical section waits or does I/O.
+// The destructor asserts that the mutex is unlocked and nobody is waiting.
+class async_mutex {
+public:
+	// Owns the lock until unlock() or destruction; empty after a timeout.
+	class [[nodiscard]] guard {
+	public:
+		guard() = default;
+		guard(guard&& o) noexcept : m_(std::exchange(o.m_, nullptr)) {}
+		guard& operator=(guard&& o) noexcept {
+			if (this != &o) {
+				unlock();
+				m_ = std::exchange(o.m_, nullptr);
+			}
+			return *this;
+		}
+		guard(const guard&) = delete;
+		guard& operator=(const guard&) = delete;
+		~guard() { unlock(); }
+		explicit operator bool() const noexcept { return m_ != nullptr; }
+		void unlock() noexcept {
+			if (auto* m = std::exchange(m_, nullptr)) { m->unlock(); }
+		}
+
+	private:
+		friend class async_mutex;
+		explicit guard(async_mutex* m) noexcept : m_(m) {}
+		async_mutex* m_ = nullptr;
+	};
+
+	async_mutex() = default;
+	async_mutex(const async_mutex&) = delete;
+	async_mutex& operator=(const async_mutex&) = delete;
+	~async_mutex() {
+		assert(!locked_);
+		while (detail::lock_waiter* w = head_) {
+			head_ = w->next;
+			w->release();
+		}
+	}
+
+	// Takes the lock if it is free and nobody is queued.
+	[[nodiscard]] bool try_lock() noexcept {
+		std::lock_guard g(m_);
+		return std::exchange(locked_, true) == false;
+	}
+
+	// Hands the lock to the first waiter that has not timed out, or frees it.
+	void unlock() noexcept {
+		detail::lock_waiter* granted = nullptr;
+		{
+			std::lock_guard g(m_);
+			assert(locked_);
+			while (detail::lock_waiter* w = head_) {
+				head_ = w->next;
+				if (!head_) { tail_ = nullptr; }
+				if (w->settle(detail::lock_waiter::granted)) {
+					granted = w;
+					break;
+				}
+				w->release();  // timed out while queued
+			}
+			if (!granted) { locked_ = false; }
+		}
+		if (granted) {
+			granted->wake();
+			granted->release();
+		}
+	}
+
+	class lock_awaiter {
+	public:
+		explicit lock_awaiter(async_mutex& m) noexcept : m_(m) {}
+		lock_awaiter(const lock_awaiter&) = delete;
+		lock_awaiter& operator=(const lock_awaiter&) = delete;
+		~lock_awaiter() {
+			if (w_) { w_->release(); }
+		}
+		bool await_ready() noexcept { return m_.try_lock(); }
+		bool await_suspend(std::coroutine_handle<> h) {
+			w_ = m_.enqueue(h, current());
+			return w_ && w_->park();
+		}
+		guard await_resume() noexcept {
+			if (w_) { std::exchange(w_, nullptr)->release(); }
+			return guard{&m_};
+		}
+
+	private:
+		async_mutex& m_;
+		detail::lock_waiter* w_ = nullptr;
+	};
+
+	// Takes the lock, waiting its turn: `auto g = co_await m.lock();`
+	[[nodiscard]] lock_awaiter lock() noexcept { return lock_awaiter{*this}; }
+
+	// lock() with a deadline: the guard is empty if the lock was not granted by then. S is
+	// the scheduler the task resumes on; it also starts the deadline timer:
+	// `start_timer(steady_clock::time_point, F&&)` runs F once at the deadline on S (not at
+	// all when the returned timer is destroyed first), and `now()` tells time in nanoseconds
+	// on the same clock. A lock that is free is taken whatever the deadline.
+	template <typename S>
+	class timed_awaiter {
+	public:
+		timed_awaiter(async_mutex& m, S& s, std::chrono::steady_clock::time_point deadline) noexcept : m_(m), s_(s), deadline_(deadline) {}
+		timed_awaiter(const timed_awaiter&) = delete;
+		timed_awaiter& operator=(const timed_awaiter&) = delete;
+		~timed_awaiter() {
+			if (w_) { w_->release(); }
+		}
+		bool await_ready() noexcept { return m_.try_lock(); }
+		bool await_suspend(std::coroutine_handle<> h) {
+			w_ = m_.enqueue(h, scheduler_ref::of(s_));
+			if (!w_) { return false; }
+			try {
+				timer_.emplace(s_.start_timer(deadline_, detail::lock_timeout{w_}));
+			} catch (...) {
+				if (!w_->settle(detail::lock_waiter::timed_out)) { m_.unlock(); }  // granted meanwhile: give it back
+				throw;
+			}
+			return w_->park();
+		}
+		guard await_resume() noexcept {
+			timer_.reset();
+			if (!w_) { return guard{&m_}; }
+			const bool got = w_->state.load(std::memory_order_acquire) == detail::lock_waiter::granted;
+			std::exchange(w_, nullptr)->release();
+			return got ? guard{&m_} : guard{};
+		}
+
+	private:
+		async_mutex& m_;
+		S& s_;
+		std::chrono::steady_clock::time_point deadline_;
+		detail::lock_waiter* w_ = nullptr;
+		std::optional<decltype(std::declval<S&>().start_timer(std::chrono::steady_clock::time_point{}, std::declval<detail::lock_timeout>()))> timer_;
+	};
+
+	template <typename S>
+	[[nodiscard]] timed_awaiter<S> lock_until(S& s, std::chrono::steady_clock::time_point deadline) noexcept {
+		return timed_awaiter<S>{*this, s, deadline};
+	}
+	template <typename S>
+	[[nodiscard]] timed_awaiter<S> lock_for(S& s, std::chrono::nanoseconds timeout) noexcept {
+		using clock = std::chrono::steady_clock;
+		return lock_until(s, clock::time_point{std::chrono::duration_cast<clock::duration>(std::chrono::nanoseconds(s.now()) + timeout)});
+	}
+
+private:
+	// Queues a waiter, or takes the free lock and returns null.
+	detail::lock_waiter* enqueue(std::coroutine_handle<> h, scheduler_ref sched) {
+		std::lock_guard g(m_);
+		if (!locked_) {
+			locked_ = true;
+			return nullptr;
+		}
+		while (head_ && head_->state.load(std::memory_order_acquire) != detail::lock_waiter::waiting) {  // shed timed-out entries
+			detail::lock_waiter* dead = head_;
+			head_ = dead->next;
+			dead->release();
+		}
+		if (!head_) { tail_ = nullptr; }
+		auto* w = new detail::lock_waiter;
+		w->handle = h;
+		w->sched = sched;
+		(tail_ ? tail_->next : head_) = w;
+		tail_ = w;
+		return w;
+	}
+
+	std::mutex m_;
+	bool locked_ = false;
+	detail::lock_waiter* head_ = nullptr;
+	detail::lock_waiter* tail_ = nullptr;
 };
 
 // ---------------------------------------------------------------------------------------------

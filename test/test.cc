@@ -45,7 +45,6 @@ public:
 
 private:
 	void loop() {
-		task::running_on scope(task::scheduler_ref::of(*this));
 		for (;;) {
 			std::coroutine_handle<> h;
 			{
@@ -55,6 +54,7 @@ private:
 				h = queue_.front();
 				queue_.pop_front();
 			}
+			task::running_on scope(task::scheduler_ref::of(*this));
 			h.resume();
 		}
 	}
