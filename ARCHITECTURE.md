@@ -39,8 +39,33 @@ executor and keeps demoted handles in a local queue drained one per executor pas
 `budget` converts its slice to cycle-counter ticks once (`rdtsc` on x86-64,
 `cntvct_el0` on AArch64, calibrated against `steady_clock` over 2 ms per process).
 `checkpoint()` is ready, and costs nothing beyond a counter read and a relaxed load
-of the cancel flag, until the deadline passes; then it posts the coroutine as
-demoted and starts a new slice on resume.
+of the cancel flag, until the slice is spent; then it posts the coroutine as
+demoted.
+
+A slice is one resume. `running_on` stamps a thread-local slice start from the cycle
+counter when it is entered and restores the enclosing stamp when it leaves, and
+`exhausted()` compares the counter with that stamp plus the slice. Schedulers wrap each
+resume in a scope, so a task resumed after a lock, an event or an Asio completion starts
+fresh, and only a run longer than the slice is demoted. A budget used with no scheduler
+current falls back to a deadline from its construction.
+
+## Events and locks
+
+`event` is an atomic stack of waiters whose nodes are the awaiters in the waiting frames. A
+waiter pushes itself unless the stack holds the "set" marker; `set()` swaps the marker in,
+reverses the stack for arrival order and resumes each waiter through the scheduler it
+suspended on (inline when it had none). It reads a node's link before resuming it.
+
+`async_mutex` keeps a locked flag and a FIFO queue under a short internal mutex. `unlock`
+hands the lock to the first queued waiter without releasing it, so a late arrival cannot
+barge in, and resumes that waiter through its own scheduler. A queued waiter is a
+`lock_waiter`: a refcounted block shared by the queue, the awaiter and, for `lock_until`, a
+timer callback. One compare-exchange on its state settles it as granted or timed out; the
+loser finds it settled. A timed-out entry stays queued until a later `unlock` or `lock`
+sheds it, so the timer never touches the mutex. `await_suspend` ends with a handshake
+(`park` against `wake`) so a grant or a timeout that lands before it returns continues the
+coroutine in place instead of resuming a frame that is still suspending. See
+`docs/mechanisms/async-mutex.md`.
 
 ## Frames
 

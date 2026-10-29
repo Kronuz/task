@@ -4,16 +4,22 @@
 
 ```
 task.hh            task<T>, scheduler concept and scheduler_ref, inline_scheduler, frame pool,
-                   spawn/run/sync_wait, yield/schedule_on, budget, cancellation, when_all.
-task_asio.hh       asio_scheduler and as_awaitable (target task::asio; fetches Asio 1.36.0).
+                   spawn/run/sync_wait, yield/schedule_on, budget, cancellation, event,
+                   async_mutex (lock_until), when_all.
+task_asio.hh       asio_scheduler (demoted, start_timer), as_awaitable, await_asio
+                   (target task::asio; fetches Asio 1.36.0).
 test/test.cc       Core tests; argv[1] sets the stress task count.
+test/sync_test.cc  Slice, event, async_mutex, lock_until orders, destructor asserts.
 test/asio_test.cc  Asio bridge: yields, demotion, results, exceptions.
 bench/bench.cc     No-op task cost and allocations; Asio yield latency.
 ```
 
 ## Invariants
 
-- Every scheduler sets `task::running_on` around each resume; affinity depends on it.
+- Every scheduler sets `task::running_on` around each resume; affinity and the budget slice
+  depend on it (the scope stamps the slice start, so one scope per resume, not per loop).
+- A lock_waiter (async_mutex) is shared by the queue, the awaiter and a timer callback; only
+  the last reference frees it. Never point a timer or queue entry at the awaiter itself.
 - The core header never includes Asio.
 - Hot paths allocate nothing after warm-up; the bench counts allocations to prove it.
 
