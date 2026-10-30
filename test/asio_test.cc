@@ -12,6 +12,7 @@
 #include <asio/write.hpp>
 
 #include <atomic>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <random>
