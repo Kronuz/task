@@ -796,9 +796,9 @@ private:
 }  // namespace detail
 
 // A FIFO mutex for coroutines, usable from every scheduler at once. A waiter suspends
-// instead of blocking and resumes through the scheduler it suspended on when the holder
-// unlocks, which hands the lock over without releasing it, so a late arrival cannot barge
-// in. The holder need not be the coroutine's thread: a guard may be released anywhere.
+// instead of blocking and resumes through the scheduler it suspended on (on the unlocking
+// thread when it had none) when the holder unlocks, which hands the lock over without
+// releasing it, so a late arrival cannot barge in. The holder need not be the coroutine's thread: a guard may be released anywhere.
 // Internally a short mutex guards a queue; no critical section waits or does I/O.
 // The destructor asserts that the mutex is unlocked and nobody is waiting.
 class async_mutex {

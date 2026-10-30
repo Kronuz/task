@@ -435,6 +435,22 @@ void test_mutex() {
 		CHECK(m.try_lock());  // the waiter's guard released it
 		m.unlock();
 	}
+	{  // A waiter with no scheduler (under sync_wait) resumes on the unlocking thread.
+		task::async_mutex m;
+		CHECK(m.try_lock());
+		std::thread unlocker([&] {
+			std::this_thread::sleep_for(5ms);
+			m.unlock();
+		});
+		auto locked = [](task::async_mutex& mu) -> task::task<int> {
+			auto g = co_await mu.lock();
+			co_return 1;
+		};
+		CHECK(task::sync_wait(locked(m)) == 1);
+		unlocker.join();
+		CHECK(m.try_lock());
+		m.unlock();
+	}
 	{  // Many threads, several schedulers: mutual exclusion and no lost wakeup.
 		thread_scheduler w[4];
 		task::async_mutex m;
@@ -513,7 +529,9 @@ void test_lock_until() {
 		m.unlock();
 		ms.run();
 		CHECK(w.got == 1 && w.resumed == 1);
-		ms.run_queued();  // the late timer meets a settled waiter
+		ms.run_queued();  // the late timer meets a settled waiter: no second wake
+		CHECK(ms.ready() == 0);
+		ms.run();
 		CHECK(w.got == 1 && w.resumed == 1);
 		CHECK(m.try_lock());
 		m.unlock();
