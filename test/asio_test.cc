@@ -298,9 +298,10 @@ void test_primitives() {
 		std::thread t3([&] { io3.run(); });
 		std::thread::id ran_on, io3_id = t3.get_id();
 		std::atomic<bool> finished{false};
+		std::thread completer;
 		auto other_thread = [&]() -> task::task<void> {
 			int v = co_await task::await_asio<void(int)>([&](auto h) {
-				std::thread([h = std::move(h)]() mutable { std::this_thread::sleep_for(2ms); h(41); }).detach();
+				completer = std::thread([h = std::move(h)]() mutable { std::this_thread::sleep_for(2ms); h(41); });
 			});
 			ran_on = std::this_thread::get_id();
 			finished = v == 41;
@@ -308,6 +309,7 @@ void test_primitives() {
 		task::spawn(task::scheduler_ref::of(s3), other_thread());
 		for (int i = 0; i < 2000 && !finished; ++i) { std::this_thread::sleep_for(1ms); }
 		CHECK(finished && ran_on == io3_id);
+		if (completer.joinable()) completer.join();  // its tail must end before io3 is destroyed
 		guard.reset();
 		t3.join();
 	}

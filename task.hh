@@ -944,7 +944,10 @@ public:
 	template <typename S>
 	[[nodiscard]] timed_awaiter<S> lock_for(S& s, std::chrono::nanoseconds timeout) noexcept {
 		using clock = std::chrono::steady_clock;
-		return lock_until(s, clock::time_point{std::chrono::duration_cast<clock::duration>(std::chrono::nanoseconds(s.now()) + timeout)});
+		using ns = std::chrono::nanoseconds;
+		const ns now{s.now()};
+		const ns at = timeout > ns::max() - now ? ns::max() : now + timeout;  // saturates: no signed overflow
+		return lock_until(s, clock::time_point{std::chrono::duration_cast<clock::duration>(at)});
 	}
 
 private:
