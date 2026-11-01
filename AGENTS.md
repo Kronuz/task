@@ -11,7 +11,7 @@ task_asio.hh       asio_scheduler (demoted, start_timer), as_awaitable, await_as
 test/test.cc       Core tests; argv[1] sets the stress task count.
 test/sync_test.cc  Slice, event, async_mutex, lock_until orders, destructor asserts.
 test/asio_test.cc  Asio bridge: yields, demotion, results, exceptions.
-bench/bench.cc     No-op task cost and allocations; Asio yield latency.
+bench/bench.cc     No-op task cost and allocations; Asio yield latency; the same two measurements on asio::awaitable.
 docs/API.md        The types and functions, and how to run a task.
 ```
 
