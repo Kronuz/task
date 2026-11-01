@@ -12,6 +12,7 @@ test/test.cc       Core tests; argv[1] sets the stress task count.
 test/sync_test.cc  Slice, event, async_mutex, lock_until orders, destructor asserts.
 test/asio_test.cc  Asio bridge: yields, demotion, results, exceptions.
 bench/bench.cc     No-op task cost and allocations; Asio yield latency.
+docs/API.md        The types and functions, and how to run a task.
 ```
 
 ## Invariants
