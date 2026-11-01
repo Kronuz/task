@@ -105,15 +105,23 @@ Not for:
 
 ## ⚡ Performance
 
-| Measurement | Result |
-| --- | ---: |
-| Create, await, and destroy a no-op task, Intel Core i9-9980HK, macOS, Apple clang `-O3` | 17.9 ns, 0 allocations |
-| Same, Linux x86_64 VM, Clang 18 (symmetric transfer) | 15.3 ns |
-| Same, Linux x86_64 VM, GCC 13 (trampoline) | 21.5 ns |
-| Same, Linux x86_64 VM, GCC 13 with `TASK_SYMMETRIC_TRANSFER=1` | 13.9 ns |
-| Yield to resume through `asio_scheduler`, idle loop, Intel Core i9-9980HK, macOS | p50 123 ns, p99 175 ns |
+`bench/bench.cc` times two things on one thread, the best of five trials of 20 million coroutines
+for the first and 200,000 samples for the second. *Create, await and destroy a no-op coroutine*: a
+parent loops over `co_await child()`, where the child returns 1 at once; `task` is `task::task<int>`
+run by `task::run` on the inline scheduler, and `asio::awaitable` is `asio::awaitable<int>` run by
+`asio::co_spawn` on an `io_context`, the coroutine type that Asio code already uses. A replaced
+global `operator new` counts the allocations of the whole run, the parent included. *Yield and
+resume*: one coroutine on an idle `io_context` measures, with the cycle counter, the time from
+`co_await task::yield()` through `task::asio_scheduler` (task) or from `co_await
+asio::post(executor, use_awaitable)` (`asio::awaitable`) to the instruction after it, in ns. Both
+sides are built with [Asio asio-1-36-0](https://github.com/chriskohlhoff/asio/tree/asio-1-36-0),
+the version CMake pins, and return the same sums. Apple clang 17, `-O3`; best of two runs.
 
-`bench/bench.cc` measures both and counts allocations with a global `operator new`:
+| Measurement | Apple M4 Pro: task | `asio::awaitable` |
+| --- | ---: | ---: |
+| Create, await and destroy a no-op coroutine | **9.2 ns** | 10.2 ns |
+| Allocations for 20 million of them | 0 | 6 |
+| Yield and resume on an idle loop, p50 / p99 | 42 / 83 ns | 42 / 84 ns |
 
 ```sh
 cmake -B build -DCMAKE_BUILD_TYPE=Release
