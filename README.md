@@ -91,9 +91,10 @@ waits that must come back to the thread they started on.
 
 Not for:
 
-- **The fastest transfer under GCC.** The trampoline costs about 8 ns per transfer over
-  symmetric transfer; `TASK_SYMMETRIC_TRANSFER=1` is safe on GCC only for optimized
-  builds without sanitizers.
+- **The fastest coroutines under GCC.** The default trampoline takes 56 ns for a no-op
+  coroutine on g++ 16, `TASK_SYMMETRIC_TRANSFER=1` 34 ns, and `asio::awaitable` 24 ns on the
+  same machine; `TASK_SYMMETRIC_TRANSFER=1` is safe on GCC only for optimized builds
+  without sanitizers.
 - **Memory that stays on its thread.** A frame freed on another thread joins that
   thread's pool, so memory migrates with the work.
 - **Throwing from fire-and-forget work.** An exception that escapes a `spawn`
@@ -106,22 +107,28 @@ Not for:
 ## ⚡ Performance
 
 `bench/bench.cc` times two things on one thread, the best of five trials of 20 million coroutines
-for the first and 200,000 samples for the second. *Create, await and destroy a no-op coroutine*: a
-parent loops over `co_await child()`, where the child returns 1 at once; `task` is `task::task<int>`
-run by `task::run` on the inline scheduler, and `asio::awaitable` is `asio::awaitable<int>` run by
-`asio::co_spawn` on an `io_context`, the coroutine type that Asio code already uses. A replaced
-global `operator new` counts the allocations of the whole run, the parent included. *Yield and
-resume*: one coroutine on an idle `io_context` measures, with the cycle counter, the time from
-`co_await task::yield()` through `task::asio_scheduler` (task) or from `co_await
-asio::post(executor, use_awaitable)` (`asio::awaitable`) to the instruction after it, in ns. Both
-sides are built with [Asio asio-1-36-0](https://github.com/chriskohlhoff/asio/tree/asio-1-36-0),
-the version CMake pins, and return the same sums. Apple clang 17, `-O3`; best of two runs.
+for the first and 200,000 samples for the second, then the best of two runs. *No-op coroutine* is
+the time to create, await and destroy one: a parent loops over `co_await child()`, where the child
+returns 1 at once. *task* is `task::task<int>` run by `task::run` on the inline scheduler;
+*`asio::awaitable`* is `asio::awaitable<int>` run by `asio::co_spawn` on an `io_context`, the
+coroutine type Asio code already uses. *Yield and resume* is one coroutine on an idle `io_context`
+timing, with the cycle counter, from `co_await task::yield()` through `task::asio_scheduler` (task)
+or from `co_await asio::post(executor, use_awaitable)` (`asio::post`) to the instruction after it.
+Both sides are built with Asio
+[asio-1-36-0](https://github.com/chriskohlhoff/asio/tree/asio-1-36-0), the version CMake pins, and
+return the same sums. A replaced global `operator new` counts allocations: task allocates nothing in
+20 million coroutines, and `asio::awaitable` recycles its frames (6 allocations under Apple clang,
+none under g++). Clang resumes the awaiter by symmetric transfer, a tail call. g++ resumes it
+through a per-thread trampoline by default (see [ARCHITECTURE.md](ARCHITECTURE.md));
+`TASK_SYMMETRIC_TRANSFER=1` selects the tail call there, which is safe only for optimized builds
+without sanitizers. `-O3` on every row.
 
-| Measurement | Apple M4 Pro: task | `asio::awaitable` |
-| --- | ---: | ---: |
-| Create, await and destroy a no-op coroutine | **9.2 ns** | 10.2 ns |
-| Allocations for 20 million of them | 0 | 6 |
-| Yield and resume on an idle loop, p50 / p99 | 42 / 83 ns | 42 / 84 ns |
+| Machine, compiler | No-op coroutine: task | `asio::awaitable` | Yield and resume, p50 / p99: task | `asio::post` |
+| --- | ---: | ---: | ---: | ---: |
+| Apple M4 Pro, Apple clang 17 | **9.2 ns** | 10.2 ns | 42 / 83 ns | 42 / 84 ns |
+| Intel Core i9-9980HK, Apple clang 17 | **18.1 ns** | 30.4 ns | 115 / 133 ns | 148 / 171 ns |
+| Intel Core i9-9980HK, g++ 16 (trampoline) | 56.4 ns | **23.9 ns** | 90 / 101 ns | 122 / 143 ns |
+| Intel Core i9-9980HK, g++ 16, `TASK_SYMMETRIC_TRANSFER=1` | 34.3 ns | **23.7 ns** | 92 / 108 ns | 118 / 137 ns |
 
 ```sh
 cmake -B build -DCMAKE_BUILD_TYPE=Release
