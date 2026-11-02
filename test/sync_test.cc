@@ -829,6 +829,26 @@ void test_lock_destroyed() {
 		CHECK(m.try_lock());
 		m.unlock();
 	}
+	// grant_then_request: granted (resume posted), then the token is requested before the resume
+	// runs: the callback finds the waiter settled, posts nothing, and the waiter resumes once.
+	{
+		task::inline_scheduler s;
+		task::async_mutex m;
+		CHECK(m.try_lock());
+		task::cancel_source source;
+		probe_result w;
+		auto t = token_waiter(m, source.token(), &w);
+		s.post(t.handle());
+		s.run();
+		m.unlock();
+		CHECK(s.queued() == 1);
+		CHECK(source.request());
+		CHECK(s.queued() == 1);
+		s.run();
+		CHECK(w.resumed == 1 && w.got == 1);
+		CHECK(m.try_lock());  // the guard died with the frame
+		m.unlock();
+	}
 	// grant_waiting: destroyed while still queued: the holder's unlock skips it and frees the lock.
 	for (bool with_token : {false, true}) {
 		task::inline_scheduler s;
