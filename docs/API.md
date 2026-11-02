@@ -24,7 +24,9 @@ explains how each piece works.
   Checkpoints also observe a `cancel_token` and throw `task::cancelled`.
 - `cancel_source` / `cancel_token`: `request(reason)` is first-wins and sets a
   `cancel_reason` (`requested`, `deadline`, `shutdown`, or a library's own from `user`);
-  `requested()` is one atomic load, and an empty token allocates nothing.
+  `requested()` is one acquire load, and an empty token allocates nothing: a thread that sees
+  it true also sees every write the requester made before `request()`, so a payload can be
+  published before requesting and read after polling.
   `cancel_source(parent_token)` is requested with its parent. `cancel_callback(token, f)`
   runs `f(reason)` on the requesting thread, with `std::stop_callback`'s lifetime rules.
   `deadline(sched, time_point, parent = {})` is a source its scheduler's timer requests

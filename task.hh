@@ -682,7 +682,7 @@ public:
 
 	static cancel_state* make(cancel_state* parent);
 
-	bool requested() const noexcept { return word_.load(std::memory_order_relaxed) & requested_bit; }
+	bool requested() const noexcept { return word_.load(std::memory_order_acquire) & requested_bit; }
 	cancel_reason reason() const noexcept { return cancel_reason(word_.load(std::memory_order_acquire) >> 32); }
 	void disarm() noexcept { word_.fetch_or(disarmed_bit, std::memory_order_release); }
 

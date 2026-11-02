@@ -77,7 +77,7 @@ no `operator new`, exactly as frames do.
 ```cpp
 enum class cancel_reason : std::uint32_t { none = 0, requested = 1, deadline = 2, shutdown = 3, user = 64 };
 class cancel_token {   // one pointer; empty = never requested
-  bool requested() const noexcept;          // one relaxed load of the state word
+  bool requested() const noexcept;          // one acquire load of the state word
   cancel_reason reason() const noexcept;    // none until requested
 };
 class cancel_source {  // copies share the state, as today
@@ -104,6 +104,11 @@ template <class F> class cancel_callback {   // non-copyable, non-movable; lives
   ~cancel_callback();                            // deregisters; waits for f running on another thread
 };
 ```
+
+Ordering contract: `request()` is a release (acq_rel CAS) and `requested()` and `reason()` are acquire
+loads, so a poller that sees `requested()` true sees every write the requester made before
+`request()`; a callback gets the same ordering from the state's lock bit. On x86-64 the load is
+unchanged; on AArch64 it is one `ldapr` (or `ldar`).
 
 The node is the object itself, so registering allocates nothing; it holds a reference to the
 state, so a source may die first; an empty token makes it inert. `request()` sets the bit, then

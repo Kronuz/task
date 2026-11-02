@@ -38,9 +38,12 @@ executor and keeps demoted handles in a local queue drained one per executor pas
 
 `budget` converts its slice to cycle-counter ticks once (`rdtsc` on x86-64,
 `cntvct_el0` on AArch64, calibrated against `steady_clock` over 2 ms per process).
-`checkpoint()` is ready, and costs nothing beyond a counter read and a relaxed load
+`checkpoint()` is ready, and costs nothing beyond a counter read and an acquire load
 of the cancel flag, until the slice is spent; then it posts the coroutine as
 demoted.
+
+`requested()` is an acquire load and `request()` a release: a poller that sees the request also
+sees the requester's earlier writes (a disconnect reason, a shutdown payload).
 
 A slice is one resume. `running_on` stamps a thread-local slice start from the cycle
 counter when it is entered and restores the enclosing stamp when it leaves, and

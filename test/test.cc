@@ -515,6 +515,22 @@ void test_cancel_tokens() {
 		}
 		requester.join();
 	}
+	// D1: a poller that sees requested() also sees the requester's earlier writes (TSan reports
+	// a race on `data` if the load is relaxed).
+	for (int round = 0; round < 200; ++round) {
+		task::cancel_source s;
+		auto t = s.token();
+		int data = 0;
+		int seen = -1;
+		std::thread poller([&] {
+			while (!t.requested()) {}
+			seen = data;
+		});
+		data = 1;
+		s.request(cancel_reason::user);
+		poller.join();
+		CHECK(seen == 1);
+	}
 	CHECK(task::detail::live_frames() == base);
 }
 
