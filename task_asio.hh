@@ -20,24 +20,24 @@
  * THE SOFTWARE.
  */
 
-// Binds task<T> to standalone Asio: a scheduler over an Asio executor, and
-// as_awaitable() so asio::awaitable code can co_await a task.
+// Binds task<T> to standalone Asio: a scheduler over an Asio executor that owns its spawned
+// tasks as roots, and await_asio(), which awaits an Asio operation with an optional token.
 
 #pragma once
 
 #include "task.hh"
 
 #include <asio/any_io_executor.hpp>
-#include <asio/associated_executor.hpp>
-#include <asio/async_result.hpp>
-#include <asio/awaitable.hpp>
-#include <asio/dispatch.hpp>
+#include <asio/bind_cancellation_slot.hpp>
+#include <asio/cancellation_signal.hpp>
+#include <asio/error.hpp>
+#include <asio/io_context.hpp>
 #include <asio/post.hpp>
 #include <asio/steady_timer.hpp>
-#include <asio/use_awaitable.hpp>
 
 #include <atomic>
 #include <cassert>
+#include <exception>
 #include <optional>
 #include <tuple>
 
@@ -46,16 +46,27 @@ namespace task {
 // Runs handles on an Asio executor. Demoted handles wait in a local queue that a
 // self-reposting drainer empties one handle per pass, so ordinary posts that arrive
 // meanwhile run first. All calls happen on the executor's thread except post(),
-// demoted(), and the destructor. Handles queued in it must run to completion before it
-// is destroyed: the destructor asserts that no demoted handle remains.
+// post_call(), demoted(), and the teardown calls. Spawned tasks are roots until they end.
+//
+// Teardown, across every scheduler and pool a root may be suspended on: (1) stop and join
+// every loop; (2) close() every scheduler; (3) destroy_roots() on every one, with every
+// io_context alive; (4) destroy the schedulers, then the io_contexts. close() and
+// destroy_roots() are idempotent and run on the owner's thread after (1); the destructor
+// repeats them.
 class asio_scheduler {
 public:
-	explicit asio_scheduler(asio::any_io_executor executor) : executor_(std::move(executor)) {}
-	~asio_scheduler() { assert(demoted() == 0); }
+	explicit asio_scheduler(asio::any_io_executor executor)
+		: executor_(std::move(executor)), io_(executor_.target<asio::io_context::executor_type>()) {}
+	~asio_scheduler() {
+		assert(roots_.empty() || !io_ || io_->context().stopped());  // live roots need a stopped loop
+		close();
+		destroy_roots();
+	}
 	asio_scheduler(const asio_scheduler&) = delete;
 	asio_scheduler& operator=(const asio_scheduler&) = delete;
 
 	void post(std::coroutine_handle<> h) {
+		if (closed()) { return; }
 		asio::post(executor_, [this, h] {
 			running_on scope(scheduler_ref::of(*this));
 			h.resume();
@@ -63,12 +74,37 @@ public:
 	}
 
 	void post_demoted(std::coroutine_handle<> h) {
+		if (closed()) { return; }
 		demoted_.push_back(h);
 		demoted_count_.fetch_add(1, std::memory_order_relaxed);
 		if (!draining_) {
 			draining_ = true;
 			asio::post(executor_, [this] { drain(); });
 		}
+	}
+
+	// Runs fn(arg) on the executor; dropped when closed, destroyed unrun with a stopped loop.
+	void post_call(void (*fn)(void*), void* arg) {
+		if (closed()) { return; }
+		asio::post(executor_, [this, fn, arg] {
+			running_on scope(scheduler_ref::of(*this));
+			fn(arg);
+		});
+	}
+
+	// True on a thread running the io_context; false for other executor types.
+	bool runs_here() const noexcept { return io_ && io_->running_in_this_thread(); }
+
+	root_list* roots() noexcept { return &roots_; }
+
+	// Phase 2: post, post_demoted and post_call drop what they are given; spawn destroys its task.
+	void close() noexcept { roots_.close(); }
+	bool closed() const noexcept { return roots_.closed(); }
+	// Phase 3: destroys every root, then forgets the demoted handles (they were the roots').
+	void destroy_roots() noexcept {
+		roots_.destroy_all();
+		demoted_.clear();
+		demoted_count_.store(0, std::memory_order_relaxed);
 	}
 
 	std::uint64_t now() const noexcept {
@@ -95,6 +131,10 @@ public:
 
 private:
 	void drain() {
+		if (demoted_.empty()) {  // destroy_roots() forgot them
+			draining_ = false;
+			return;
+		}
 		auto h = demoted_.front();
 		demoted_.pop_front();
 		demoted_count_.fetch_sub(1, std::memory_order_relaxed);
@@ -110,29 +150,12 @@ private:
 	}
 
 	asio::any_io_executor executor_;
+	const asio::io_context::executor_type* io_;  // into executor_; null for other executor types
+	root_list roots_;
 	std::deque<std::coroutine_handle<>> demoted_;
 	std::atomic<std::size_t> demoted_count_{0};
 	bool draining_ = false;
 };
-
-// Runs t on scheduler s and completes on the awaiting coroutine's executor; exceptions
-// thrown by t propagate to the awaiter.
-template <typename T>
-asio::awaitable<T> as_awaitable(asio_scheduler& s, task<T> t) {
-	auto initiate = [&s](auto handler, task<T> work) {
-		spawn(scheduler_ref::of(s), std::move(work), [h = std::move(handler)](std::exception_ptr e, auto&&... value) mutable {
-			auto ex = asio::get_associated_executor(h);
-			asio::dispatch(ex, [h = std::move(h), e, ... value = std::move(value)]() mutable { std::move(h)(e, std::move(value)...); });
-		});
-	};
-	if constexpr (std::is_void_v<T>) {
-		co_await asio::async_initiate<const asio::use_awaitable_t<>&, void(std::exception_ptr)>(initiate, asio::use_awaitable, std::move(t));
-	} else {
-		auto v = co_await asio::async_initiate<const asio::use_awaitable_t<>&, void(std::exception_ptr, std::optional<T>)>(
-			initiate, asio::use_awaitable, std::move(t));
-		co_return std::move(*v);
-	}
-}
 
 namespace detail {
 
@@ -151,21 +174,35 @@ struct asio_result<A> {
 	static A take(std::tuple<A>& t) { return std::move(std::get<0>(t)); }
 };
 
+// One resume count: await_suspend's park and the handler hold one each, and a cancel posted
+// from another thread adds one. Whoever drops it to zero resumes the frame; await_suspend
+// dropping last continues in place, so a handler run inside initiation never resumes it.
+struct asio_park {
+	std::atomic<int> count_{2};
+	std::coroutine_handle<> h_;
+	scheduler_ref sched_;
+	void drop() {
+		if (count_.fetch_sub(1, std::memory_order_acq_rel) == 1) { resume_on(sched_, h_); }
+	}
+	bool park() noexcept { return count_.fetch_sub(1, std::memory_order_acq_rel) != 1; }
+};
+
 template <typename Sig, typename Init>
 class asio_awaiter;
 
 template <typename... A, typename Init>
-class asio_awaiter<void(A...), Init> {
+class asio_awaiter<void(A...), Init> : asio_park {
 public:
 	explicit asio_awaiter(Init init) : init_(std::move(init)) {}
 	asio_awaiter(const asio_awaiter&) = delete;
 	asio_awaiter& operator=(const asio_awaiter&) = delete;
 
 	bool await_ready() const noexcept { return false; }
-	void await_suspend(std::coroutine_handle<> h) {
+	bool await_suspend(std::coroutine_handle<> h) {
 		h_ = h;
 		sched_ = current();
-		init_(handler{this});  // the operation may complete before this returns, on another thread
+		init_(handler{this});  // a throw means no handler runs; it resumes the frame with it
+		return park();
 	}
 	typename asio_result<A...>::type await_resume() {
 		if constexpr (sizeof...(A) > 0) { return asio_result<A...>::take(*result_); }
@@ -176,28 +213,158 @@ private:
 		asio_awaiter* self;
 		void operator()(A... a) {
 			self->result_.emplace(std::move(a)...);
-			resume_on(self->sched_, self->h_);  // nothing touches *self after this
+			self->drop();  // nothing touches *self after this
 		}
 	};
 	Init init_;
-	std::coroutine_handle<> h_;
-	scheduler_ref sched_;
 	std::optional<std::tuple<A...>> result_;
+};
+
+template <typename>
+inline constexpr bool always_false = false;
+
+template <typename Sig, typename Init>
+class cancellable_asio_awaiter {
+	static_assert(always_false<Sig>, "await_asio with a token needs a signature beginning with asio::error_code");
+};
+
+// await_asio with a token. The callback is registered before the operation starts, a
+// requested token never starts it, and a cancel ends it through a cancellation slot:
+// emitted on the loop, or by a function posted there when requested from another thread.
+template <typename... R, typename Init>
+class cancellable_asio_awaiter<void(asio::error_code, R...), Init> : asio_park {
+public:
+	cancellable_asio_awaiter(Init init, cancel_token token) : init_(std::move(init)), token_(std::move(token)) {}
+	cancellable_asio_awaiter(const cancellable_asio_awaiter&) = delete;
+	cancellable_asio_awaiter& operator=(const cancellable_asio_awaiter&) = delete;
+	~cancellable_asio_awaiter() { cb_.reset(); }  // waits for a callback running elsewhere
+
+	bool await_ready() {
+		if (!token_.requested()) { return false; }
+		result_.emplace(asio::error::operation_aborted, R{}...);
+		return true;
+	}
+
+	bool await_suspend(std::coroutine_handle<> h) {
+		h_ = h;
+		sched_ = current();
+		if (detail::token_empty(token_)) {  // nothing can cancel it: no slot, no node
+			started_ = true;
+			init_(handler{this});
+			return park();
+		}
+#ifndef NDEBUG
+		on_loop_ = sched_.runs_here();
+#endif
+		cb_.emplace(token_, on_cancel{this});
+		TASK_TEST_HOOK(asio_registered);
+		if (token_.requested()) {
+			// Requested in between: initiate nothing. After the reset no callback starts, so
+			// a posted emit's count is the last; give up the handler's and suspend on it.
+			cb_.reset();
+			result_.emplace(asio::error::operation_aborted, R{}...);
+			count_.fetch_sub(1, std::memory_order_relaxed);
+			return park();
+		}
+		try {
+			init_(asio::bind_cancellation_slot(signal_.slot(), handler{this}));
+		} catch (...) {
+			cb_.reset();
+			error_ = std::current_exception();
+			if (!completed_) { count_.fetch_sub(1, std::memory_order_relaxed); }
+			return park();  // await_resume rethrows, after a posted emit if one is pending
+		}
+		started_ = true;
+		if (pending_) { signal_.emit(asio::cancellation_type::all); }  // requested during initiation
+		return park();
+	}
+
+	typename asio_result<asio::error_code, R...>::type await_resume() {
+		if (error_) { std::rethrow_exception(error_); }
+		return asio_result<asio::error_code, R...>::take(*result_);
+	}
+
+private:
+	struct handler {
+		cancellable_asio_awaiter* self;
+		void operator()(asio::error_code ec, R... r) {
+#ifndef NDEBUG
+			assert(!self->on_loop_ || self->sched_.runs_here());  // token-bound operations are loop-local
+#endif
+			self->result_.emplace(ec, std::move(r)...);
+			self->completed_ = true;
+			self->cb_.reset();  // waits for a callback on another thread; none starts after it
+			self->drop();
+		}
+	};
+
+	struct on_cancel {
+		cancellable_asio_awaiter* self;
+		void operator()() const { self->cancel(); }
+	};
+
+	void cancel() {
+		if (sched_.runs_here()) {
+			if (started_) {
+				signal_.emit(asio::cancellation_type::all);
+			} else {
+				pending_ = true;  // await_suspend emits once the slot holds the operation
+			}
+			return;
+		}
+		count_.fetch_add(1, std::memory_order_relaxed);
+		bool posted = false;
+		try {
+			posted = sched_.post_call(&emit_posted, this);
+		} catch (...) {}
+		if (!posted) { count_.fetch_sub(1, std::memory_order_relaxed); }  // no post_call: no cross-thread cancel
+	}
+
+	static void emit_posted(void* p) {
+		auto* self = static_cast<cancellable_asio_awaiter*>(p);
+		self->signal_.emit(asio::cancellation_type::all);
+		self->drop();
+	}
+
+	Init init_;
+	cancel_token token_;
+	std::optional<std::tuple<asio::error_code, R...>> result_;
+	std::exception_ptr error_;
+	asio::cancellation_signal signal_;
+	bool started_ = false;    // the loop's thread only
+	bool pending_ = false;    // the loop's thread only
+	bool completed_ = false;  // the loop's thread only
+#ifndef NDEBUG
+	bool on_loop_ = false;
+#endif
+	std::optional<cancel_callback<on_cancel>> cb_;
 };
 
 }  // namespace detail
 
 // Awaits an Asio operation: `init(handler)` starts it, and when the handler runs with the
 // arguments of the completion signature Sig, the task resumes through the scheduler it
-// suspended on, so the resumed run is a fresh slice on its own thread. The result is
-// void, the single argument, or a std::tuple of the arguments; an error_code is returned
-// like any other argument.
+// suspended on. A handler that runs inside init (a dispatch on the loop, a direct call)
+// only stores the result: the task then continues in place after init returns. The result
+// is void, the single argument, or a std::tuple of the arguments; an error_code is
+// returned like any other argument.
 //   auto [ec, n] = co_await task::await_asio<void(asio::error_code, std::size_t)>(
 //       [&](auto h) { socket.async_read_some(buffer, std::move(h)); });
-// The operation must complete (or be cancelled, which completes it) before the task ends.
+// The operation must complete (or be cancelled, which completes it) before the task ends,
+// except at teardown.
 template <typename Sig, typename Init>
 [[nodiscard]] detail::asio_awaiter<Sig, std::decay_t<Init>> await_asio(Init&& init) {
 	return detail::asio_awaiter<Sig, std::decay_t<Init>>(std::forward<Init>(init));
+}
+
+// The same with a token; Sig must begin with asio::error_code. A requested token never
+// calls init and completes with operation_aborted (other arguments value-initialized); a
+// request while the operation is pending cancels it through a cancellation slot. The
+// operation's I/O object must run on the awaiting scheduler's loop. A cancel that loses the
+// race returns the operation's real result: check token.requested() to know whether to stop.
+template <typename Sig, typename Init>
+[[nodiscard]] detail::cancellable_asio_awaiter<Sig, std::decay_t<Init>> await_asio(Init&& init, cancel_token token) {
+	return detail::cancellable_asio_awaiter<Sig, std::decay_t<Init>>(std::forward<Init>(init), std::move(token));
 }
 
 }  // namespace task

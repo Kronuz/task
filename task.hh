@@ -31,6 +31,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -120,7 +121,51 @@ concept scheduler = requires(S& s, std::coroutine_handle<> h) {
 	{ s.now() } -> std::convertible_to<std::uint64_t>;
 };
 
-// A type-erased reference to a scheduler: two pointers and a demotion hook.
+class root_list;
+
+namespace detail {
+
+// What scheduler_ref calls through. post_call, runs_here and roots are optional: null when
+// the scheduler does not declare them.
+struct scheduler_vtable {
+	void (*post)(void*, std::coroutine_handle<>);
+	void (*post_demoted)(void*, std::coroutine_handle<>);
+	void (*post_call)(void*, void (*)(void*), void*);
+	bool (*runs_here)(void*) noexcept;
+	root_list* (*roots)(void*) noexcept;
+};
+
+template <typename S>
+constexpr scheduler_vtable make_scheduler_vtable() noexcept {
+	scheduler_vtable t{};
+	t.post = [](void* p, std::coroutine_handle<> h) { static_cast<S*>(p)->post(h); };
+	if constexpr (requires(S& s) { s.post_demoted(std::coroutine_handle<>{}); }) {
+		t.post_demoted = [](void* p, std::coroutine_handle<> h) { static_cast<S*>(p)->post_demoted(h); };
+	} else {
+		t.post_demoted = t.post;
+	}
+	if constexpr (requires(S& s, void (*f)(void*), void* a) { s.post_call(f, a); }) {
+		t.post_call = [](void* p, void (*f)(void*), void* a) { static_cast<S*>(p)->post_call(f, a); };
+	}
+	if constexpr (requires(S& s) { { s.runs_here() } -> std::convertible_to<bool>; }) {
+		t.runs_here = [](void* p) noexcept -> bool { return static_cast<S*>(p)->runs_here(); };
+	}
+	if constexpr (requires(S& s) { { s.roots() } -> std::convertible_to<root_list*>; }) {
+		t.roots = [](void* p) noexcept -> root_list* { return static_cast<S*>(p)->roots(); };
+	}
+	return t;
+}
+
+template <typename S>
+inline constexpr scheduler_vtable scheduler_vtable_of = make_scheduler_vtable<S>();
+
+}  // namespace detail
+
+// A type-erased reference to a scheduler: the scheduler and its vtable. Optional members a
+// scheduler (or a wrapper forwarding to one) may declare, found by detection:
+//   bool runs_here() const noexcept;               true on the scheduler's own thread
+//   void post_call(void (*fn)(void*), void* arg);  runs fn(arg) on it; dropped when closed
+//   task::root_list* roots() noexcept;             spawned tasks are roots there (teardown)
 class scheduler_ref {
 public:
 	scheduler_ref() = default;
@@ -129,24 +174,28 @@ public:
 	static scheduler_ref of(S& s) noexcept {
 		scheduler_ref r;
 		r.self_ = &s;
-		r.post_ = [](void* p, std::coroutine_handle<> h) { static_cast<S*>(p)->post(h); };
-		if constexpr (requires { s.post_demoted(std::coroutine_handle<>{}); }) {
-			r.demote_ = [](void* p, std::coroutine_handle<> h) { static_cast<S*>(p)->post_demoted(h); };
-		} else {
-			r.demote_ = r.post_;
-		}
+		r.vt_ = &detail::scheduler_vtable_of<S>;
 		return r;
 	}
 
-	void post(std::coroutine_handle<> h) const { post_(self_, h); }
-	void post_demoted(std::coroutine_handle<> h) const { demote_(self_, h); }
+	void post(std::coroutine_handle<> h) const { vt_->post(self_, h); }
+	void post_demoted(std::coroutine_handle<> h) const { vt_->post_demoted(self_, h); }
+	// Queues fn(arg) on the scheduler; false (nothing queued) when it declares no post_call.
+	bool post_call(void (*fn)(void*), void* arg) const {
+		if (!vt_ || !vt_->post_call) { return false; }
+		vt_->post_call(self_, fn, arg);
+		return true;
+	}
+	// True on the scheduler's own thread; false when it cannot tell.
+	bool runs_here() const noexcept { return vt_ && vt_->runs_here && vt_->runs_here(self_); }
+	// Where spawn links its roots; null when the scheduler owns none.
+	root_list* roots() const noexcept { return vt_ && vt_->roots ? vt_->roots(self_) : nullptr; }
 	explicit operator bool() const noexcept { return self_ != nullptr; }
 	friend bool operator==(const scheduler_ref& a, const scheduler_ref& b) noexcept { return a.self_ == b.self_; }
 
 private:
 	void* self_ = nullptr;
-	void (*post_)(void*, std::coroutine_handle<>) = nullptr;
-	void (*demote_)(void*, std::coroutine_handle<>) = nullptr;
+	const detail::scheduler_vtable* vt_ = nullptr;
 };
 
 namespace detail {
@@ -315,9 +364,19 @@ inline std::ptrdiff_t live_frames() noexcept {
 #endif
 }
 
+// TASK_FRAME_POOL=0 sends every pooled block to operator new, so a bench can count task
+// frames against another library's allocations.
+#ifndef TASK_FRAME_POOL
+#define TASK_FRAME_POOL 1
+#endif
+
 struct pooled_frame {
 	static void* operator new(std::size_t n) {
+#if TASK_FRAME_POOL
 		void* p = pool().allocate(n);
+#else
+		void* p = ::operator new(n);
+#endif
 #if TASK_COUNT_FRAMES
 		live_count.fetch_add(1, std::memory_order_relaxed);
 #endif
@@ -327,7 +386,12 @@ struct pooled_frame {
 #if TASK_COUNT_FRAMES
 		live_count.fetch_sub(1, std::memory_order_relaxed);
 #endif
+#if TASK_FRAME_POOL
 		pool().deallocate(p, n);
+#else
+		(void)n;
+		::operator delete(p);
+#endif
 	}
 };
 
@@ -338,6 +402,8 @@ struct pooled_frame {
 namespace detail::test_hooks {
 inline thread_local void (*after_enqueue)() = nullptr;  // async_mutex::lock(token), before registering
 inline thread_local void (*before_link)() = nullptr;    // cancel_source(parent), before registering on it
+inline thread_local void (*cancel_settled)() = nullptr;  // a lock(token) cancel callback, between settle and wake
+inline thread_local void (*asio_registered)() = nullptr; // await_asio(init, token), between registering and the check
 }  // namespace detail::test_hooks
 #define TASK_TEST_HOOK(name) \
 	do { \
@@ -510,9 +576,14 @@ inline task<void> promise<void>::get_return_object() noexcept { return task<void
 
 namespace detail {
 
-// A self-destroying coroutine that runs one task to completion.
+// A self-destroying coroutine that runs one task to completion. A spawned one is a root:
+// linked into its scheduler's root_list until it ends or the list destroys it.
 struct detached {
 	struct promise_type : pooled_frame {
+		root_list* list = nullptr;
+		promise_type* prev = nullptr;
+		promise_type* next = nullptr;
+		~promise_type();
 		detached get_return_object() noexcept { return {std::coroutine_handle<promise_type>::from_promise(*this)}; }
 		std::suspend_always initial_suspend() noexcept { return {}; }
 		std::suspend_never final_suspend() noexcept { return {}; }
@@ -538,10 +609,84 @@ detached run_then(task<T> t, F done) {
 
 }  // namespace detail
 
-// Queues t on scheduler s; done(exception_ptr[, optional<T>]) runs when it finishes.
+// The tasks spawned on a scheduler that have not finished, so its owner can destroy the
+// ones still suspended at teardown (close(), then destroy_all(), after every loop a root
+// may be suspended on has stopped). Linking and unlinking take one uncontended lock.
+class root_list {
+public:
+	root_list() = default;
+	root_list(const root_list&) = delete;
+	root_list& operator=(const root_list&) = delete;
+	~root_list() { assert(!head_); }
+
+	// After close(), spawn destroys the task it is given instead of linking it.
+	void close() noexcept {
+		std::lock_guard g(m_);
+		closed_.store(true, std::memory_order_release);
+	}
+	bool closed() const noexcept { return closed_.load(std::memory_order_acquire); }
+	bool empty() const noexcept {
+		std::lock_guard g(m_);
+		return head_ == nullptr;
+	}
+
+	// Destroys every root, one at a time outside the lock; each destroys its awaited chain.
+	void destroy_all() noexcept {
+		for (;;) {
+			detail::detached::promise_type* r;
+			{
+				std::lock_guard g(m_);
+				r = head_;
+				if (!r) { return; }
+				head_ = r->next;
+				if (head_) { head_->prev = nullptr; }
+				r->list = nullptr;
+				r->next = nullptr;
+			}
+			std::coroutine_handle<detail::detached::promise_type>::from_promise(*r).destroy();
+		}
+	}
+
+	// Links r; false when closed.
+	bool link(detail::detached::promise_type* r) noexcept {
+		std::lock_guard g(m_);
+		if (closed_.load(std::memory_order_relaxed)) { return false; }
+		r->list = this;
+		r->prev = nullptr;
+		r->next = head_;
+		if (head_) { head_->prev = r; }
+		head_ = r;
+		return true;
+	}
+	void unlink(detail::detached::promise_type* r) noexcept {
+		std::lock_guard g(m_);
+		(r->prev ? r->prev->next : head_) = r->next;
+		if (r->next) { r->next->prev = r->prev; }
+		r->list = nullptr;
+	}
+
+private:
+	mutable std::mutex m_;
+	std::atomic<bool> closed_{false};
+	detail::detached::promise_type* head_ = nullptr;
+};
+
+inline detail::detached::promise_type::~promise_type() {
+	if (list) { list->unlink(this); }
+}
+
+// Queues t on scheduler s; done(exception_ptr[, optional<T>]) runs when it finishes. On a
+// scheduler that owns roots the task is one until it finishes; on a closed one, t and done
+// are destroyed at once, unrun, and done is never called.
 template <typename T, typename F>
 void spawn(scheduler_ref s, task<T> t, F done) {
 	auto d = detail::run_then(std::move(t), std::move(done));
+	if (root_list* roots = s.roots()) {
+		if (!roots->link(&d.h.promise())) {
+			d.h.destroy();
+			return;
+		}
+	}
 	s.post(d.h);
 }
 
@@ -836,6 +981,11 @@ inline void cancel_state::destroy() noexcept {
 
 template <typename F>
 class cancel_callback;
+class cancel_token;
+
+namespace detail {
+bool token_empty(const cancel_token& t) noexcept;
+}
 
 // A view of a source's state: polling is one relaxed load, and an empty token (the default)
 // is never requested and allocates nothing.
@@ -861,11 +1011,15 @@ private:
 	friend class cancel_source;
 	template <typename F>
 	friend class cancel_callback;
+	friend bool detail::token_empty(const cancel_token& t) noexcept;
 	explicit cancel_token(detail::cancel_state* s) noexcept : s_(s) {
 		if (s_) { s_->retain(); }
 	}
 	detail::cancel_state* s_ = nullptr;
 };
+
+// True for a token no source can request (the default one).
+inline bool detail::token_empty(const cancel_token& t) noexcept { return t.s_ == nullptr; }
 
 // Requests cancellation; copies share the state. A source built from a parent token is
 // requested, with the parent's reason, when the parent is.
@@ -966,15 +1120,20 @@ class deadline {
 
 public:
 	deadline(S& s, std::chrono::steady_clock::time_point at, const cancel_token& parent = {})
-		: source_(parent), timer_(s.start_timer(at, fire{source_.s_})) {}
+		: sched_(s), source_(parent), timer_(s.start_timer(at, fire{source_.s_})) {}
 	deadline(const deadline&) = delete;
 	deadline& operator=(const deadline&) = delete;
-	~deadline() { source_.s_->disarm(); }  // before the timer is destroyed
+	// Runs on the deadline's loop, or after its scheduler was closed (teardown).
+	~deadline() {
+		if constexpr (requires { sched_.runs_here(); sched_.closed(); }) { assert(sched_.runs_here() || sched_.closed()); }
+		source_.s_->disarm();  // before the timer is destroyed
+	}
 
 	cancel_token token() const noexcept { return source_.token(); }
 	bool expired() const noexcept { return source_.reason() == cancel_reason::deadline; }
 
 private:
+	S& sched_;
 	cancel_source source_;
 	timer_type timer_;
 };
@@ -1023,16 +1182,40 @@ inline void resume_on(scheduler_ref s, std::coroutine_handle<> h) {
 }
 }  // namespace detail
 
+namespace detail {
+#ifndef NDEBUG
+inline std::atomic<std::size_t> orphan_count{0};
+#endif
+// Waiters an event's destructor left behind (Debug builds; 0 otherwise).
+inline std::size_t orphaned_waiters() noexcept {
+#ifndef NDEBUG
+	return orphan_count.load(std::memory_order_relaxed);
+#else
+	return 0;
+#endif
+}
+}  // namespace detail
+
 // A one-shot completion. Awaiting it suspends until set(); each waiter resumes through the
 // scheduler it suspended on, in the order it began waiting, so a waiter never runs inside
-// set(). set() is idempotent and callable from any thread. Waiters must run to completion:
-// the event's destructor asserts that none is left.
+// set(). set() is idempotent and callable from any thread. At teardown (no thread can call
+// set()), a waiting frame may be destroyed: it unlinks itself; an event destroyed with
+// waiters marks them orphaned, counted in Debug by detail::orphaned_waiters().
 class event {
 public:
 	event() = default;
 	event(const event&) = delete;
 	event& operator=(const event&) = delete;
-	~event() { assert(head_.load(std::memory_order_relaxed) == set_marker() || head_.load(std::memory_order_relaxed) == nullptr); }
+	~event() {
+		node* n = head_.load(std::memory_order_acquire);
+		if (n == set_marker()) { return; }
+		for (; n; n = n->next) {
+			n->state = node::orphaned;
+#ifndef NDEBUG
+			detail::orphan_count.fetch_add(1, std::memory_order_relaxed);
+#endif
+		}
+	}
 
 	bool is_set() const noexcept { return head_.load(std::memory_order_acquire) == set_marker(); }
 
@@ -1048,22 +1231,33 @@ public:
 		}
 		while (first) {
 			node* n = std::exchange(first, first->next);  // read before n's frame can end
+			n->state = node::taken;
 			detail::resume_on(n->sched, n->handle);
 		}
 	}
 
 	struct awaiter {
+		enum : unsigned char { idle, linked, taken, orphaned };
 		event& e;
 		std::coroutine_handle<> handle;
 		scheduler_ref sched;
 		awaiter* next = nullptr;
+		unsigned char state = idle;
+		// A frame destroyed while waiting (teardown only): leave the event consistent.
+		~awaiter() {
+			if (state == linked) { e.unlink(this); }
+		}
 		bool await_ready() const noexcept { return e.is_set(); }
 		bool await_suspend(std::coroutine_handle<> h) noexcept {
 			handle = h;
 			sched = current();
+			state = linked;
 			node* head = e.head_.load(std::memory_order_acquire);
 			do {
-				if (head == set_marker()) { return false; }
+				if (head == set_marker()) {
+					state = idle;
+					return false;
+				}
 				next = head;
 			} while (!e.head_.compare_exchange_weak(head, this, std::memory_order_acq_rel, std::memory_order_acquire));
 			return true;  // set() may already be resuming this frame: touch nothing more
@@ -1074,6 +1268,20 @@ public:
 
 private:
 	using node = awaiter;
+	// Teardown only: no thread may be in set().
+	void unlink(node* w) noexcept {
+		node* n = head_.load(std::memory_order_relaxed);
+		if (n == w) {
+			head_.store(w->next, std::memory_order_relaxed);
+			return;
+		}
+		for (; n && n != set_marker(); n = n->next) {
+			if (n->next == w) {
+				n->next = w->next;
+				return;
+			}
+		}
+	}
 	static node* set_marker() noexcept { return reinterpret_cast<node*>(std::uintptr_t(1)); }
 	std::atomic<node*> head_{nullptr};
 };
@@ -1118,7 +1326,10 @@ struct lock_waiter : pooled_frame {
 struct lock_cancel {
 	lock_waiter* w;
 	void operator()() const noexcept {
-		if (w->settle(lock_waiter::timed_out)) { w->wake(); }
+		if (w->settle(lock_waiter::timed_out)) {
+			TASK_TEST_HOOK(cancel_settled);
+			w->wake();
+		}
 	}
 };
 
@@ -1330,15 +1541,19 @@ struct when_all_state {
 	std::atomic<bool> errored{false};
 };
 
+// Owns one child: the parent's container destroys a child that has not finished (a frame
+// destroyed at teardown); a finished child destroys itself and clears its owner.
 struct when_all_child {
 	struct promise_type : pooled_frame {
 		when_all_state* state = nullptr;
+		std::coroutine_handle<promise_type>* owner = nullptr;
 		when_all_child get_return_object() noexcept { return {std::coroutine_handle<promise_type>::from_promise(*this)}; }
 		std::suspend_always initial_suspend() noexcept { return {}; }
 		struct final_awaiter {
 			bool await_ready() noexcept { return false; }
 			std::coroutine_handle<> await_suspend(std::coroutine_handle<promise_type> h) noexcept {
 				when_all_state* s = h.promise().state;
+				*h.promise().owner = nullptr;
 				h.destroy();
 				if (s->pending.fetch_sub(1, std::memory_order_acq_rel) == 1) { return transfer(s->parent); }
 				return std::noop_coroutine();
@@ -1349,6 +1564,12 @@ struct when_all_child {
 		void return_void() noexcept {}
 		void unhandled_exception() noexcept { std::terminate(); }
 	};
+	when_all_child(std::coroutine_handle<promise_type> c) noexcept : h(c) {}
+	when_all_child(when_all_child&& o) noexcept : h(std::exchange(o.h, {})) {}
+	when_all_child& operator=(when_all_child&&) = delete;
+	~when_all_child() {
+		if (h) { h.destroy(); }
+	}
 	std::coroutine_handle<promise_type> h;
 };
 
@@ -1368,13 +1589,16 @@ when_all_child run_child(task<T> t, result_t<T>& out, when_all_state& s) {
 // Awaiting starts every child, then suspends until the last one finishes.
 struct when_all_awaiter {
 	when_all_state& state;
-	std::vector<when_all_child>& children;
-	bool await_ready() const noexcept { return children.empty(); }
+	when_all_child* children;
+	std::size_t n;
+	bool await_ready() const noexcept { return n == 0; }
 	bool await_suspend(std::coroutine_handle<> parent) {
 		state.parent = parent;
-		for (auto& c : children) {
-			c.h.promise().state = &state;
-			c.h.resume();
+		for (std::size_t i = 0; i < n; ++i) {
+			auto h = children[i].h;  // the child may finish, and clear its slot, inside resume()
+			h.promise().state = &state;
+			h.promise().owner = &children[i].h;
+			h.resume();
 		}
 		// The extra count held while starting: the last child may already be done.
 		return state.pending.fetch_sub(1, std::memory_order_acq_rel) != 1;
@@ -1393,7 +1617,7 @@ task<std::vector<detail::result_t<T>>> when_all(std::vector<task<T>> tasks) {
 	std::vector<detail::when_all_child> children;
 	children.reserve(tasks.size());
 	for (std::size_t i = 0; i < tasks.size(); ++i) { children.push_back(detail::run_child(std::move(tasks[i]), results[i], state)); }
-	co_await detail::when_all_awaiter{state, children};
+	co_await detail::when_all_awaiter{state, children.data(), children.size()};
 	if (state.error) { std::rethrow_exception(state.error); }
 	co_return results;
 }
@@ -1402,12 +1626,10 @@ template <typename... T>
 task<std::tuple<detail::result_t<T>...>> when_all(task<T>... tasks) {
 	std::tuple<detail::result_t<T>...> results;
 	detail::when_all_state state{sizeof...(T) + 1, {}, {}};
-	std::vector<detail::when_all_child> children;
-	children.reserve(sizeof...(T));
-	[&]<std::size_t... I>(std::index_sequence<I...>) {
-		(children.push_back(detail::run_child(std::move(tasks), std::get<I>(results), state)), ...);
+	auto children = [&]<std::size_t... I>(std::index_sequence<I...>) {
+		return std::array<detail::when_all_child, sizeof...(T)>{detail::run_child(std::move(tasks), std::get<I>(results), state)...};
 	}(std::index_sequence_for<T...>{});
-	co_await detail::when_all_awaiter{state, children};
+	co_await detail::when_all_awaiter{state, children.data(), children.size()};
 	if (state.error) { std::rethrow_exception(state.error); }
 	co_return results;
 }

@@ -122,7 +122,7 @@ int main() {
 			latencies.push_back(double(task::cycles::read() - t) / task::cycles::per_ns());
 		}
 	};
-	asio::co_spawn(io, [&]() -> asio::awaitable<void> { co_await task::as_awaitable(as, yields()); }, asio::detached);
+	task::spawn(task::scheduler_ref::of(as), yields());
 	io.run();
 	std::sort(latencies.begin(), latencies.end());
 	auto at = [&](double q) { return latencies[std::size_t(q * double(latencies.size() - 1))]; };

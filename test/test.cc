@@ -294,6 +294,36 @@ struct self_destroying {
 	}
 };
 
+// D9: children that wait forever, counting their destruction.
+struct destroy_mark {
+	int* n;
+	~destroy_mark() { ++*n; }
+};
+task::task<int> waits_forever(task::event& e, int* destroyed) {
+	destroy_mark m{destroyed};
+	co_await e;
+	co_return 1;
+}
+task::task<void> joins(task::event& e, int* destroyed, bool variadic) {
+	if (variadic) {
+		co_await task::when_all(waits_forever(e, destroyed), answer());
+	} else {
+		std::vector<task::task<int>> v;
+		v.push_back(waits_forever(e, destroyed));
+		v.push_back(waits_forever(e, destroyed));
+		v.push_back(answer());
+		co_await task::when_all(std::move(v));
+	}
+}
+#if TEST_COUNTS_NEW
+task::task<void> joins_in_loop(std::size_t* allocs) {
+	co_await task::when_all(answer(), add(1, 2));  // warm the pool
+	const std::size_t before = allocations.load();
+	for (int i = 0; i < 1000; ++i) { co_await task::when_all(answer(), add(1, 2)); }
+	*allocs = allocations.load() - before;
+}
+#endif
+
 task::cancel_source* hook_parent = nullptr;
 void hook_request_parent() { hook_parent->request(task::cancel_reason::shutdown); }
 
@@ -625,6 +655,26 @@ int main(int argc, char** argv) {
 		CHECK(caught);
 		CHECK(task::run(s, task::when_all(std::vector<task::task<int>>{})).empty());
 	}
+	// when_all owns its children: destroying it with children suspended destroys them (D9).
+	for (bool variadic : {false, true}) {
+		const auto base = task::detail::live_frames();
+		task::event never;
+		int destroyed = 0;
+		auto parent = joins(never, &destroyed, variadic);
+		s.post(parent.handle());
+		s.run();
+		CHECK(destroyed == 0);
+		parent = {};
+		CHECK(destroyed == (variadic ? 1 : 2));
+		CHECK(task::detail::live_frames() == base);
+	}
+#if TEST_COUNTS_NEW
+	{  // the variadic form allocates nothing once frames are pooled
+		std::size_t allocs = 99;
+		task::run(s, joins_in_loop(&allocs));
+		CHECK(allocs == 0);
+	}
+#endif
 
 	// sync_wait: blocks the caller until a task finishes on another thread.
 	{

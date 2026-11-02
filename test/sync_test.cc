@@ -866,6 +866,93 @@ void test_lock_destroyed() {
 		CHECK(m.try_lock());
 		m.unlock();
 	}
+	// X3 (C1 review): the frame is destroyed while its cancel callback runs on another thread,
+	// between settle and wake. The destructor deregisters (waiting for the callback) before it
+	// gives up its reference, so the callback's wake never meets a freed waiter even when the
+	// holder's unlock sheds the entry meanwhile.
+	{
+		task::inline_scheduler s;
+		task::async_mutex m;
+		CHECK(m.try_lock());
+		task::cancel_source source;
+		probe_result w;
+		auto t = token_waiter(m, source.token(), &w);
+		s.post(t.handle());
+		s.run();  // queued
+		static std::atomic<bool> in_callback;
+		static task::async_mutex* holder;
+		in_callback = false;
+		holder = &m;
+		std::thread requester([&] {
+			task::detail::test_hooks::cancel_settled = [] {
+				in_callback = true;
+				std::this_thread::sleep_for(std::chrono::milliseconds(50));  // the frame dies meanwhile
+				holder->unlock();  // sheds the timed-out entry
+			};
+			source.request();
+			task::detail::test_hooks::cancel_settled = nullptr;
+		});
+		while (!in_callback) { std::this_thread::yield(); }
+		t = {};  // waits for the callback to return
+		requester.join();
+		CHECK(w.resumed == 0);
+		CHECK(s.queued() == 1);  // the wake posted the dead handle; a closed scheduler drops it
+		CHECK(m.try_lock());
+		m.unlock();
+	}
+	CHECK(task::detail::live_frames() == base);
+}
+
+// An event's waiters at teardown: a frame destroyed while linked unlinks itself, one whose
+// wake was dropped leaves the event alone, and an event destroyed first orphans its waiters.
+void test_event_teardown() {
+	const auto base = task::detail::live_frames();
+	// Destroyed while linked (the middle of three): set() resumes only the other two.
+	{
+		task::inline_scheduler s;
+		task::event e;
+		std::vector<int> order;
+		auto a = wait_then_record(e, &order, 0), b = wait_then_record(e, &order, 1), c = wait_then_record(e, &order, 2);
+		for (auto* t : {&a, &b, &c}) { s.post(t->handle()); }
+		s.run();
+		b = {};
+		e.set();
+		CHECK(s.queued() == 2);
+		s.run();
+		CHECK((order == std::vector<int>{0, 2}));
+	}
+	// Taken by set() (its wake dropped, as by a closed scheduler), then the event and the frame
+	// die: the frame does not touch the event.
+	{
+		task::inline_scheduler s;
+		auto* e = new task::event;
+		std::vector<int> order;
+		auto a = wait_then_record(*e, &order, 0);
+		s.post(a.handle());
+		s.run();
+		e->set();
+		delete e;
+		a = {};  // the queued wake is never run
+		CHECK(order.empty());
+	}
+	// The event dies first: its waiter is orphaned (counted in Debug) and later destroyed.
+	{
+		task::inline_scheduler s;
+		auto* e = new task::event;
+		std::vector<int> order;
+		auto a = wait_then_record(*e, &order, 0);
+		s.post(a.handle());
+		s.run();
+		const auto orphans = task::detail::orphaned_waiters();
+		delete e;
+#ifndef NDEBUG
+		CHECK(task::detail::orphaned_waiters() == orphans + 1);
+#else
+		(void)orphans;
+#endif
+		a = {};
+		CHECK(order.empty());
+	}
 	CHECK(task::detail::live_frames() == base);
 }
 
@@ -893,7 +980,7 @@ void test_destructor_asserts() {
 		CHECK(m.try_lock());
 		m.unlock();
 	}));
-	CHECK(aborts([] {  // an event with a waiter
+	CHECK(!aborts([] {  // an event with a waiter orphans it instead of asserting
 		task::inline_scheduler s;
 		auto* e = new task::event;
 		std::vector<int> order;
@@ -949,6 +1036,7 @@ int main() {
 	test_deadline();
 	test_lock_token();
 	test_lock_destroyed();
+	test_event_teardown();
 	std::printf("task_sync: %s\n", failures ? "FAILED" : "ok");
 	return failures ? EXIT_FAILURE : EXIT_SUCCESS;
 }
