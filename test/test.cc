@@ -3,6 +3,7 @@
 // sync_wait (threads, ordering, restore, pool bound), a randomized cancellation stress run (argv[1] tasks, default 1,000,000),
 // and cancel tokens: reasons, callbacks and linked sources.
 #define TASK_COUNT_FRAMES 1
+#define TASK_TEST_HOOKS 1
 #include "task.hh"
 
 #include <atomic>
@@ -293,6 +294,9 @@ struct self_destroying {
 	}
 };
 
+task::cancel_source* hook_parent = nullptr;
+void hook_request_parent() { hook_parent->request(task::cancel_reason::shutdown); }
+
 void test_cancel_tokens() {
 	using task::cancel_reason;
 	const auto base = task::detail::live_frames();
@@ -460,6 +464,13 @@ void test_cancel_tokens() {
 		parent.request(cancel_reason::deadline);
 		task::cancel_source child(parent.token());
 		CHECK(child.requested() && child.reason() == cancel_reason::deadline);
+		// Requested after the check and before the child registers: still born requested.
+		task::cancel_source late;
+		hook_parent = &late;
+		task::detail::test_hooks::before_link = hook_request_parent;
+		task::cancel_source late_child(late.token());
+		task::detail::test_hooks::before_link = nullptr;
+		CHECK(late_child.requested() && late_child.reason() == cancel_reason::shutdown);
 		task::cancel_source alone{task::cancel_token{}};
 		CHECK(!alone.requested() && alone.request() && alone.reason() == cancel_reason::requested);
 	}

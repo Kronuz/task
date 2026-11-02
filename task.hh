@@ -341,6 +341,7 @@ struct pooled_frame {
 #ifdef TASK_TEST_HOOKS
 namespace detail::test_hooks {
 inline thread_local void (*after_enqueue)() = nullptr;  // async_mutex::lock(token), before registering
+inline thread_local void (*before_link)() = nullptr;    // cancel_source(parent), before registering on it
 }  // namespace detail::test_hooks
 #define TASK_TEST_HOOK(name) \
 	do { \
@@ -809,6 +810,7 @@ inline cancel_state* cancel_state::make(cancel_state* parent) {
 		s->word_.store(requested_bit | (std::uint64_t(parent->reason()) << 32), std::memory_order_relaxed);
 		return s;
 	}
+	TASK_TEST_HOOK(before_link);
 	auto* s = new linked_cancel_state;
 	s->word_.store(linked_bit, std::memory_order_relaxed);
 	s->run = [](cancel_node* n, cancel_reason r) noexcept { static_cast<linked_cancel_state*>(n)->request(r); };
