@@ -158,7 +158,9 @@ race is "arm a deadline, pass its token to the operation", the shape `expire_rea
 Q1 (a), ruled: `async_mutex::lock(cancel_token t = {})` replaces `lock_until`/`lock_for`
 (`task.hh:898-951`).
 
-1. An empty token is today's `lock_awaiter` (`:872-893`) exactly.
+1. `lock()` with no argument is today's `lock_awaiter` (`:872-893`) exactly. `lock(token)` is a
+   separate overload returning `cancellable_lock_awaiter` (80 bytes against 16), so frames that
+   never pass a token do not grow; an empty token behaves as `lock()` (its registration is inert).
 2. A free lock is taken whatever the token (`await_ready` tries it, as `timed_awaiter` does,
    `:912`). A requested token that finds the lock held returns an empty guard without queueing.
 3. Otherwise the awaiter enqueues (`:955-973`), then registers a `cancel_callback` whose body is
