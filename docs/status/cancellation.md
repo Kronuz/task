@@ -29,7 +29,7 @@
   - [ ] K7 T7 greps empty (`as_awaitable`; `lock_until`/`lock_for` in task and, at its wave
     commit, Xapiand)
 - Done: revision 1 (task:6d361ca); Xapiand lead's notes recorded (task:3686135); review pointer
-  (task:0585469); revision 2 and this ledger (see log).
+  (task:0585469); revision 2 and this ledger (task:1132c04).
 - Doing: nothing.
 - Next:
   1. The rechecker's scoped re-check of D5, D6, D8 against `.scratch/arch-review-rev2/`.
@@ -45,4 +45,4 @@
 ## Log
 - 2026-11-02: revision 2 of `docs/design/cancellation.md` folds in the architect's REJECT
   (http:1ae1390) and the Xapiand lead's notes; "Review response" table by finding ID; ledger
-  created; State ready for re-check.
+  created; State ready for re-check (task:1132c04).
