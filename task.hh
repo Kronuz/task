@@ -301,11 +301,7 @@ inline frame_pool& pool() {
 // Counts pooled blocks alive (frames of both pool paths, lock waiters, cancel states) when
 // TASK_COUNT_FRAMES is set; tests assert it returns to its baseline.
 #ifndef TASK_COUNT_FRAMES
-#ifdef NDEBUG
 #define TASK_COUNT_FRAMES 0
-#else
-#define TASK_COUNT_FRAMES 1
-#endif
 #endif
 #if TASK_COUNT_FRAMES
 inline std::atomic<std::ptrdiff_t> live_count{0};

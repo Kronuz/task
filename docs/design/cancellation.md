@@ -338,7 +338,8 @@ may be suspended on:
    `pooled_frame::operator new`/`delete` (`task.hh:300-303`), so it covers both allocation paths:
    pooled classes and frames over 2 KiB that `frame_pool` hands to `operator new` (`:255`; http's
    connection frame is one, `char tmp[64 * 1024]`, `http_asio.h:765`), plus `lock_waiter`s (`:750`)
-   and D1's cancel states. On when `TASK_COUNT_FRAMES` is set (default without `NDEBUG`); tests
+   and D1's cancel states. On when `TASK_COUNT_FRAMES` is set (opt-in, off in every build type, so
+   Debug pays no global read-modify-write per allocation; the test targets set it); tests
    assert it returns to its baseline; Linux ASan runs LSan too. Frames that are not roots, whose
    dropped post therefore leaks visibly: the `sync_wait` driver (`task.hh:548`, a `detached` that
    `sync_wait` resumes without `spawn`), tasks posted by handle rather than spawned (the probes'
