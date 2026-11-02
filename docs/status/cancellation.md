@@ -2,78 +2,80 @@
 
 # cancellation
 
-- Design: `docs/design/cancellation.md` revision 2 (this branch); revision 1 at task:6d361ca.
+- Design: `docs/design/cancellation.md` revision 2, with C1's and C2's text fixes (NF1-NF3,
+  CN-R3 wording, CR6, D8.7, Limit 3: task:1c30b8b); revision 1 at task:6d361ca.
   Reviews: architect, http `docs/reviews/task-handlers-rev2-design.md` at http:1ae1390, REJECT
-  (2026-11-02, CN-L1, CN-L2, C8-C11; Q1-Q3 ruled (a)); Xapiand lead,
-  `docs/reviews/cancellation-xapiand.md` (2026-11-02, XN1-XN3); pointer
-  `docs/reviews/cancellation-design.md`.
-- Branch / worktree: `design/cancellation` at `~/code/Kronuz/task-wt/cancellation`; step C1 on
-  `phase/cancellation-c1` at `~/code/Kronuz/task-wt/cancellation-c1`; head: `git log -1`.
-- State: C1 (D1-D4) implemented, code review conditions CR1-CR6 folded in (2026-11-02), ready for the scoped re-check; C2 (D5, D7-D10) and C3 (D6)
-  not started. Re-check CLEARED WITH CONDITIONS (2026-11-02, `docs/reviews/cancellation-design.md`).
+  (2026-11-02, CN-L1, CN-L2, C8-C11; Q1-Q3 ruled (a)); re-check CLEARED WITH CONDITIONS
+  (`docs/reviews/cancellation-design.md`); Xapiand lead, `docs/reviews/cancellation-xapiand.md`
+  (XN1-XN3); C1 code review `docs/reviews/cancellation-c1-code.md` (CR1-CR6, X3).
+- Branch / worktree: C2 on `phase/cancellation-c2` at `~/code/Kronuz/task-wt/cancellation-c2`
+  (from task:b406766, C1 landed); head: `git log -1`.
+- State: C2 (D5, D7-D10, K9-K12) implemented and proven (see "C2 evidence"), ready for code
+  review; C3 (D6) not started.
 - Done criteria (set by the lead; contributors tick, never edit; they apply to steps C1-C3):
   - [ ] K1 Every decision's T1 tests pass, and each fails with its fix reverted (the revert and the
-    failure recorded here once per decision, D1-D8)
-  - [ ] K2 The review's probes rerun clean on the branch headers (T3): teardown probes
+    failure recorded here once per decision, D1-D8): D1-D4 in "C1 evidence"; D5, D7, D8 (and D9,
+    K12) in "C2 evidence"; D6 is C3's
+  - [x] K2 The review's probes rerun clean on the branch headers (T3): teardown probes
     (`crossroot`, `holder` in both orders, `grant_destroyed`, `dispatch_inline`, revision 1's
     `teardown`) ASan clean; race probes (`race`, the cross-thread cancel, `late_fire`) TSan clean;
-    `channel`, `composed` unchanged; results in this worktree's `.scratch/` `results.txt`
+    `channel`, `composed` unchanged; results in this worktree's `.scratch/` `results.txt`:
+    `.scratch/arch-review-rev2/results.txt` (27 of 27 runs exit 0, no sanitizer report),
+    `.scratch/arch-review/results.txt` (`teardown` 1 of 1, `cancel` 0.0-0.1 ms in all three
+    builds); the cross-thread cancel is T1 (10,000 iterations, TSan clean)
   - [ ] K3 task's existing suite (`test/test.cc`, `sync_test.cc`, `asio_test.cc`) and benches
     build and pass in `build-rel`, `build-asan`, `build-tsan` and g++ Debug ASan (T2); T4 rows
-    reported by the lead
-  - [ ] K4 Zero live frames: `live_frames()` back to baseline in every T1 (D8) test, both pool
-    paths counted
+    reported by the lead: C2's four builds pass (see "C2 evidence"); T4 is the lead's, after C3
+  - [x] K4 Zero live frames: `live_frames()` back to baseline in every T1 (D8) test, both pool
+    paths counted: every D8 block in `asio_test.cc` `test_teardown`, `test_wrapper`,
+    `test_await_token`, and `sync_test.cc` `test_event_teardown`, `test_lock_destroyed` asserts
+    its baseline; a 64 KiB frame (operator new path) raises the count and returns to it
   - [ ] K5 CI green on every job of `.github/workflows/ci.yml` at the landing commit, Linux ASan
-    (LSan) included
+    (LSan) included: green on all 8 jobs at task:1c30b8b (run 41543246183); the landing commit is later
   - [ ] K6 Consumer rebuild (T6): strata, prospect, residency build and pass against the branch;
     Xapiand by the Xapiand lead on the C3 pin, with `take_turn` migrated to `lock(token)` and
-    `Host` forwarding `roots`, `runs_here`, `post_call`
+    `Host` forwarding `roots`, `runs_here`, `post_call`: not run (C3 pin)
   - [ ] K7 T7 greps empty (`as_awaitable`; `lock_until`/`lock_for` in task and, at its wave
-    commit, Xapiand)
-  - [ ] K8 (added per re-check CN-R3) D8.4 unlocks in the awaiter's destructor only when the
+    commit, Xapiand): both greps empty in task at task:1c30b8b; Xapiand's at its wave commit
+  - [x] K8 (added per re-check CN-R3) D8.4 unlocks in the awaiter's destructor only when the
     waiter's state is `granted`; T1 (D8) gains `grant_timedout` (a token-bound waiter that timed
-    out, then destroyed, leaves the holder's lock held) beside `grant_granted`
-  - [ ] K9 (added per re-check NF1) D5.3: before `initiating` is set, a cross-thread cancel only
+    out, then destroyed, leaves the holder's lock held) beside `grant_granted`: C1 (mutants K8a,
+    K8b in "C1 evidence"); both pass in C2's four builds
+  - [x] K9 (added per re-check NF1) D5.3: before `initiating` is set, a cross-thread cancel only
     records the request (or the early-out and throw paths drop the handler's share and suspend
     while the count is above 2); T1 (D5) gains the re-check's `earlyout` and a throwing `init`,
-    ASan clean, each failing with the fix reverted
-  - [ ] K10 (added per re-check NF2, NF3) `~event` keeps a Debug count of orphaned waiters and
+    ASan clean, each failing with the fix reverted: the second option; `test_await_token` modes
+    1-2 and the throwing-init pair; mutants D5a, D5b (ASan use-after-poison)
+  - [x] K10 (added per re-check NF2, NF3) `~event` keeps a Debug count of orphaned waiters and
     unlinks only during teardown; a T1 death test for the ownership rule (`own_a_first`: a mutex
-    destroyed with a held guard or granted waiter asserts in Debug)
-  - [ ] K11 (added per re-check TH2-L1 note and the lead) D8.7 states `close()` and
+    destroyed with a held guard or granted waiter asserts in Debug): `detail::orphaned_waiters()`,
+    `test_event_teardown`; `own_a_first`/`own_b_first` in `test_destructor_asserts`; D8 text
+    states the teardown rule; mutants D8d-D8f
+  - [x] K11 (added per re-check TH2-L1 note and the lead) D8.7 states `close()` and
     `destroy_roots()` are idempotent and called on the owner thread after phase 1's join; Limit 3
     states that `spawn` onto a closed scheduler destroys the task and never calls `done`, so a
-    blocking `run` on it returns rather than hangs (or document the hang and test it)
-  - [ ] K12 (added by the lead from http S1) T7 can count task frames against asio's: a build
+    blocking `run` on it returns rather than hangs (or document the hang and test it): both
+    stated; a `done` owning a `std::promise` returns `broken_promise` (test), one waiting on a flag
+    hangs (documented; mutant D8b shows the hang when the task is linked instead)
+  - [x] K12 (added by the lead from http S1) T7 can count task frames against asio's: a build
     switch that bypasses task's per-thread frame pool, or a pool-miss and pool-hit count exposed
-    for the bench
-- Done: revision 1 (task:6d361ca); Xapiand lead's notes recorded (task:3686135); review pointer
-  (task:0585469); revision 2 and this ledger (task:1132c04).
-- Done (C1): D1-D4, D8.4's destructor rule with CN-R3's state test (K8), `live_frames()`,
-  docs (see "C1 evidence"); commits: `git log design/cancellation..phase/cancellation-c1`.
+    for the bench: `TASK_FRAME_POOL=0`; `test/pool_off_test.cc`; mutant K12a
+- Done: revision 1 (task:6d361ca); revision 2 (task:1132c04); C1 (landed, task:b406766).
+- Done (C2): task:213020d (code and tests: D5, D7-D10, K9-K12, X3, CR6), task:1c30b8b (design
+  text and docs), and this ledger.
 - Doing: nothing.
 - Next:
-  1. Scoped re-check of the C1 fixes (CR1-CR5); the lead watches CI.
-  2. C2 (D5, D7-D10) against C1's interface: D8.4 and `live_frames()` already exist, so C2 adds
-     the `event` orphaning, `root_list`, `close()`, `destroy_roots()`, K9, K10's `~event`
-     count, K11, K12, and `~deadline`'s Debug `runs_here() || closed()` assertion (not in C1:
-     no scheduler declares either yet).
-  3. C3 (D6), then the Xapiand lead's review of the task diff, then landing.
-  4. C2's test list also carries two items from the C1 code review: (CR3/X3) a test that destroys a
-     frame while a callback runs on another thread against its waiter, killing the mutant that drops the
-     explicit `cb_.reset()` before `abandon` in `~cancellable_lock_awaiter` (`task.hh:1238-1241`;
-     it survives the C1 suite); (CR6) the precondition that a frame is not destroyed between
-     `unlock()`'s grant (`settle(granted)`) and its `wake()` (a destroyed frame there makes `wake()`
-     post a dead handle): D8's phase ordering (no concurrent destruction) states it and the T1 (D8)
-     set includes it.
-  5. T6 for C1 (strata, prospect, residency against this branch) not run: host load (28-74 on
-     16 CPUs) and disk (17-20 GiB free) kept it out of this step; it is K6 at the C3 pin.
+  1. Code review of C2 (the lead launches it); fold findings in.
+  2. C3 (D6): inline resume through the count's last drop; T3 `posts`, `nocurrent` (still 6.00
+     io handlers per round trip and 19-20 checkpoints at C2, as expected); the on-loop cancel
+     then ends a read in 2 `run_one`s instead of 3 (`test_await_token` checks `<= 3`).
+  3. T6 (K6) at the C3 pin: strata, prospect, residency; Xapiand by its lead.
 - Blocked on: nothing.
 - Findings folded in: CN-L1/CN-R1, CN-L2/CN-R2, CN-R3, CN-R4 (C8), CN-R5 (C9), CN-R6 (C10),
-  CN-R7 (C11), XN1-XN3, Q1-Q3 rulings, TH2-L1 (task's API, D8.7): see the log.
-- Last verified: C1 built and tested in four builds (2026-11-02, "C1 evidence"); design
-  citations checked (2026-11-02). Citations checked against
-  task:8cad661 (identical headers at this head), reactor:ade618d, Xapiand:81c311799.
+  CN-R7 (C11), XN1-XN3, Q1-Q3 rulings, TH2-L1 (D8.7), NF1 (K9), NF2-NF3 (K10), the TH2-L1 note
+  (K11), X3 and CR6 (C1 review): see the log.
+- Last verified: 2026-11-02, C2 at task:1c30b8b: four builds green, 19 C2 mutants caught,
+  probes clean, CI green (see "C2 evidence").
 
 ## C1 evidence (2026-11-02)
 
@@ -153,6 +155,83 @@ CR2 codegen of `poll()` (`.scratch/c1/poll.cc`, `-O2`, `clang++ -target`): x86-6
 one `movq (%rax),%rax`; an x86 load is already an acquire); arm64 is `ldapr x8, [x8]` (the RCpc
 acquire load; `ldar` on targets without RCpc). Asm in `.scratch/c1/poll-*.s`. Nothing was timed.
 
+## C2 evidence (2026-11-02)
+
+Builds via `.scratch/c2/build.sh KIND` under `quiet light` (4 jobs), each its own directory,
+removed after: `build-rel` (Apple clang `-O2`), `build-asan` (Homebrew clang, ASan+UBSan,
+`-fno-sanitize-recover=undefined`), `build-tsan`, `build-gcc` (g++ 16, Debug, ASan+UBSan).
+`ctest`: 4 of 4 pass in each (task, task_sync, task_pool_off, task_asio), no compiler warning,
+no sanitizer report. Output in `.scratch/c2/sanitizers.txt`.
+
+T1 tests: `asio_test.cc` `test_await_token` (D5: requested before start, on-loop and
+cross-thread requests between registration and the check, throwing `init` with and without a
+posted emit, dispatch and direct handlers inside `init` with and without a token on the loop and
+with no scheduler, on-loop cancel of a pending read, a lost race returning 4 bytes, empty token
+binds no slot, 10,000 cross-thread cancels on a running loop), `test_wrapper` (D7: a `Host`-shaped
+virtual wrapper; a cross-thread cancel through its `post_call`, its spawn a root destroyed at
+teardown), `test_teardown` (D8: one loop with roots in `await_asio` with and without a token, an
+`event`, two lock waits, a demoted checkpoint, a `when_all`, and a 64 KiB frame; `crossroot`;
+`holder` both orders; an `event` set by a dying frame, waiter on another loop, both orders; a
+destructor spawning in phase 3; a frame destroyed with a cross-thread emit pending; spawn onto a
+closed scheduler with a `std::promise` `done`; closed posts dropped; idempotent phases; the
+destructor's own phases); `test_sizes` (T5); death tests `scheduler_with_demoted` (live roots and
+an unstopped loop assert), `deadline_off_loop`. `sync_test.cc`: X3 in `test_lock_destroyed`,
+`test_event_teardown`, `~event` orphaning in `test_destructor_asserts`. `test.cc`: D9 ownership
+(vector and variadic) and 0 `operator new` for 1,000 variadic joins. CR6 is stated in D8.4 and
+`ARCHITECTURE.md`; its test is the holder pair (grant and dropped wake on the owner thread in
+phase 3).
+
+Reverts (K1's C2 part): `.scratch/c2/mutants.py` (output `.scratch/c2/mutants.txt`,
+`mutants-k12a.txt`).
+
+| Mutant | Broken | Build | Caught by |
+| --- | --- | --- | --- |
+| D5a | NF1: early-out continues in place with a posted emit pending | asan | use-after-poison in the posted emit |
+| D5b | K9: throwing `init` rethrows at once with a posted emit pending | asan | use-after-poison |
+| D5c | CN-R1: no resume count (handler resumes at once) | asan | `test_await_token` checks; use-after-poison |
+| D5d | the check after registration is gone | rel | `init` called for a request after registration; `live_frames()` |
+| D5e | a cross-thread request posts no emit | rel | hang (killed at 60 s) |
+| D7a | `roots` not detected | rel | `test_wrapper`, `test_teardown` counts |
+| D7b | `post_call` not detected | rel | hang (cross-thread cancels never land) |
+| D8a | a closed scheduler still posts | rel | `io.poll() == 0` |
+| D8b | spawn onto a closed scheduler links | rel | hang (the promise's `done` never runs or dies) |
+| D8c | `destroy_roots()` destroys nothing | rel | teardown counts, mutex left locked |
+| D8d | a linked `event` waiter does not unlink | rel | `queued() == 2`, SIGSEGV |
+| D8e | `set()` does not mark taken | asan | heap-use-after-free |
+| D8f | `~event` does not orphan | asan | heap-use-after-free |
+| D8g | X3: abandon before deregistering | asan | use-after-poison in `lock_waiter::wake` |
+| D8h | `~asio_scheduler` runs no phases | rel | destructor-phases check |
+| D8i | `~deadline` asserts nothing | asan | `aborts(deadline_off_loop)` |
+| D9a | `when_all` does not own unfinished children | rel | D9 destroyed count, `live_frames()` |
+| K12a | `TASK_FRAME_POOL=0` ignored | rel | `task_pool_off` (first try reverted only `operator new` and survived, since pooled frees then went to `operator delete`; reverting both is caught) |
+
+D10 is a removal: T7's `as_awaitable` grep is empty; its test and the bench's yield row spawn the
+task on `asio_scheduler` directly.
+
+T3 (K2): the architect's probe directories copied to `.scratch/arch-review/` and
+`.scratch/arch-review-rev2/` with the branch's headers in `src/`. Ported: `cancel` to
+`await_asio(init, token)` with the request on the loop; `teardown` to the four phases;
+`late_fire` adds a `task::deadline` destroyed by the first timer's handler (requested 0; the first
+port registered the deadline's timer first and requested 1, correctly, so the order was fixed);
+`crossroot`, `holder` (both orders, `holder_ab`) spawned and torn down by the phases (mutex free
+afterwards); `dispatch_inline` on the branch's `await_asio` with and without a token. Results:
+`cancel` 0.0-0.1 ms (was 489-491); `teardown` 1 of 1 (was 0 of 1); `grant_destroyed` mutex
+free; `crossroot`, `holder`, `dispatch_inline` exit 0 and ASan clean; `channel`, `race`,
+`composed` unchanged; every run exits 0 in rel, ASan and TSan. `posts` (6.00 handlers) and
+`nocurrent` are C3's rows, unchanged.
+
+T5 sizes (printed by `test_sizes`, rel): `scheduler_ref` 16 (24 before), `cancel_callback` for a
+lock 40, `await_asio` awaiter 72 without a token and 152 with one, `lock(token)` awaiter 80;
+`static_assert` caps 16, 48, 72, 160. 10,000 socket reads after 100 warm-up: 0 `operator new`
+with an empty token and 0 with an unrequested one. Nothing was timed.
+
+Notes for the reviewer: `await_asio(init, token)` is a second overload with its own awaiter
+type, so awaits without a token keep the 72-byte awaiter. `scheduler_ref::post_call` returns
+whether the scheduler declares one. `root_list::link`/`unlink` are public (spawn calls them).
+`~deadline` keeps a reference to its scheduler for the assertion; a test that destroys a deadline
+off the loop now closes its scheduler first. `when_all` keeps eager freeing: a finished child
+clears its owner's slot and destroys itself.
+
 ## Log
 - 2026-11-02: C1 (D1-D4) on `phase/cancellation-c1`: reasons, callbacks, linked sources,
   `deadline` with the disarm bit, `lock(token)` replacing `lock_until`/`lock_for`, D8.4's
@@ -161,3 +240,8 @@ acquire load; `ldar` on targets without RCpc). Asm in `.scratch/c1/poll-*.s`. No
 - 2026-11-02: revision 2 of `docs/design/cancellation.md` folds in the architect's REJECT
   (http:1ae1390) and the Xapiand lead's notes; "Review response" table by finding ID; ledger
   created; State ready for re-check (task:1132c04).
+- 2026-11-02: C2 on `phase/cancellation-c2`: `await_asio(init, token)` with the resume count
+  (D5, K9), `scheduler_ref` vtable (D7), `root_list`, `close()`/`destroy_roots()` and the event,
+  deadline and when_all teardown rules (D8, D9, K10, K11), `as_awaitable` removed (D10),
+  `TASK_FRAME_POOL` (K12), X3 and CR6 tests; four builds green, 19 mutants caught, probes clean,
+  CI green on 8 jobs (task:213020d, task:1c30b8b).
