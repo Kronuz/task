@@ -8,7 +8,7 @@
   `docs/reviews/cancellation-xapiand.md` (2026-11-02, XN1-XN3); pointer
   `docs/reviews/cancellation-design.md`.
 - Branch / worktree: `design/cancellation` at `~/code/Kronuz/task-wt/cancellation`; head: `git log -1`.
-- State: ready for re-check (scoped: D5, D6, D8, with `.scratch/arch-review-rev2/`)
+- State: re-check CLEARED WITH CONDITIONS (2026-11-02, `docs/reviews/cancellation-design.md`); C1 may start; K8-K12 fold into the design at C1 and C2
 - Done criteria (set by the lead; contributors tick, never edit; they apply to steps C1-C3):
   - [ ] K1 Every decision's T1 tests pass, and each fails with its fix reverted (the revert and the
     failure recorded here once per decision, D1-D8)
@@ -28,6 +28,23 @@
     `Host` forwarding `roots`, `runs_here`, `post_call`
   - [ ] K7 T7 greps empty (`as_awaitable`; `lock_until`/`lock_for` in task and, at its wave
     commit, Xapiand)
+  - [ ] K8 (added per re-check CN-R3) D8.4 unlocks in the awaiter's destructor only when the
+    waiter's state is `granted`; T1 (D8) gains `grant_timedout` (a token-bound waiter that timed
+    out, then destroyed, leaves the holder's lock held) beside `grant_granted`
+  - [ ] K9 (added per re-check NF1) D5.3: before `initiating` is set, a cross-thread cancel only
+    records the request (or the early-out and throw paths drop the handler's share and suspend
+    while the count is above 2); T1 (D5) gains the re-check's `earlyout` and a throwing `init`,
+    ASan clean, each failing with the fix reverted
+  - [ ] K10 (added per re-check NF2, NF3) `~event` keeps a Debug count of orphaned waiters and
+    unlinks only during teardown; a T1 death test for the ownership rule (`own_a_first`: a mutex
+    destroyed with a held guard or granted waiter asserts in Debug)
+  - [ ] K11 (added per re-check TH2-L1 note and the lead) D8.7 states `close()` and
+    `destroy_roots()` are idempotent and called on the owner thread after phase 1's join; Limit 3
+    states that `spawn` onto a closed scheduler destroys the task and never calls `done`, so a
+    blocking `run` on it returns rather than hangs (or document the hang and test it)
+  - [ ] K12 (added by the lead from http S1) T7 can count task frames against asio's: a build
+    switch that bypasses task's per-thread frame pool, or a pool-miss and pool-hit count exposed
+    for the bench
 - Done: revision 1 (task:6d361ca); Xapiand lead's notes recorded (task:3686135); review pointer
   (task:0585469); revision 2 and this ledger (task:1132c04).
 - Doing: nothing.
