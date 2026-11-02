@@ -1,6 +1,8 @@
-// task: the per-resume slice, event, and async_mutex with lock_until, including both
-// orders of the lock_until race (timeout first, grant first), the await_suspend handshake,
-// threads (TSan), and the destructor asserts.
+// task: the per-resume slice, event, and async_mutex with lock(token) and deadline,
+// including both orders of the grant/cancel race, the await_suspend handshake, threads (TSan),
+// frames destroyed while waiting, and the destructor asserts.
+#define TASK_COUNT_FRAMES 1
+#define TASK_TEST_HOOKS 1
 #include "task.hh"
 
 #include <atomic>
@@ -90,7 +92,7 @@ struct callback final : callback_base {
 // A single-threaded scheduler whose timers fire only when the test says so. A timer's
 // callback can be fired at once, or expired into a queue that runs later, like a completion
 // that Asio has queued but not yet run. `immediate` makes post() resume in place, and `on_start`
-// runs inside start_timer, to interleave another party with a waiter's await_suspend.
+// runs inside start_timer. `posts` counts post() calls.
 class manual_scheduler {
 public:
 	class timer {
@@ -107,6 +109,7 @@ public:
 	};
 
 	void post(std::coroutine_handle<> h) {
+		++posts;
 		if (immediate) {
 			task::running_on scope(task::scheduler_ref::of(*this));
 			h.resume();
@@ -158,6 +161,7 @@ public:
 	std::size_t ready() const { return ready_.size(); }
 
 	bool immediate = false, fail_start = false;
+	int posts = 0;
 	std::function<void(std::size_t)> on_start;
 	std::chrono::steady_clock::time_point last_deadline;
 
@@ -483,14 +487,95 @@ void test_mutex() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// lock_until: both orders of the grant/timeout race, and the await_suspend handshake
+// deadline (D4): a timer that requests a token, armed until destroyed
+
+using time_point = std::chrono::steady_clock::time_point;
+
+void test_deadline() {
+	using task::cancel_reason;
+	const auto base = task::detail::live_frames();
+	// It requests cancel_reason::deadline when its timer fires.
+	{
+		manual_scheduler ms;
+		task::deadline dl(ms, time_point{1000ns});
+		CHECK(ms.pending() == 1 && ms.last_deadline == time_point{1000ns});
+		CHECK(!dl.token().requested() && !dl.expired());
+		ms.fire(0);
+		CHECK(dl.expired() && dl.token().reason() == cancel_reason::deadline);
+	}
+	// Destroyed first, it never requests: its callback is destroyed unrun.
+	{
+		manual_scheduler ms;
+		task::cancel_token t;
+		{
+			task::deadline dl(ms, time_point{1000ns});
+			t = dl.token();
+		}
+		CHECK(ms.pending() == 0 && !t.requested());
+	}
+	// Destroyed after its expiry was queued (the expiry still runs, as Asio's does), it never
+	// requests: the disarm bit stops the late callback.
+	{
+		manual_scheduler ms;
+		task::cancel_token t;
+		{
+			task::deadline dl(ms, time_point{1000ns});
+			t = dl.token();
+			ms.expire(0);
+		}
+		ms.run_queued();
+		CHECK(!t.requested() && t.reason() == cancel_reason::none);
+	}
+	// Linked to a parent: the parent's request reaches it with the parent's reason, and a
+	// later expiry does not change it.
+	{
+		manual_scheduler ms;
+		task::cancel_source parent;
+		task::deadline dl(ms, time_point{1000ns}, parent.token());
+		CHECK(parent.request(cancel_reason::shutdown));
+		CHECK(dl.token().reason() == cancel_reason::shutdown && !dl.expired());
+		ms.fire(0);
+		CHECK(dl.token().reason() == cancel_reason::shutdown);
+	}
+	// Its expiry does not reach the parent.
+	{
+		manual_scheduler ms;
+		task::cancel_source parent;
+		task::deadline dl(ms, time_point{1000ns}, parent.token());
+		ms.fire(0);
+		CHECK(dl.expired() && !parent.requested());
+	}
+	// A timer that cannot start: the constructor throws and frees the state.
+	{
+		manual_scheduler ms;
+		ms.fail_start = true;
+		bool threw = false;
+		try {
+			task::deadline dl(ms, time_point{1000ns});
+		} catch (const std::runtime_error&) {
+			threw = true;
+		}
+		CHECK(threw);
+	}
+	CHECK(task::detail::live_frames() == base);
+}
+
+// ---------------------------------------------------------------------------------------------
+// lock(token): both orders of the grant/cancel race, and the await_suspend handshake
 
 struct probe_result {
-	int got = 0;      // 0 pending, 1 holds the lock, 2 timed out
-	int resumed = 0;  // times the coroutine ran past its lock_for
+	int got = 0;      // 0 pending, 1 holds the lock, 2 cancelled
+	int resumed = 0;  // times the coroutine ran past its lock
 };
-task::task<void> timed_waiter(task::async_mutex& m, manual_scheduler& s, probe_result* out) {
-	auto g = co_await m.lock_for(s, 1000ns);
+task::task<void> deadline_waiter(task::async_mutex& m, manual_scheduler& s, probe_result* out, task::cancel_token* token = nullptr) {
+	task::deadline dl(s, time_point{1000ns});
+	if (token) { *token = dl.token(); }
+	auto g = co_await m.lock(dl.token());
+	++out->resumed;
+	out->got = g ? 1 : 2;
+}
+task::task<void> token_waiter(task::async_mutex& m, task::cancel_token t, probe_result* out) {
+	auto g = co_await m.lock(std::move(t));
 	++out->resumed;
 	out->got = g ? 1 : 2;
 }
@@ -500,14 +585,21 @@ task::task<void> plain_waiter(task::async_mutex& m, probe_result* out) {
 	out->got = 1;
 }
 
-void test_lock_until() {
-	// A: the timeout wins, the waiter's frame ends, then the holder unlocks and walks the queue.
+// What the after_enqueue hook does: request a source, or unlock a mutex.
+task::cancel_source* hook_source = nullptr;
+task::async_mutex* hook_mutex = nullptr;
+void hook_request() { hook_source->request(); }
+void hook_unlock() { hook_mutex->unlock(); }
+
+void test_lock_token() {
+	const auto base = task::detail::live_frames();
+	// A: the deadline wins, the waiter's frame ends, then the holder unlocks and walks the queue.
 	{
 		manual_scheduler ms;
 		task::async_mutex m;
 		CHECK(m.try_lock());
 		probe_result w;
-		task::spawn(ms.ref(), timed_waiter(m, ms, &w));
+		task::spawn(ms.ref(), deadline_waiter(m, ms, &w));
 		ms.run();
 		CHECK(w.resumed == 0 && ms.pending() == 1);
 		ms.fire(0);
@@ -518,32 +610,34 @@ void test_lock_until() {
 		CHECK(m.try_lock());
 		m.unlock();
 	}
-	// B: the grant wins while the timer's completion is already queued; the frame ends first.
+	// B: the grant wins while the timer's expiry is already queued; the frame ends first, and
+	// the late expiry neither requests the token nor wakes anything.
 	{
 		manual_scheduler ms;
 		task::async_mutex m;
 		CHECK(m.try_lock());
 		probe_result w;
-		task::spawn(ms.ref(), timed_waiter(m, ms, &w));
+		task::cancel_token t;
+		task::spawn(ms.ref(), deadline_waiter(m, ms, &w, &t));
 		ms.run();
 		ms.expire(0);
 		m.unlock();
 		ms.run();
 		CHECK(w.got == 1 && w.resumed == 1);
-		ms.run_queued();  // the late timer meets a settled waiter: no second wake
-		CHECK(ms.ready() == 0);
+		ms.run_queued();
+		CHECK(ms.ready() == 0 && !t.requested());
 		ms.run();
 		CHECK(w.got == 1 && w.resumed == 1);
 		CHECK(m.try_lock());
 		m.unlock();
 	}
-	// C: a lock is never granted to a waiter that timed out; the next waiter gets it.
+	// C: a lock is never granted to a waiter that was cancelled; the next waiter gets it.
 	{
 		manual_scheduler ms;
 		task::async_mutex m;
 		CHECK(m.try_lock());
 		probe_result w1, w2;
-		task::spawn(ms.ref(), timed_waiter(m, ms, &w1));
+		task::spawn(ms.ref(), deadline_waiter(m, ms, &w1));
 		task::spawn(ms.ref(), plain_waiter(m, &w2));
 		ms.run();
 		ms.fire(0);
@@ -556,31 +650,35 @@ void test_lock_until() {
 		CHECK(m.try_lock());
 		m.unlock();
 	}
-	// D: the timer is cancelled by a grant; its callback is destroyed unrun and nothing leaks.
+	// D: a grant ends the frame, which destroys the deadline and its timer unrun.
 	{
 		manual_scheduler ms;
 		task::async_mutex m;
 		CHECK(m.try_lock());
 		probe_result w;
-		task::spawn(ms.ref(), timed_waiter(m, ms, &w));
+		task::spawn(ms.ref(), deadline_waiter(m, ms, &w));
 		ms.run();
 		m.unlock();
 		ms.run();
 		CHECK(w.got == 1 && ms.pending() == 0);
 	}
-	// E, F: the other party settles the waiter inside start_timer, before await_suspend
-	// returns. The coroutine continues in place, once, whether post() queues or resumes.
+	// E, F: the other party acts after the waiter is queued and before its callback is
+	// registered. The coroutine continues in place, once, whether post() queues or resumes:
+	// spawn's is the only post.
 	for (bool immediate : {false, true}) {
-		{  // E: the deadline passes first
+		{  // E: the token is requested first
 			manual_scheduler ms;
 			ms.immediate = immediate;
 			task::async_mutex m;
 			CHECK(m.try_lock());
+			task::cancel_source source;
 			probe_result w;
-			ms.on_start = [&](std::size_t id) { ms.fire(id); };
-			task::spawn(ms.ref(), timed_waiter(m, ms, &w));
+			hook_source = &source;
+			task::detail::test_hooks::after_enqueue = hook_request;
+			task::spawn(ms.ref(), token_waiter(m, source.token(), &w));
 			ms.run();
-			CHECK(w.got == 2 && w.resumed == 1);
+			task::detail::test_hooks::after_enqueue = nullptr;
+			CHECK(w.got == 2 && w.resumed == 1 && ms.posts == 1);
 			m.unlock();
 			CHECK(m.try_lock());
 			m.unlock();
@@ -590,58 +688,165 @@ void test_lock_until() {
 			ms.immediate = immediate;
 			task::async_mutex m;
 			CHECK(m.try_lock());
+			task::cancel_source source;
 			probe_result w;
-			ms.on_start = [&](std::size_t) { m.unlock(); };
-			task::spawn(ms.ref(), timed_waiter(m, ms, &w));
+			hook_mutex = &m;
+			task::detail::test_hooks::after_enqueue = hook_unlock;
+			task::spawn(ms.ref(), token_waiter(m, source.token(), &w));
 			ms.run();
-			CHECK(w.got == 1 && w.resumed == 1);
+			task::detail::test_hooks::after_enqueue = nullptr;
+			CHECK(w.got == 1 && w.resumed == 1 && ms.posts == 1);
 			CHECK(m.try_lock());
 			m.unlock();
 		}
 	}
-	// G: a free lock is taken without a timer, whatever the deadline.
+	// G: a free lock is taken whatever the token, requested or not.
 	{
 		manual_scheduler ms;
 		task::async_mutex m;
+		probe_result w1, w2;
+		task::spawn(ms.ref(), deadline_waiter(m, ms, &w1));
+		ms.run();
+		CHECK(w1.got == 1 && ms.pending() == 0);
+		task::cancel_source source;
+		source.request();
+		task::spawn(ms.ref(), token_waiter(m, source.token(), &w2));
+		ms.run();
+		CHECK(w2.got == 1);
+		CHECK(m.try_lock());  // released when the waiter ended
+		m.unlock();
+	}
+	// H: a held lock with a requested token returns an empty guard without queueing.
+	{
+		manual_scheduler ms;
+		task::async_mutex m;
+		CHECK(m.try_lock());
+		task::cancel_source source;
+		source.request();
 		probe_result w;
-		task::spawn(ms.ref(), timed_waiter(m, ms, &w));
+		const auto before = task::detail::live_frames();
+		task::spawn(ms.ref(), token_waiter(m, source.token(), &w));
 		ms.run();
-		CHECK(w.got == 1 && ms.pending() == 0);
+		CHECK(w.got == 2 && w.resumed == 1 && ms.posts == 1);
+		CHECK(task::detail::live_frames() == before);  // no lock_waiter left in the queue
+		m.unlock();
 	}
-	// H: a timer that cannot start leaves the mutex usable and the waiter dead.
+	// I: a request while queued, from this thread outside the scheduler: the waiter is posted
+	// home, not resumed inside request().
 	{
 		manual_scheduler ms;
 		task::async_mutex m;
 		CHECK(m.try_lock());
-		bool threw = false;
-		auto t = [](task::async_mutex& mu, manual_scheduler& s, bool* threw) -> task::task<void> {
-			try {
-				auto g = co_await mu.lock_for(s, 1000ns);
-			} catch (const std::runtime_error&) {
-				*threw = true;
-			}
-		};
-		ms.fail_start = true;
-		task::spawn(ms.ref(), t(m, ms, &threw));
+		task::cancel_source source;
+		probe_result w;
+		task::spawn(ms.ref(), token_waiter(m, source.token(), &w));
 		ms.run();
-		CHECK(threw);
+		CHECK(source.request());
+		CHECK(w.resumed == 0 && ms.ready() == 1);
+		ms.run();
+		CHECK(w.got == 2 && w.resumed == 1);
 		m.unlock();
 		CHECK(m.try_lock());
 		m.unlock();
 	}
-	// I: lock_for adds the timeout to the scheduler's clock.
+	// J: an empty token is lock(): it waits for the grant.
 	{
 		manual_scheduler ms;
 		task::async_mutex m;
 		CHECK(m.try_lock());
 		probe_result w;
-		task::spawn(ms.ref(), timed_waiter(m, ms, &w));
+		task::spawn(ms.ref(), token_waiter(m, task::cancel_token{}, &w));
 		ms.run();
-		CHECK(ms.last_deadline.time_since_epoch() == 1000ns);  // manual_scheduler's now() is 0
-		ms.fire(0);
+		CHECK(w.resumed == 0);
+		m.unlock();
 		ms.run();
+		CHECK(w.got == 1);
+	}
+	// K: requests from another thread race the waiter on its own thread at every point of the
+	// await (before, between enqueue and registration, while queued) (TSan).
+	{
+		thread_scheduler worker;
+		task::async_mutex m;
+		CHECK(m.try_lock());
+		constexpr int rounds = 2000;
+		std::atomic<int> done{0}, cancelled{0};
+		for (int i = 0; i < rounds; ++i) {
+			task::cancel_source source;
+			auto waiter = [](task::async_mutex& mu, task::cancel_token t, std::atomic<int>* d, std::atomic<int>* c) -> task::task<void> {
+				auto g = co_await mu.lock(std::move(t));
+				if (!g) { c->fetch_add(1); }
+				d->fetch_add(1);
+			};
+			task::spawn(task::scheduler_ref::of(worker), waiter(m, source.token(), &done, &cancelled));
+			if (i % 3) { std::this_thread::yield(); }
+			source.request();
+		}
+		for (int i = 0; i < 20000 && done.load() < rounds; ++i) { std::this_thread::sleep_for(1ms); }
+		CHECK(done.load() == rounds && cancelled.load() == rounds);
+		m.unlock();
+		CHECK(m.try_lock());
 		m.unlock();
 	}
+	CHECK(task::detail::live_frames() == base);
+}
+
+// ---------------------------------------------------------------------------------------------
+// A frame destroyed while it waits for the lock (D8.4)
+
+void test_lock_destroyed() {
+	const auto base = task::detail::live_frames();
+	// grant_granted: granted and its resume posted, then destroyed unrun: the lock passes on.
+	for (bool with_token : {false, true}) {
+		task::inline_scheduler s;
+		task::async_mutex m;
+		CHECK(m.try_lock());
+		task::cancel_source source;
+		probe_result w;
+		auto t = with_token ? token_waiter(m, source.token(), &w) : plain_waiter(m, &w);
+		s.post(t.handle());
+		s.run();  // queued
+		m.unlock();  // granted; the resume is posted and never runs
+		CHECK(s.queued() == 1);
+		t = {};
+		CHECK(w.resumed == 0);
+		CHECK(m.try_lock());
+		m.unlock();
+	}
+	// grant_timedout: a token-bound waiter cancelled, then destroyed unrun: the holder keeps the lock.
+	{
+		task::inline_scheduler s;
+		task::async_mutex m;
+		CHECK(m.try_lock());
+		task::cancel_source source;
+		probe_result w;
+		auto t = token_waiter(m, source.token(), &w);
+		s.post(t.handle());
+		s.run();
+		CHECK(source.request());  // timed_out; the resume is posted and never runs
+		t = {};
+		CHECK(!m.try_lock());
+		m.unlock();
+		CHECK(m.try_lock());
+		m.unlock();
+	}
+	// grant_waiting: destroyed while still queued: the holder's unlock skips it and frees the lock.
+	for (bool with_token : {false, true}) {
+		task::inline_scheduler s;
+		task::async_mutex m;
+		CHECK(m.try_lock());
+		task::cancel_source source;
+		probe_result w;
+		auto t = with_token ? token_waiter(m, source.token(), &w) : plain_waiter(m, &w);
+		s.post(t.handle());
+		s.run();
+		t = {};
+		CHECK(source.request() && s.queued() == 0);  // a destroyed waiter's callback is gone
+		m.unlock();
+		CHECK(s.queued() == 0);
+		CHECK(m.try_lock());
+		m.unlock();
+	}
+	CHECK(task::detail::live_frames() == base);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -676,6 +881,26 @@ void test_destructor_asserts() {
 		s.run();
 		delete e;
 	}));
+	// The ownership rule: a mutex local to root A, awaited by root B. Destroying A first
+	// grants B and then destroys the mutex with the lock held: the assertion catches it.
+	auto own = [](bool a_first) {
+		task::inline_scheduler s;
+		probe_result w;
+		task::task<void> b;
+		auto a = [](task::inline_scheduler& sch, task::task<void>* waiter, probe_result* out) -> task::task<void> {
+			task::async_mutex m;
+			auto g = co_await m.lock();
+			*waiter = plain_waiter(m, out);
+			sch.post(waiter->handle());
+			co_await park_here{};
+		}(s, &b, &w);
+		s.post(a.handle());
+		s.run();  // A holds the lock and parks; B queues on it
+		if (!a_first) { b = {}; }
+		a = {};
+	};
+	CHECK(aborts([&] { own(true); }));    // own_a_first
+	CHECK(!aborts([&] { own(false); }));  // own_b_first: B's waiter leaves the queue first
 	CHECK(aborts([] {  // a mutex still locked
 		task::async_mutex m;
 		(void)m.try_lock();
@@ -701,7 +926,9 @@ int main() {
 	test_slice();
 	test_event();
 	test_mutex();
-	test_lock_until();
+	test_deadline();
+	test_lock_token();
+	test_lock_destroyed();
 	std::printf("task_sync: %s\n", failures ? "FAILED" : "ok");
 	return failures ? EXIT_FAILURE : EXIT_SUCCESS;
 }

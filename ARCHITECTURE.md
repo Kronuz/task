@@ -59,10 +59,11 @@ suspended on (inline when it had none). It reads a node's link before resuming i
 `async_mutex` keeps a locked flag and a FIFO queue under a short internal mutex. `unlock`
 hands the lock to the first queued waiter without releasing it, so a late arrival cannot
 barge in, and resumes that waiter through its own scheduler. A queued waiter is a
-`lock_waiter`: a refcounted block shared by the queue, the awaiter and, for `lock_until`, a
-timer callback. One compare-exchange on its state settles it as granted or timed out; the
+`lock_waiter`: a refcounted block shared by the queue and the awaiter; `lock(token)` adds a
+cancel callback, registered after the waiter is queued and destroyed before the awaiter drops
+its reference. One compare-exchange on its state settles it as granted or timed out; the
 loser finds it settled. A timed-out entry stays queued until a later `unlock` or `lock`
-sheds it, so the timer never touches the mutex. `await_suspend` ends with a handshake
+sheds it, so the callback never touches the mutex. `await_suspend` ends with a handshake
 (`park` against `wake`) so a grant or a timeout that lands before it returns continues the
 coroutine in place instead of resuming a frame that is still suspending. See
 `docs/mechanisms/async-mutex.md`.

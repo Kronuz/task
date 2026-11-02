@@ -26,8 +26,9 @@ it.
   `asio_scheduler` runs on an Asio executor.
 - **Time-slice budgets.** `co_await budget.checkpoint()` costs one cycle-counter read
   while the slice lasts, and requeues the coroutine as demoted once it is spent.
-- **Cancellation.** Checkpoints observe a `cancel_token` and throw `task::cancelled`.
-- **Coroutine primitives.** `event`, a FIFO `async_mutex` with deadlines, `when_all`,
+- **Cancellation.** A `cancel_token` carries a reason and callbacks; sources link to a parent,
+  and a `deadline` is a source its timer requests. Checkpoints throw `task::cancelled`.
+- **Coroutine primitives.** `event`, a FIFO `async_mutex` with cancellable waits, `when_all`,
   `yield`, `spawn`, `sync_wait`, and `await_asio` for any Asio operation.
 - **No allocation after warm-up.** Frames come from per-thread size-class pools.
 
@@ -158,8 +159,8 @@ ctest --test-dir build
 
 The tests cover values and exceptions, a million synchronous awaits and a 100,000-deep
 chain in constant stack, affinity across schedulers and threads, budget demotion,
-cancellation at a checkpoint, `when_all`, `event`, `async_mutex` and both orders of the
-`lock_until` race, `await_asio` on real timers, and a stress run with random yields and
+cancellation at a checkpoint, cancel reasons, callbacks and linked sources, deadlines,
+`when_all`, `event`, `async_mutex` and both orders of the grant/cancel race, `await_asio` on real timers, and a stress run with random yields and
 random cancellation. `-DTASK_ASIO=OFF` builds the core without fetching Asio.
 
 ## 🤝 Contributing

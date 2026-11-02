@@ -158,7 +158,8 @@ struct outcome {
 task::task<void> timed_lock(task::asio_scheduler& s, task::async_mutex& m, std::chrono::nanoseconds timeout, outcome* out) {
 	co_await task::schedule_on{task::scheduler_ref::of(s)};
 	auto start = std::chrono::steady_clock::now();
-	auto g = co_await m.lock_for(s, timeout);
+	task::deadline dl(s, start + timeout);
+	auto g = co_await m.lock(dl.token());
 	out->waited = std::chrono::steady_clock::now() - start;
 	out->got = g ? 1 : 2;
 }
@@ -170,7 +171,8 @@ task::task<void> contender(task::asio_scheduler& s, asio::io_context& io, task::
 	co_await task::schedule_on{task::scheduler_ref::of(s)};
 	std::mt19937 rng(seed);
 	for (int i = 0; i < rounds; ++i) {
-		auto g = co_await m.lock_for(s, std::chrono::microseconds(rng() % 300));
+		task::deadline dl(s, std::chrono::steady_clock::now() + std::chrono::microseconds(rng() % 300));
+		auto g = co_await m.lock(dl.token());
 		if (!g) {
 			++*timed_out;
 			continue;
@@ -313,7 +315,38 @@ void test_primitives() {
 		guard.reset();
 		t3.join();
 	}
-	// lock_until on real timers: a timeout, a grant before the deadline, and a free lock.
+	// deadline on a real timer: requested with cancel_reason::deadline at its time.
+	{
+		asio::io_context io;
+		task::asio_scheduler s(io.get_executor());
+		auto start = std::chrono::steady_clock::now();
+		task::deadline dl(s, start + 20ms);
+		auto t = dl.token();
+		io.run();
+		CHECK(dl.expired() && t.reason() == task::cancel_reason::deadline);
+		CHECK(std::chrono::steady_clock::now() - start >= 20ms);
+	}
+	// late_fire: a handler that runs after the deadline's expiry was queued destroys it; the
+	// expiry still runs and requests nothing.
+	{
+		asio::io_context io;
+		task::asio_scheduler s(io.get_executor());
+		auto at = std::chrono::steady_clock::now() + 5ms;
+		asio::steady_timer first(io, at);
+		std::unique_ptr<task::deadline<task::asio_scheduler>> dl;
+		bool first_ran = false;
+		first.async_wait([&](asio::error_code) {
+			first_ran = true;
+			dl.reset();
+		});
+		dl = std::make_unique<task::deadline<task::asio_scheduler>>(s, at);
+		auto t = dl->token();
+		std::this_thread::sleep_for(10ms);  // both expire before the loop looks
+		io.run();
+		CHECK(first_ran && !dl);
+		CHECK(!t.requested() && t.reason() == task::cancel_reason::none);
+	}
+	// lock(deadline token) on real timers: a timeout, a grant before the deadline, and a free lock.
 	{
 		asio::io_context io;
 		task::asio_scheduler s(io.get_executor());

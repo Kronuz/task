@@ -1,10 +1,11 @@
-> Status: CURRENT (2026-10-29) how `async_mutex` and `lock_until` work, as built in phase 7c step L1 (phase7c/l1-task).
+> Status: CURRENT (2026-11-02) how `async_mutex` and `lock(cancel_token)` work, as built in step C1 of `docs/design/cancellation.md` (phase/cancellation-c1); supersedes the phase 7c L1 `lock_until` note (task:9a85e89).
 
-# async_mutex and lock_until
+# async_mutex and lock(token)
 
 `task::async_mutex` is a FIFO mutex for coroutines that run on several schedulers at once.
 A task that cannot take it suspends, and the unlocker resumes it through the scheduler it
-suspended on. Nothing blocks a thread.
+suspended on. Nothing blocks a thread. `lock(token)` gives up when a `cancel_token` is
+requested; a timed lock is `lock(deadline.token())`.
 
 ## State
 
@@ -17,7 +18,7 @@ async_mutex
 lock_waiter  (pool-allocated, refcounted)
   handle, sched     the suspended coroutine and the scheduler to resume it on
   state             waiting -> granted | timed_out   (one compare-exchange)
-  refs              queue entry + awaiter (+ one per timer callback)
+  refs              queue entry + awaiter
   parked            handshake with await_suspend
 ```
 
@@ -31,46 +32,71 @@ lock_waiter  (pool-allocated, refcounted)
 - A guard may be released from any thread; the next holder need not share a thread with the
   last.
 
-## lock_until
+## lock(token)
 
-`lock_until(sched, deadline)` is `lock()` plus a timer that `sched` starts
-(`asio_scheduler::start_timer` is a `steady_timer`). The timer callback owns one reference
-to the waiter and, at the deadline, tries to settle it as `timed_out`. The deadline is
-ignored when the lock is free.
+1. A free lock is taken whatever the token (`await_ready` tries it).
+2. A requested token that finds the lock held returns an empty guard without queueing.
+3. Otherwise the awaiter queues a `lock_waiter`, then registers a `cancel_callback` on the
+   token whose body settles the waiter as `timed_out` and wakes it. An empty token registers
+   nothing, so `lock(cancel_token{})` behaves as `lock()`.
+4. `await_resume` destroys the registration first (it waits for a callback running on
+   another thread), then reads the outcome: a guard if granted, an empty guard otherwise.
 
-The waiter's block has three holders that end in any order:
+The callback borrows the awaiter's reference to the waiter instead of holding its own: the
+registration is destroyed before the awaiter releases that reference, and destroying it waits
+for a callback still running, so the callback never meets a freed waiter.
 
-1. The queue entry, until `unlock` pops it or the mutex is destroyed.
-2. The awaiter in the waiting frame, until `await_resume` (or the frame's destruction).
-3. The timer callback, until it runs or the timer is destroyed unrun.
+A `deadline` is a cancel source whose timer requests `cancel_reason::deadline`. Destroying a
+timer does not stop an expiry Asio has already queued, so the timer callback holds the
+deadline's cancel state, and `~deadline` sets a `disarmed` bit in the state word before
+destroying the timer; the callback's request is one compare-exchange that fails when the bit
+is set. A deadline destroyed after a grant therefore never requests its token, queued
+expiry or not.
 
-Whichever drops last frees the block, so neither order of the race meets freed state:
+The race between a grant and a cancel ends in either order without meeting freed state:
 
-- *Timeout first.* The callback settles `timed_out` and posts the waiter. The frame finishes
+- *Cancel first.* The callback settles `timed_out` and posts the waiter. The frame finishes
   and ends. The entry is still queued, and holds the block alive; the next `unlock` pops it,
-  sees it is not `waiting`, and drops it. The timer never touches the mutex, which may be gone
-  by then.
+  sees it is not `waiting`, and drops it. The callback never touches the mutex, which may be
+  gone by then.
 - *Grant first.* `unlock` settles `granted` and posts the waiter. The frame runs its turn and
-  ends, and cancels its timer. A callback that Asio had already queued still runs later: its
-  compare-exchange fails on the settled block, which its reference keeps alive.
+  deregisters the callback; a request that comes later runs no callback, and one that comes
+  while the callback is running finds its compare-exchange failing on the settled block.
 
 ## await_suspend handshake
 
-A grant or a timeout can land on another thread before `await_suspend` has returned, while the
-frame is still suspending. `park` (end of `await_suspend`) and `wake` (the settler) each swap
-`parked` to true. Whoever swaps second acts: if `wake` is second it resumes the waiter; if
-`park` is second it returns false and the coroutine continues in place, exactly once.
+A grant or a cancel can land before `await_suspend` has returned: on another thread, or on
+this one between queueing and registering (a token requested in that window runs the
+callback inside the `cancel_callback` constructor). `park` (end of `await_suspend`) and `wake`
+(the settler) each swap `parked` to true. Whoever swaps second acts: if `wake` is second it
+resumes the waiter; if `park` is second it returns false and the coroutine continues in
+place, exactly once.
+
+## A frame destroyed while waiting
+
+An awaiter destroyed before `await_resume` (its frame destroyed while suspended) reads the
+waiter's state with one compare-exchange from `waiting` to `timed_out`:
+
+- `waiting`: now `timed_out`, so the holder's `unlock` sheds it.
+- `granted`: the lock was handed to this frame, which will never run, so the destructor
+  `unlock`s it and the lock passes to the next waiter.
+- `timed_out`: a cancel already settled it; the holder still holds the lock, and nothing is
+  unlocked.
+
+The cancellable awaiter destroys its registration before reading the state.
 
 ## Lifetime rules
 
-- The mutex must outlive its waiters and be unlocked when destroyed (asserted).
-- A waiter runs to completion; nothing destroys a suspended frame. The awaiter's destructor
-  only drops its reference.
+- The mutex must outlive its waiters and be unlocked when destroyed (asserted in Debug). A
+  mutex local to one root and awaited by another breaks this when the first root dies first:
+  its guard grants the other root's waiter and the mutex dies locked, which the assertion
+  reports.
 - Timed-out entries are shed from the queue's head on each new `lock`, and at every `unlock`;
   between those they cost one pool block each.
 
-Tests: `test/sync_test.cc` (`test_lock_until` forces both orders, the handshake inside
-`start_timer`, a failing timer) and `test/asio_test.cc` (real timers; four reactors contending
-with random deadlines). The probe that found the original lifetime bug is the architect's
-`lock_until_probe.cc` (phase 7c re-check 1, R8); its orders A and B are cases A and B of
-`test_lock_until`.
+Tests: `test/sync_test.cc` (`test_lock_token` forces both orders, the handshake between
+queueing and registering through the `after_enqueue` test hook, a requested token, a request
+from another thread at every point of the await; `test_lock_destroyed` destroys waiting,
+granted and cancelled waiters; `test_deadline` the disarm bit and linking;
+`test_destructor_asserts` the ownership rule) and `test/asio_test.cc` (real timers, a
+queued expiry, four reactors contending with random deadlines).

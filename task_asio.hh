@@ -78,8 +78,10 @@ public:
 	// Handles waiting in the demoted queue; readable from any thread (admission, metrics).
 	std::size_t demoted() const noexcept { return demoted_count_.load(std::memory_order_relaxed); }
 
-	// Runs on_fire() on the executor at the deadline, unless the returned timer is
-	// destroyed first (on_fire is then destroyed unrun). For async_mutex::lock_until.
+	// Runs on_fire() on the executor at the deadline. Destroying the returned timer before
+	// the deadline destroys on_fire unrun, but an expiry Asio has already queued still runs
+	// it, so on_fire must hold what it touches and check whether it is still wanted, as
+	// task::deadline's disarm bit does.
 	template <typename F>
 	asio::steady_timer start_timer(std::chrono::steady_clock::time_point deadline, F&& on_fire) {
 		asio::steady_timer timer(executor_, deadline);

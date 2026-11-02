@@ -22,12 +22,19 @@ explains how each piece works.
   for more than one slice. The slice is one resume: time spent suspended does not count,
   and a task resumed after an event, a lock or an Asio completion starts a fresh slice.
   Checkpoints also observe a `cancel_token` and throw `task::cancelled`.
+- `cancel_source` / `cancel_token`: `request(reason)` is first-wins and sets a
+  `cancel_reason` (`requested`, `deadline`, `shutdown`, or a library's own from `user`);
+  `requested()` is one atomic load, and an empty token allocates nothing.
+  `cancel_source(parent_token)` is requested with its parent. `cancel_callback(token, f)`
+  runs `f(reason)` on the requesting thread, with `std::stop_callback`'s lifetime rules.
+  `deadline(sched, time_point, parent = {})` is a source its scheduler's timer requests
+  with `cancel_reason::deadline`; `sched` supplies `start_timer` (`asio_scheduler` does).
 - `event`: a one-shot completion. `co_await e` suspends until `e.set()` (any thread); each
   waiter resumes through the scheduler it suspended on, in arrival order.
 - `async_mutex`: a FIFO mutex for coroutines, usable from every scheduler at once.
   `co_await m.lock()` returns a `guard`; `unlock` hands the lock to the next waiter through its
-  scheduler. `m.lock_until(sched, deadline)` and `lock_for(sched, timeout)` give up at a
-  deadline and return an empty guard; `sched` supplies the timer (`asio_scheduler` does).
+  scheduler. `co_await m.lock(token)` gives up when the token is requested and returns an
+  empty guard; with a `deadline`'s token it is a timed lock.
 - `await_asio<void(Args...)>(init)` (in `task_asio.hh`): awaits any Asio operation started by
   `init(handler)`; `asio_scheduler::demoted()` counts the handles waiting in its demoted queue.
 - The destructors of `event`, `async_mutex` and `asio_scheduler` assert that nothing is left

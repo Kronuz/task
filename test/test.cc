@@ -1,6 +1,8 @@
 // task: values and exceptions, symmetric transfer in constant stack, executor affinity
 // (single- and multi-threaded), budgets and demotion, cancellation, when_all, and a
-// sync_wait (threads, ordering, restore, pool bound), and a randomized cancellation stress run (argv[1] tasks, default 1,000,000).
+// sync_wait (threads, ordering, restore, pool bound), a randomized cancellation stress run (argv[1] tasks, default 1,000,000),
+// and cancel tokens: reasons, callbacks and linked sources.
+#define TASK_COUNT_FRAMES 1
 #include "task.hh"
 
 #include <atomic>
@@ -9,11 +11,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <future>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 static int failures = 0;
 #define CHECK(cond) \
@@ -237,6 +242,269 @@ task::task<shaky> make_shaky(task::scheduler_ref where) {
 task::task<std::size_t> worker_cached(task::scheduler_ref where) {
 	co_await task::schedule_on{where};
 	co_return task::detail::pool().cached();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Cancel tokens: reasons (D1), callbacks (D2), linked sources (D3)
+
+// Sanitizer runtimes replace operator new themselves, so only plain builds count allocations.
+#if defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
+#define TEST_COUNTS_NEW 0
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer) || __has_feature(address_sanitizer)
+#define TEST_COUNTS_NEW 0
+#endif
+#endif
+#ifndef TEST_COUNTS_NEW
+#define TEST_COUNTS_NEW 1
+#endif
+
+#if TEST_COUNTS_NEW
+static std::atomic<std::size_t> allocations{0};
+void* operator new(std::size_t n) {
+	allocations.fetch_add(1, std::memory_order_relaxed);
+	if (void* p = std::malloc(n ? n : 1)) { return p; }
+	throw std::bad_alloc();
+}
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+#endif
+
+// Sleeps inside the callback, so a deregistration from another thread overlaps it.
+struct slow_callback {
+	std::atomic<bool>* entered;
+	int* value;
+	void operator()() const {
+		entered->store(true);
+		std::this_thread::sleep_for(std::chrono::milliseconds(5));
+		*value = 42;  // plain write: TSan checks the deregistration waited for it
+	}
+};
+
+// Destroys its own registration and the source being requested, from inside the callback.
+struct self_destroying {
+	std::optional<task::cancel_callback<self_destroying>>* self;
+	std::optional<task::cancel_source>* source;
+	int* ran;
+	void operator()() const {
+		++*ran;
+		source->reset();
+		self->reset();
+	}
+};
+
+void test_cancel_tokens() {
+	using task::cancel_reason;
+	const auto base = task::detail::live_frames();
+
+	// D1: an empty token is never requested and has no reason.
+	{
+		task::cancel_token t;
+		CHECK(!t.requested() && t.reason() == cancel_reason::none);
+	}
+	// D1: the first request wins and sets the reason; tokens see it.
+	{
+		task::cancel_source s;
+		auto t = s.token();
+		CHECK(!t.requested() && t.reason() == cancel_reason::none);
+		CHECK(s.request(cancel_reason::deadline));
+		CHECK(!s.request(cancel_reason::shutdown));
+		CHECK(t.requested() && t.reason() == cancel_reason::deadline && s.reason() == cancel_reason::deadline);
+		task::cancel_source d;
+		CHECK(d.request() && d.reason() == cancel_reason::requested);
+		task::cancel_source n;
+		CHECK(n.request(cancel_reason::none) && n.reason() == cancel_reason::requested);  // never requested without a reason
+		task::cancel_source u;
+		CHECK(u.request(cancel_reason(int(cancel_reason::user) + 1)) && u.token().reason() == cancel_reason(65));
+	}
+	// D1: eight racing requests: exactly one wins and its reason stays; a reader never sees a
+	// requested token without a reason.
+	for (int round = 0; round < 200; ++round) {
+		task::cancel_source s;
+		auto t = s.token();
+		std::atomic<int> ready{0}, winner{-1}, wins{0};
+		std::vector<std::thread> threads;
+		for (int i = 0; i < 8; ++i) {
+			threads.emplace_back([&, i] {
+				ready.fetch_add(1);
+				while (ready.load() < 8) { std::this_thread::yield(); }
+				if (s.request(cancel_reason(64 + i))) {
+					winner.store(i);
+					wins.fetch_add(1);
+				}
+			});
+		}
+		while (!t.requested()) {
+			if (t.reason() != cancel_reason::none) { CHECK(t.requested()); }
+		}
+		CHECK(t.reason() != cancel_reason::none);
+		for (auto& th : threads) { th.join(); }
+		CHECK(wins.load() == 1);
+		CHECK(t.reason() == cancel_reason(64 + winner.load()));
+	}
+#if TEST_COUNTS_NEW
+	// D1: steady-state sources, linked sources, registrations and requests call no operator new;
+	// an empty token allocates nothing at all.
+	{
+		{
+			task::cancel_source warm;
+			task::cancel_source warm_child(warm.token());
+		}
+		const auto before = allocations.load();
+		for (int i = 0; i < 10000; ++i) {
+			task::cancel_source s;
+			task::cancel_source child(s.token());
+			auto t = child.token();
+			int ran = 0;
+			task::cancel_callback cb(t, [&] { ++ran; });
+			if (i % 2) { s.request(cancel_reason::shutdown); }
+			CHECK(ran == i % 2);
+		}
+		task::cancel_token empty;
+		task::budget b(std::chrono::seconds(1), empty);
+		for (int i = 0; i < 10000; ++i) {
+			auto copy = empty;
+			CHECK(!copy.requested() && !b.token().requested());
+		}
+		CHECK(allocations.load() == before);
+	}
+#endif
+
+	// D2: a callback registered before the request runs on it with the reason; one registered
+	// after runs at once; a destroyed one, or one on an empty token, never runs.
+	{
+		task::cancel_source s;
+		int before = 0, after = 0, gone = 0, inert = 0;
+		cancel_reason seen = cancel_reason::none;
+		task::cancel_callback a(s.token(), [&](cancel_reason r) {
+			++before;
+			seen = r;
+		});
+		{
+			task::cancel_callback g(s.token(), [&] { ++gone; });
+		}
+		task::cancel_callback e(task::cancel_token{}, [&] { ++inert; });
+		CHECK(before == 0);
+		CHECK(s.request(cancel_reason::shutdown));
+		CHECK(before == 1 && seen == cancel_reason::shutdown && gone == 0);
+		task::cancel_callback b(s.token(), [&](cancel_reason r) {
+			++after;
+			seen = r;
+		});
+		CHECK(after == 1 && seen == cancel_reason::shutdown);
+		CHECK(!s.request());
+		CHECK(before == 1 && after == 1 && inert == 0);
+	}
+	// D2: deregistering while the callback runs on another thread waits for it to return.
+	for (int round = 0; round < 20; ++round) {
+		task::cancel_source s;
+		std::atomic<bool> entered{false};
+		int value = 0;
+		std::optional<task::cancel_callback<slow_callback>> cb;
+		cb.emplace(s.token(), slow_callback{&entered, &value});
+		std::thread requester([&] { s.request(); });
+		while (!entered.load()) { std::this_thread::yield(); }
+		cb.reset();
+		CHECK(value == 42);
+		requester.join();
+	}
+	// D2: a callback destroys its own registration and the source being requested (the last
+	// outside reference to the state) from inside request().
+	{
+		std::optional<task::cancel_callback<self_destroying>> self;
+		std::optional<task::cancel_source> source;
+		source.emplace();
+		int ran = 0;
+		self.emplace(source->token(), self_destroying{&self, &source, &ran});
+		CHECK(task::detail::live_frames() == base + 1);
+		CHECK(source->request());
+		CHECK(ran == 1 && !self && !source);
+		CHECK(task::detail::live_frames() == base);
+	}
+	// D2: a throwing callback is dropped and the next still runs, now and on request.
+	{
+		task::cancel_source s;
+		int ran = 0;
+		task::cancel_callback a(s.token(), [&] { ++ran; });
+		task::cancel_callback b(s.token(), [] { throw std::runtime_error("callback"); });  // runs first
+		CHECK(s.request());
+		CHECK(ran == 1);
+		task::cancel_callback c(s.token(), [](cancel_reason) { throw 1; });
+		task::cancel_callback d(s.token(), [&] { ++ran; });
+		CHECK(ran == 2);
+	}
+
+	// D3: a parent's request reaches its children and grandchildren with its reason; a child's
+	// request stays below it.
+	{
+		task::cancel_source parent;
+		task::cancel_source child(parent.token());
+		task::cancel_source grandchild(child.token());
+		task::cancel_source sibling(parent.token());
+		int ran = 0;
+		cancel_reason seen = cancel_reason::none;
+		task::cancel_callback cb(grandchild.token(), [&](cancel_reason r) {
+			++ran;
+			seen = r;
+		});
+		CHECK(sibling.request(cancel_reason::user));
+		CHECK(!parent.requested() && !child.requested());
+		CHECK(parent.request(cancel_reason::shutdown));
+		CHECK(child.reason() == cancel_reason::shutdown && grandchild.reason() == cancel_reason::shutdown);
+		CHECK(ran == 1 && seen == cancel_reason::shutdown);
+		CHECK(sibling.reason() == cancel_reason::user);
+	}
+	// D3: a child of a requested parent is born requested; an empty parent links nothing.
+	{
+		task::cancel_source parent;
+		parent.request(cancel_reason::deadline);
+		task::cancel_source child(parent.token());
+		CHECK(child.requested() && child.reason() == cancel_reason::deadline);
+		task::cancel_source alone{task::cancel_token{}};
+		CHECK(!alone.requested() && alone.request() && alone.reason() == cancel_reason::requested);
+	}
+	// D3: a child keeps its parent's state until it dies; both are freed after; a child that
+	// died first is no longer on its parent's list (ASan).
+	CHECK(task::detail::live_frames() == base);
+	{
+		{
+			std::optional<task::cancel_source> parent;
+			parent.emplace();
+			task::cancel_source child(parent->token());
+			CHECK(task::detail::live_frames() == base + 2);
+			parent.reset();
+			CHECK(task::detail::live_frames() == base + 2);
+			CHECK(!child.requested());
+		}
+		CHECK(task::detail::live_frames() == base);
+		{
+			task::cancel_source parent;
+			{
+				task::cancel_source child(parent.token());
+			}
+			CHECK(task::detail::live_frames() == base + 1);
+			CHECK(parent.request());
+		}
+		CHECK(task::detail::live_frames() == base);
+	}
+	// D3: children come and go on one thread while the parent is requested on another (TSan).
+	for (int round = 0; round < 100; ++round) {
+		task::cancel_source parent;
+		std::atomic<bool> go{false};
+		std::thread requester([&] {
+			while (!go.load()) { std::this_thread::yield(); }
+			parent.request(cancel_reason::shutdown);
+		});
+		for (int i = 0; i < 100; ++i) {
+			if (i == 50) { go.store(true); }
+			task::cancel_source child(parent.token());
+			int ran = 0;
+			task::cancel_callback cb(child.token(), [&] { ++ran; });
+			if (child.requested()) { CHECK(child.reason() == cancel_reason::shutdown); }
+		}
+		requester.join();
+	}
+	CHECK(task::detail::live_frames() == base);
 }
 
 int main(int argc, char** argv) {
@@ -474,6 +742,8 @@ int main(int argc, char** argv) {
 		CHECK(finished + cancelled == n);
 		CHECK(cancelled > 0);
 	}
+
+	test_cancel_tokens();
 
 	std::printf("task: %s\n", failures ? "FAILED" : "ok");
 	return failures ? EXIT_FAILURE : EXIT_SUCCESS;
