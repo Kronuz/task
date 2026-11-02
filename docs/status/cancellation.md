@@ -74,7 +74,7 @@
 - Findings folded in: CN-L1/CN-R1, CN-L2/CN-R2, CN-R3, CN-R4 (C8), CN-R5 (C9), CN-R6 (C10),
   CN-R7 (C11), XN1-XN3, Q1-Q3 rulings, TH2-L1 (D8.7), NF1 (K9), NF2-NF3 (K10), the TH2-L1 note
   (K11), X3 and CR6 (C1 review): see the log.
-- Last verified: 2026-11-02, C2 at task:1c30b8b: four builds green, 19 C2 mutants caught,
+- Last verified: 2026-11-02, C2 at task:1c30b8b: four builds green, 18 C2 mutants caught,
   probes clean, CI green (see "C2 evidence").
 
 ## C1 evidence (2026-11-02)
@@ -243,5 +243,5 @@ clears its owner's slot and destroys itself.
 - 2026-11-02: C2 on `phase/cancellation-c2`: `await_asio(init, token)` with the resume count
   (D5, K9), `scheduler_ref` vtable (D7), `root_list`, `close()`/`destroy_roots()` and the event,
   deadline and when_all teardown rules (D8, D9, K10, K11), `as_awaitable` removed (D10),
-  `TASK_FRAME_POOL` (K12), X3 and CR6 tests; four builds green, 19 mutants caught, probes clean,
+  `TASK_FRAME_POOL` (K12), X3 and CR6 tests; four builds green, 18 mutants caught, probes clean,
   CI green on 8 jobs (task:213020d, task:1c30b8b).
