@@ -208,7 +208,12 @@ template <class Sig, class Init>
      loop's `io_context` destroys it unrun, and a closed scheduler drops it (D8), so nothing leaks
      (CN-R7.1).
 
-   If `init` throws, `await_suspend` destroys the registration and rethrows; no handler runs.
+   If the request landed between registration and the check from another thread, its callback
+   has already added a count and posted the emit function (NF1): the early-out therefore gives
+   up the handler's share and parks like the normal path, so it suspends while that count is
+   pending and the emit function's drop resumes the frame with `operation_aborted`. If `init`
+   throws, `await_suspend` destroys the registration, stores the exception, gives up the
+   handler's share and parks the same way; `await_resume` rethrows. No handler runs.
 4. **One resume count.** The awaiter holds a count, 2 at start: `await_suspend`'s park and the
    handler; a posted emit adds 1. Whoever drops it to zero resumes the frame. The handler stores
    the result, destroys the registration (D2 waits for a callback running on another thread; after
@@ -322,21 +327,32 @@ may be suspended on:
    - `lock(token)` / `lock()` waiter: waiting, it settles as `timed_out` and `unlock` sheds it
      (`:855-863`); **granted but not resumed, its awaiter's destructor unlocks** (CN-R3, probe
      `grant_destroyed`: today the mutex stays locked forever, all builds). The test is the
-     destructor's: `w_` still set (so `await_resume` has not run) and `settle(timed_out)` fails
-     (so it was granted), then `m_.unlock()`, which hands the lock on through a post the closed
-     scheduler drops, until a waiter that is not being destroyed, or nobody, gets it.
-   - `event` waiter: a node `set()` has not taken unlinks itself (single-threaded at teardown);
-     `set()` marks each node it takes before resuming it, so a waiter destroyed after a dropped
-     wake leaves the event alone. `~event` marks any waiter left as orphaned instead of asserting
-     (`:696`); such a waiter's frame either dies in this phase or shows in `live_frames()`.
+     destructor's: `w_` still set (so `await_resume` has not run) and the waiter's state is
+     `granted` (CN-R3: a waiter that timed out never held the lock), then `m_.unlock()`, which
+     hands the lock on through a post the closed scheduler drops, until a waiter that is not
+     being destroyed, or nobody, gets it. The token-bound awaiter destroys its registration
+     first, waiting for a callback running on another thread (C1 review X3). Precondition (C1
+     review CR6): no frame is destroyed between `unlock()`'s grant and its `wake()`; the phases
+     guarantee it, since phase 3 runs after every loop joined and every unlock in it runs on
+     the owner's thread.
+   - `event` waiter: a node `set()` has not taken unlinks itself; `set()` marks each node it
+     takes before resuming it, so a waiter destroyed after a dropped wake leaves the event
+     alone. `~event` marks any waiter left as orphaned instead of asserting (`:696`) and counts
+     it in Debug builds (`detail::orphaned_waiters()`, NF2), the signal the assertion gave;
+     such a waiter's frame either dies in this phase or shows in `live_frames()`. Unlinking is a
+     teardown rule: it is valid only while no thread can call `set()`, which phase 3 guarantees
+     and a frame destroyed while suspended outside teardown does not.
    - `deadline`: disarmed, then its timer destroyed with its `io_context` alive (D4).
    - `cancel_callback`: deregistered; the state is counted, so its source may be gone (D2).
    - `when_all` children die with their parent (D9).
 
    Ownership rule: a primitive awaited by frames of more than one root (an `async_mutex`, an
    `event`) is owned outside every root, by an object destroyed after phase 3; Xapiand's turn
-   mutex is an index's, which outlives the http service. A violation is a use after free that ASan
-   reports.
+   mutex is an index's, which outlives the http service. For a mutex the Debug assertion in
+   `~async_mutex` catches a violation first and deterministically (NF3, `own_a_first`: a mutex
+   destroyed held or with a granted waiter); a mutex with only queued waiters is safe in either
+   order. In Release (`NDEBUG`) a violation is a use after free that only ASan reports, and
+   task cannot enforce the rule there.
 5. **Phase 4: destroy schedulers, then `io_context`s.** `~asio_scheduler` runs `close()` and
    `destroy_roots()` itself if the owner did not (an owner with one scheduler and no cross-loop
    frames), with a Debug assertion that live roots imply a stopped `io_context`. Destroying an
@@ -363,6 +379,10 @@ may be suspended on:
    bool closed() const noexcept;
    ~asio_scheduler();               // phase 4: close() and destroy_roots() if not yet done; then the io_context
    ```
+
+   `close()` and `destroy_roots()` are idempotent and are the owner thread's, called after phase
+   1's join (a `Reactor`'s `scheduler_` destructor repeats them); `closed()` is a plain read
+   after the join.
 
    reactor's `TcpServer::stop()` runs, after its join (`reactor.h:596-600` at reactor:ade618d):
    `close()` on every reactor's scheduler, then `destroy_roots()` on every one, then destroys the
@@ -461,6 +481,9 @@ blocks any of them.
    on a scheduler whose loop still runs during phase 3, or a primitive owned by one root and
    awaited from another, is a use after free that nothing in task detects outside ASan.
 3. `sync_wait` frames are not roots: a `sync_wait` blocked on a stopped loop never returns.
+   `spawn` onto a closed scheduler destroys the task and its `done` unrun and never calls
+   `done`: a blocking run whose `done` sets a flag it waits on hangs; one whose `done` owns a
+   `std::promise` returns at once with `broken_promise` (T1 (D8) tests it).
 4. Callbacks run on the requesting thread; a slow callback delays every later one on that
    request, silently.
 5. A cancel that loses the race returns the real result (D5.5); the token, not the error code, says

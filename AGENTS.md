@@ -6,12 +6,13 @@
 task.hh            task<T>, scheduler concept and scheduler_ref, inline_scheduler, frame pool,
                    spawn/run/sync_wait, yield/schedule_on, budget, cancellation, event,
                    cancel_token/source/callback, deadline, async_mutex (lock(token)), when_all.
-task_asio.hh       asio_scheduler (demoted, start_timer), as_awaitable, await_asio
-                   (target task::asio; fetches Asio 1.36.0).
+task_asio.hh       asio_scheduler (demoted, start_timer, roots, close/destroy_roots), await_asio
+                   with an optional token (target task::asio; fetches Asio 1.36.0).
 test/test.cc       Core tests; argv[1] sets the stress task count.
 test/sync_test.cc  Slice, event, deadline, async_mutex, lock(token) orders, destroyed waiters,
-                   destructor asserts.
-test/asio_test.cc  Asio bridge: yields, demotion, results, exceptions.
+                   event waiters at teardown, destructor asserts.
+test/asio_test.cc  asio_scheduler and await_asio: tokens, wrappers, the teardown phases, sizes.
+test/pool_off_test.cc  TASK_FRAME_POOL=0: every frame is an operator new.
 bench/bench.cc     No-op task cost and allocations; Asio yield latency; the same two measurements on asio::awaitable.
 docs/API.md        The types and functions, and how to run a task.
 ```

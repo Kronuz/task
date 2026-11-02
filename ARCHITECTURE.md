@@ -23,8 +23,9 @@ several children from one `await_suspend`.
 
 ## Schedulers
 
-`scheduler_ref` erases a scheduler to its address plus two function pointers
-(`post`, `post_demoted`). A thread-local `current` reference says which scheduler is
+`scheduler_ref` erases a scheduler to its address plus a pointer to a per-type table
+(`post`, `post_demoted`, and the optional `post_call`, `runs_here`, `roots`, filled by
+detection). A thread-local `current` reference says which scheduler is
 running; schedulers set it around every resume with `running_on`. Affinity checks,
 `yield()`, and budget checkpoints all go through it, so code written against `task`
 never names a concrete scheduler.
@@ -57,7 +58,10 @@ current falls back to a deadline from its construction.
 `event` is an atomic stack of waiters whose nodes are the awaiters in the waiting frames. A
 waiter pushes itself unless the stack holds the "set" marker; `set()` swaps the marker in,
 reverses the stack for arrival order and resumes each waiter through the scheduler it
-suspended on (inline when it had none). It reads a node's link before resuming it.
+suspended on (inline when it had none). It reads a node's link and marks the node taken before
+resuming it. At teardown a waiting frame's awaiter unlinks itself, and an event destroyed with
+waiters marks them orphaned (counted in Debug), so a node taken, linked or orphaned is each a
+plain write to a live frame.
 
 `async_mutex` keeps a locked flag and a FIFO queue under a short internal mutex. `unlock`
 hands the lock to the first queued waiter without releasing it, so a late arrival cannot
@@ -71,11 +75,36 @@ sheds it, so the callback never touches the mutex. `await_suspend` ends with a h
 coroutine in place instead of resuming a frame that is still suspending. See
 `docs/mechanisms/async-mutex.md`.
 
+## Asio operations
+
+`await_asio` keeps one resume count, 2 at the start: `await_suspend`'s park and the handler.
+The handler stores the result and drops its count; `await_suspend` drops its own after `init`
+returns, and whoever reaches zero resumes the frame (`await_suspend` by returning false, so a
+handler that runs inside `init` never resumes a frame that is still suspending). With a token,
+the cancel callback is registered before `init` runs and the token is checked again after; a
+request on the loop emits `cancellation_type::all` on the operation's slot (or, during
+initiation, leaves it for `await_suspend` to emit), and a request from another thread adds one
+to the count and posts a plain function through `post_call` that emits and drops it. Every exit
+of `await_suspend` (the early-out, a throwing `init`) suspends while that count is pending.
+
+## Teardown
+
+`spawn` links its frame into the scheduler's `root_list` when the scheduler has one, and the
+frame unlinks itself when it ends. The owner's four phases: stop and join every loop; `close()`
+every scheduler (posts drop, `spawn` destroys its task); `destroy_roots()` on every one, which
+pops one root at a time and destroys it outside the list's lock; then destroy schedulers and
+`io_context`s. A root owns its awaited chain, so destroying it destroys every frame it awaits.
+Each primitive stays consistent: a lock waiter granted but not resumed unlocks in its awaiter's
+destructor, a token's callback deregisters, a pending Asio operation goes to its stopped
+`io_context`, `when_all` destroys unfinished children. No frame is destroyed while another thread
+runs a handler or an `unlock` against it: the phases run after the join.
+
 ## Frames
 
 Promise types inherit `operator new`/`operator delete` from `pooled_frame`, which
 uses a thread-local array of free lists in 64-byte classes up to 2 KiB. Allocation
-pops a list; deallocation pushes onto the freeing thread's list.
+pops a list; deallocation pushes onto the freeing thread's list. `TASK_FRAME_POOL=0` sends
+every block to `operator new`.
 
 ## when_all
 
@@ -83,4 +112,6 @@ Each input task runs inside a small child coroutine that stores its result (or t
 first exception) and decrements a shared counter at its final suspend point; the
 last child to finish resumes the parent by symmetric transfer. The counter starts at
 `n + 1`, and the parent drops its own count after starting every child, so a child
-that finishes during start-up never resumes the parent early.
+that finishes during start-up never resumes the parent early. The parent owns its children
+(a `std::array` for the variadic form): a finished child destroys itself and clears its slot,
+and destroying the parent destroys any child that has not finished.

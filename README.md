@@ -102,8 +102,13 @@ Not for:
   terminates the program.
 - **Demoting from other threads.** `asio_scheduler::post_demoted` must be called on the
   executor's thread.
-- **Destroying a primitive with waiters.** The destructors of `event`, `async_mutex`,
-  and `asio_scheduler` assert that nothing is left waiting.
+- **Teardown needs the owner's phases.** Stop and join every loop a root may be suspended on,
+  `close()` every scheduler, `destroy_roots()` on every one with every `io_context` alive, then
+  destroy schedulers and `io_context`s. A primitive awaited by several roots must outlive them;
+  `async_mutex` asserts in Debug when destroyed held or with a granted waiter.
+- **`spawn` onto a closed scheduler** destroys the task unrun and never calls `done`; a caller
+  blocked on a flag that `done` sets never wakes. `sync_wait` frames are not roots: one blocked
+  on a stopped loop never returns.
 
 ## ⚡ Performance
 
