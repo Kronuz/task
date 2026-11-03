@@ -1120,20 +1120,16 @@ class deadline {
 
 public:
 	deadline(S& s, std::chrono::steady_clock::time_point at, const cancel_token& parent = {})
-		: sched_(s), source_(parent), timer_(s.start_timer(at, fire{source_.s_})) {}
+		: source_(parent), timer_(s.start_timer(at, fire{source_.s_})) {}
 	deadline(const deadline&) = delete;
 	deadline& operator=(const deadline&) = delete;
-	// Runs on the deadline's loop, or after its scheduler was closed (teardown).
-	~deadline() {
-		if constexpr (requires { sched_.runs_here(); sched_.closed(); }) { assert(sched_.runs_here() || sched_.closed()); }
-		source_.s_->disarm();  // before the timer is destroyed
-	}
+	// Any thread: the disarm bit is set before the timer dies, and the timer's callback holds the state.
+	~deadline() { source_.s_->disarm(); }
 
 	cancel_token token() const noexcept { return source_.token(); }
 	bool expired() const noexcept { return source_.reason() == cancel_reason::deadline; }
 
 private:
-	S& sched_;
 	cancel_source source_;
 	timer_type timer_;
 };

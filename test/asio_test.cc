@@ -248,11 +248,6 @@ void scheduler_stopped_with_demoted() {  // the destructor destroys the root its
 	io.stop();
 	delete s;
 }
-void deadline_off_loop() {  // destroyed off its loop on an open scheduler
-	asio::io_context io;
-	task::asio_scheduler s(io.get_executor());
-	task::deadline dl(s, std::chrono::steady_clock::now() + 1h);
-}
 void scheduler_clean() {
 	asio::io_context io;
 	task::asio_scheduler s(io.get_executor());
@@ -368,7 +363,6 @@ void test_primitives() {
 		io.run();
 		CHECK(dl.expired() && t.reason() == task::cancel_reason::deadline);
 		CHECK(std::chrono::steady_clock::now() - start >= 20ms);
-		s.close();  // a deadline dies on its loop or after its scheduler closed
 	}
 	// late_fire: a handler that runs after the deadline's expiry was queued destroys it; the
 	// expiry still runs and requests nothing.
@@ -998,7 +992,6 @@ int main() {
 	CHECK(!aborts(scheduler_clean));
 	CHECK(aborts(scheduler_with_demoted));  // live roots and a loop that was not stopped
 	CHECK(!aborts(scheduler_stopped_with_demoted));
-	CHECK(aborts(deadline_off_loop));
 #endif
 	// A task on the io_context awaits tasks that yield, demote and throw.
 	asio::io_context io;

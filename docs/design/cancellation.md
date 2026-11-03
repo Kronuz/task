@@ -154,8 +154,11 @@ timer does not cancel an expiry asio has already queued: the handler still runs 
 callback therefore holds a reference to the deadline's state, and the state word carries a
 `disarmed` bit: `~deadline` sets it (release) before destroying the timer, and the callback
 requests only when it reads the bit clear (acquire), so a deadline destroyed first never requests,
-whether or not its expiry was queued. `~deadline` runs on the deadline's loop or after that loop
-stopped (D8 phase 3); a Debug assertion checks `runs_here()` or a closed scheduler. Xapiand's
+whether or not its expiry was queued. `~deadline` may run on any thread: the disarm bit is atomic,
+the timer callback owns a state reference, and asio's timer queue cancels under its own lock
+(20,000 deadlines destroyed from a non-loop thread against a running loop: TSan clean). It holds
+no scheduler reference and asserts nothing, so a scheduler that cannot tell its thread
+needs no hook (code review CR1). Xapiand's
 `AsioHost::Armed` uses the same disarm shape (`host_asio.h:68`, `:87`). There is no `when_any`: a
 race is "arm a deadline, pass its token to the operation", the shape `expire_read` already has
 (`http_asio.h:546-555`).

@@ -30,7 +30,8 @@ explains how each piece works.
   `cancel_source(parent_token)` is requested with its parent. `cancel_callback(token, f)`
   runs `f(reason)` on the requesting thread, with `std::stop_callback`'s lifetime rules.
   `deadline(sched, time_point, parent = {})` is a source its scheduler's timer requests
-  with `cancel_reason::deadline`; `sched` supplies `start_timer` (`asio_scheduler` does).
+  with `cancel_reason::deadline`; `sched` supplies `start_timer` (`asio_scheduler` does). It
+  keeps no reference to `sched` and may be destroyed on any thread, before or after the expiry.
 - `event`: a one-shot completion. `co_await e` suspends until `e.set()` (any thread); each
   waiter resumes through the scheduler it suspended on, in arrival order.
 - `async_mutex`: a FIFO mutex for coroutines, usable from every scheduler at once.
