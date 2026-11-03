@@ -778,13 +778,17 @@ task::task<void> accept_with(tcp::acceptor& a, task::cancel_token t, accepted* o
 	++*done;
 }
 
-// A completion argument without a default constructor (a socket): the token overload returns it
-// as a std::optional, empty when the operation never started.
+// A completion argument without a default constructor (a socket): await_asio returns it as a
+// std::optional with or without a token, empty only when a request came before the start.
 void test_await_token_move_only() {
 	const auto base = task::detail::live_frames();
 	static_assert(std::is_same_v<decltype(std::declval<decltype(task::await_asio<accept_sig>(0, task::cancel_token{}))&>().await_resume()),
 		std::tuple<asio::error_code, std::optional<tcp::socket>>>);
+	static_assert(std::is_same_v<decltype(std::declval<decltype(task::await_asio<accept_sig>(0))&>().await_resume()),
+		std::tuple<asio::error_code, std::optional<tcp::socket>>>);
 	static_assert(std::is_same_v<decltype(std::declval<decltype(task::await_asio<read_sig>(0, task::cancel_token{}))&>().await_resume()),
+		std::tuple<asio::error_code, std::size_t>>);
+	static_assert(std::is_same_v<decltype(std::declval<decltype(task::await_asio<read_sig>(0))&>().await_resume()),
 		std::tuple<asio::error_code, std::size_t>>);
 	std::printf("sizes: token awaiter, socket argument %zu\n", sizeof(decltype(task::await_asio<accept_sig>(0, task::cancel_token{}))));
 	asio::io_context io;

@@ -43,8 +43,10 @@ explains how each piece works.
   a requested token never starts the operation and completes with `operation_aborted`, and a
   request while it is pending cancels it through a cancellation slot; the operation must belong
   to the awaiting scheduler's loop. A cancel that loses the race returns the real result. A
-  requested-before-start result carries value-initialized arguments; one without a default
-  constructor (`asio::ip::tcp::socket`, from `async_accept`) is a `std::optional`, empty then.
+  requested-before-start result carries value-initialized arguments. An argument after the
+  `error_code` without a default constructor (`asio::ip::tcp::socket`, from `async_accept`) is a
+  `std::optional` with or without a token, so a signature has one result type; it is empty only
+  when a request came before the start.
   A cross-thread cancel needs a current scheduler with `post_call`; otherwise it is lost, and
   Debug asserts.
 - Optional scheduler members, found by detection and forwarded by wrappers: `runs_here()`,

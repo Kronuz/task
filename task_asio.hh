@@ -195,6 +195,23 @@ struct asio_park {
 	bool park() noexcept { return count_.fetch_sub(1, std::memory_order_acq_rel) != 1; }
 };
 
+// How await_asio returns an argument R after an error_code, with or without a token: R itself when
+// it can be value-initialized (the result of a request that came before the operation started),
+// else a std::optional<R>, empty then. One signature has one result type in both overloads.
+template <typename R>
+using abort_arg_t = std::conditional_t<std::is_default_constructible_v<R>, R, std::optional<R>>;
+
+template <typename... A>
+struct result_args {
+	using type = asio_result<A...>;
+	using tuple = std::tuple<A...>;
+};
+template <typename... R>
+struct result_args<asio::error_code, R...> {
+	using type = asio_result<asio::error_code, abort_arg_t<R>...>;
+	using tuple = std::tuple<asio::error_code, abort_arg_t<R>...>;
+};
+
 template <typename Sig, typename Init>
 class asio_awaiter;
 
@@ -212,8 +229,8 @@ public:
 		init_(handler{this});  // a throw means no handler runs; it resumes the frame with it
 		return park();
 	}
-	typename asio_result<A...>::type await_resume() {
-		if constexpr (sizeof...(A) > 0) { return asio_result<A...>::take(*result_); }
+	typename result_args<A...>::type::type await_resume() {
+		if constexpr (sizeof...(A) > 0) { return result_args<A...>::type::take(*result_); }
 	}
 
 private:
@@ -225,16 +242,11 @@ private:
 		}
 	};
 	Init init_;
-	std::optional<std::tuple<A...>> result_;
+	std::optional<typename result_args<A...>::tuple> result_;
 };
 
 template <typename>
 inline constexpr bool always_false = false;
-
-// How the token overload returns an argument R: R itself when it can be value-initialized (the
-// result of a request that came before the operation started), else a std::optional<R>, empty then.
-template <typename R>
-using abort_arg_t = std::conditional_t<std::is_default_constructible_v<R>, R, std::optional<R>>;
 
 template <typename Sig, typename Init>
 class cancellable_asio_awaiter {
@@ -326,7 +338,8 @@ private:
 			return;
 		}
 		count_.fetch_add(1, std::memory_order_relaxed);
-		bool posted = false, threw = false;
+		bool posted = false;
+		[[maybe_unused]] bool threw = false;
 		try {
 			posted = sched_.post_call(&emit_posted, this);
 		} catch (...) {
