@@ -9,15 +9,14 @@
   (`docs/reviews/cancellation-design.md`); Xapiand lead, `docs/reviews/cancellation-xapiand.md`
   (XN1-XN3); C1 code review `docs/reviews/cancellation-c1-code.md` (CR1-CR6, X3); C2 code review
   `docs/reviews/cancellation-c2-code.md` (CR1-CR4, N1-N5).
-- Branch / worktree: C2 on `phase/cancellation-c2` at `~/code/Kronuz/task-wt/cancellation-c2`
-  (from task:b406766, C1 landed); head: `git log -1`.
-- State: C2 (D5, D7-D10, K9-K12) implemented, proven (see "C2 evidence") and reviewed (APPROVE WITH
-  CONDITIONS); the fix round for CR1-CR4 and N1-N5 is done (see "C2 fix round"), ready for the
-  scoped re-check; C3 (D6) not started.
+- Branch / worktree: C3 on `phase/cancellation-c3` at `~/code/Kronuz/task-wt/cancellation-c3`
+  (from task:d3d94f3, C2 landed); head: `git log -1`.
+- State: C2 landed (task:d3d94f3). C3 (D6) implemented and proven (see "C3 evidence"), ready for
+  review.
 - Done criteria (set by the lead; contributors tick, never edit; they apply to steps C1-C3):
-  - [ ] K1 Every decision's T1 tests pass, and each fails with its fix reverted (the revert and the
+  - [x] K1 Every decision's T1 tests pass, and each fails with its fix reverted (the revert and the
     failure recorded here once per decision, D1-D8): D1-D4 in "C1 evidence"; D5, D7, D8 (and D9,
-    K12) in "C2 evidence"; D6 is C3's
+    K12) in "C2 evidence"; D6 is C3's: D6 in "C3 evidence" (mutants D6a-D6f)
   - [x] K2 The review's probes rerun clean on the branch headers (T3): teardown probes
     (`crossroot`, `holder` in both orders, `grant_destroyed`, `dispatch_inline`, revision 1's
     `teardown`) ASan clean; race probes (`race`, the cross-thread cancel, `late_fire`) TSan clean;
@@ -67,19 +66,18 @@
   text and docs), and this ledger.
 - Done (C2 fix round): task:a8eef9a (CR1), task:36c7703 (CR2-CR4, N1-N3, N5), task:a958d7e
   (deadline test, N4); ledger below.
+- Done (C3): task:096c4dd (D6 code and tests), task:8d5319e (T4 bench rows, D6.5, `ARCHITECTURE.md`,
+  `docs/API.md`), and this ledger.
 - Doing: nothing.
 - Next:
-  1. Scoped re-check of CR1-CR4 and the N2 text (`rechecker`); the lead lands C2.
-  2. C3 (D6): inline resume through the count's last drop; T3 `posts`, `nocurrent` (still 6.00
-     io handlers per round trip and 19-20 checkpoints at C2, as expected); the on-loop cancel
-     then ends a read in 2 `run_one`s instead of 3 (`test_await_token` checks `<= 3`).
-  3. T6 (K6) at the C3 pin: strata, prospect, residency; Xapiand by its lead.
+  1. Code review of C3 (D6 is concurrency); the lead runs T4 on Linux.
+  2. T6 (K6) at the C3 pin: strata, prospect, residency; Xapiand by its lead.
 - Blocked on: nothing.
 - Findings folded in: CN-L1/CN-R1, CN-L2/CN-R2, CN-R3, CN-R4 (C8), CN-R5 (C9), CN-R6 (C10),
   CN-R7 (C11), XN1-XN3, Q1-Q3 rulings, TH2-L1 (D8.7), NF1 (K9), NF2-NF3 (K10), the TH2-L1 note
   (K11), X3 and CR6 (C1 review): see the log.
-- Last verified: 2026-11-02, C2 at task:1c30b8b: four builds green, 18 C2 mutants caught,
-  probes clean, CI green (see "C2 evidence").
+- Last verified: 2026-11-02, C3 at task:8d5319e: four builds green (Linux lease) and macOS
+  Apple clang rel, 33 mutants caught (26 C1-C2 rows, 7 D6 rows), probes clean (see "C3 evidence").
 
 ## C1 evidence (2026-11-02)
 
@@ -289,6 +287,82 @@ scheduler with post_call`, exit 134 (was: ends after 1001 ms with `aborted=0`). 
 use-after-poison). `accept_sig.cc` (`await_asio<void(error_code, tcp::socket)>(init, token)`)
 compiles (was two errors).
 
+## C3 evidence (2026-11-02)
+
+Builds, each its own directory, built clean: on the Linux lease (Ubuntu 24.04) via
+`.scratch/c3/rbuild.sh KIND` (8 jobs): `build-rel` (clang 18 `-O2`), `build-asan` (clang 18,
+ASan+UBSan), `build-tsan` (clang 18, halt on the first report), `build-gcc` (g++ 14, Debug,
+ASan+UBSan, the trampoline path); on macOS `build-rel` (Apple clang `-O2`) via `.scratch/c3/build.sh`
+under `quiet light`. `ctest` 4 of 4 in each, no sanitizer report; the one compiler warning is
+g++ 14's `-Wvolatile` on C2's spin loop (`asio_test.cc:752`). Output: `.scratch/c3/rebased-run.txt`
+(Linux, at the rebased head), `.scratch/c3/mac-final.txt`.
+
+D6 (`task_asio.hh:186-214`): `asio_park::drop()` at zero calls `resume`, which runs
+`{ running_on scope(s); h.resume(); }` inline when `inline_resume_depth < 4`, `s.runs_here()` and
+`!current() || current() == s`, else `resume_on` (posts). No member was added: the depth is a
+thread-local.
+
+T1 (D6), `asio_test.cc` `test_inline_resume`: a timer completion on the loop resumes inline in the
+scheduler's scope, with and without a token (`io.run() == 2`: the spawn's post and the timer's
+handler; 3 at C2); on a loop thread the continuation runs on that thread (TSan); a completion on
+another loop's thread is posted (depth 0, the waiting loop's thread); a handler dispatched by a
+coroutine of the same scheduler resumes its waiter inside the dispatch, one dispatched from another
+scheduler's coroutine on the same thread is posted; a chain of 100 completions, each dispatched by
+the link the last one resumed, peaks at depth 4 (nest 5), posts links 4, 9, ..., 99 (20) and ends
+all 100; after an inline resume a 1 s budget's first checkpoint does not yield (fresh slice) and a
+200 us budget yields 10 times; teardown with a chain in flight (the loop stops inside an inline
+resume, one posted resume queued, three links suspended) destroys all 12 frames, `live_frames()` at
+base. `test_await_token`: the on-loop cancel ends a pending read in exactly 2 `run_one`s (was
+`<= 3`); the 20,000-round cross-thread race counts inline resumes (1,864 at the head, nonzero in
+every build) with every task ending once. `test_wrapper`: a task spawned through the `Host`-shaped
+wrapper resumes inline in the wrapper's scope (`current() == hr`).
+
+Mutants (`.scratch/c3/mutants.py`, the C2 set plus D6; output `.scratch/c3/rebased-run.txt` at the
+rebased head, `.scratch/c3/mutants.txt` before the rebase, `.scratch/c3/mutant-d6b.txt`): all 33 die
+in both runs (26 C1-C2 rows and 7 D6 rows, D6d in rel and TSan).
+
+| Mutant | Broken | Build | Caught by |
+| --- | --- | --- | --- |
+| D6a | no depth bound | rel | chain: depth and posted-count checks |
+| D6b | inline resume outside the scope (raw resume: the slice is not counted) | rel | `io.run() == 2`, scope check, `yields == 10`, the wrapper's scope |
+| D6c | scope set, enclosing slice kept (slice not stamped) | rel | fresh-slice check (`fresh_yields == 0`) |
+| D6d | inline off the scheduler's thread (`runs_here` dropped) | rel, tsan | the other-thread completion (`asio_test.cc:355`) and the other-loop case |
+| D6e | inline while another scheduler is current | rel | the two-scheduler dispatch case |
+| D6f | no inline resume at all | rel | `ran == 2`, `inlined > 0` |
+
+The 26 C1-C2 rows (D5a-D5e, D7a, D7b, D8a-D8h, R8, R9, CR4a, N1a, N2a, N2b, N3a, N3b, CR1, D9a,
+K12a) still die; D5c's text follows `drop()`'s new call.
+
+T3 (K2's C3 part): the architect's probes rerun on the branch headers in rel, ASan and TSan on the
+Linux lease (`.scratch/arch-review/results_c3.txt`, `.scratch/arch-review-rev2/results_c3.txt`): 39
+of 39 runs exit 0, no sanitizer report; `composed`, `channel`, `race`, `crossroot`, `holder` (both
+orders), `grant_destroyed`, `late_fire`, `dispatch_inline`, `cancel`, `teardown` unchanged. `posts`
+(io handlers per round trip, 10,000 round trips): task + `await_asio` 4.00, asio's coroutine 4.00;
+at C2 6.00 on macOS and 7.00 on the Linux lease (C2 headers, `.scratch/c3/posts-c2-linux.txt`); macOS
+at C3 4.00 (`mac-final.txt`); `operator new` 5 per 10,000 on macOS, unchanged from C2 (0 on Linux).
+`nocurrent` ports a third row, a task resumed inline by `await_asio`: 19-21 yielding checkpoints in
+every build and both hosts, as many as one resumed through the scheduler (19-21); the raw resume 0.
+The probe's `operator new` counter is compiled out under Linux TSan, whose runtime defines it.
+
+T4 rows (`bench/bench.cc`, `task_bench N` runs only them): an `await_asio` socket round trip with
+inline resume, with a scheduler that always posts, and inline with a deadline linked to a session
+token per read. Counts only, Linux rel, 2,000 round trips (`.scratch/c3/bench-counts.txt`): io
+handlers 4.00, 7.00 and 5.00 per round trip (the deadline's cancelled timer wait is the fifth);
+`operator new` 0, 0 and 0.001. Nothing was timed; the lead runs the rows.
+
+T5 (sizes printed by `test_sizes` and `test_await_token_move_only`, Linux rel, before (C2) and
+after): `await_asio` awaiter 72 and 72; with a token 152 and 152; with a socket argument 240 and 240;
+`scheduler_ref` 16; `deadline<asio_scheduler>` 128; `event` awaiter 48; 10,000 reads after warm-up:
+0 `operator new` with an empty and an unrequested token, before and after.
+
+Notes for the reviewer: (1) under g++'s trampoline a child task's return inside an inline resume
+queues on the running trampoline instead of nesting (D6.5), so the D6 tests await in the frame they
+observe; a first version that awaited through a child task passed with clang and failed the depth
+checks with g++. (2) The tests read `detail::inline_resume_depth` to tell an inline resume from a
+posted one. (3) `current() == s` compares the scheduler pointer, so an emit function posted through
+a wrapper's `post_call` runs in the inner scheduler's scope and posts its resume through the wrapper
+rather than resuming inline: correct, one extra handler on that cancel path.
+
 ## Log
 - 2026-11-02: C1 (D1-D4) on `phase/cancellation-c1`: reasons, callbacks, linked sources,
   `deadline` with the disarm bit, `lock(token)` replacing `lock_until`/`lock_for`, D8.4's
@@ -304,3 +378,7 @@ compiles (was two errors).
   CI green on 8 jobs (task:213020d, task:1c30b8b).
 - 2026-11-02: C2 code review (APPROVE WITH CONDITIONS) folded in: CR1-CR4 and N1-N5 (see "C2 fix
   round"); four builds green, 25 mutants caught and D8i retired, the reviewer's probes clean.
+- 2026-11-02: C3 on `phase/cancellation-c3` (from task:d3d94f3): `await_asio` resumes inline on the
+  scheduler's thread in its scope, depth bound 4 (D6); T1 (D6), T4 rows; four builds green, 33
+  mutants caught, `posts` 4.00 io handlers per round trip, `nocurrent` 19-21 (task:096c4dd,
+  task:8d5319e).
