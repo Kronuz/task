@@ -366,6 +366,25 @@ void test_primitives() {
 		CHECK(dl.expired() && t.reason() == task::cancel_reason::deadline);
 		CHECK(std::chrono::steady_clock::now() - start >= 20ms);
 	}
+	// A deadline may be destroyed on any thread, before or after its expiry, while its loop runs;
+	// once destroyed it requests nothing more.
+	{
+		asio::io_context io;
+		auto guard = asio::make_work_guard(io);
+		task::asio_scheduler s(io.get_executor());
+		std::thread runner([&] { io.run(); });
+		for (int i = 0; i < 300; ++i) {
+			auto dl = std::make_unique<task::deadline<task::asio_scheduler>>(s, std::chrono::steady_clock::now() + std::chrono::microseconds(i % 4 * 80));
+			auto token = dl->token();
+			std::this_thread::sleep_for(std::chrono::microseconds(i % 5 * 40));
+			std::thread([&] { dl.reset(); }).join();
+			const bool after_destroy = token.requested();
+			std::this_thread::sleep_for(std::chrono::microseconds(300));
+			CHECK(token.requested() == after_destroy);
+		}
+		guard.reset();
+		runner.join();
+	}
 	// late_fire: a handler that runs after the deadline's expiry was queued destroys it; the
 	// expiry still runs and requests nothing.
 	{
@@ -1190,6 +1209,8 @@ void test_sizes() {
 	std::printf("sizes: scheduler_ref %zu, cancel_callback(lock) %zu, await_asio awaiter %zu, with a token %zu, lock(token) awaiter %zu\n",
 		sizeof(task::scheduler_ref), sizeof(task::cancel_callback<task::detail::lock_cancel>), sizeof(plain), sizeof(with_token),
 		sizeof(task::async_mutex::cancellable_lock_awaiter));
+	std::printf("sizes: deadline<asio_scheduler> %zu, event awaiter %zu\n", sizeof(task::deadline<task::asio_scheduler>),
+		sizeof(decltype(std::declval<task::event&>().operator co_await())));
 	static_assert(sizeof(task::scheduler_ref) == 16);
 	static_assert(sizeof(task::cancel_callback<task::detail::lock_cancel>) <= 48);
 	static_assert(sizeof(plain) <= 72);
