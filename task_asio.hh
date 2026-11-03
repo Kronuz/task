@@ -40,6 +40,7 @@
 #include <exception>
 #include <optional>
 #include <tuple>
+#include <type_traits>
 
 namespace task {
 
@@ -51,14 +52,14 @@ namespace task {
 // Teardown, across every scheduler and pool a root may be suspended on: (1) stop and join
 // every loop; (2) close() every scheduler; (3) destroy_roots() on every one, with every
 // io_context alive; (4) destroy the schedulers, then the io_contexts. close() and
-// destroy_roots() are idempotent and run on the owner's thread after (1); the destructor
-// repeats them.
+// destroy_roots() are idempotent and run on the owner's thread after (1), never on a loop
+// thread; the destructor repeats them. The io_context is not run again after (3): what it
+// still holds is dropped unrun when closed, but the owner flushes nothing by running it.
 class asio_scheduler {
 public:
 	explicit asio_scheduler(asio::any_io_executor executor)
 		: executor_(std::move(executor)), io_(executor_.target<asio::io_context::executor_type>()) {}
 	~asio_scheduler() {
-		assert(roots_.empty() || !io_ || io_->context().stopped());  // live roots need a stopped loop
 		close();
 		destroy_roots();
 	}
@@ -68,6 +69,7 @@ public:
 	void post(std::coroutine_handle<> h) {
 		if (closed()) { return; }
 		asio::post(executor_, [this, h] {
+			if (closed()) { return; }  // the frame may be gone: roots were destroyed after this was queued
 			running_on scope(scheduler_ref::of(*this));
 			h.resume();
 		});
@@ -87,6 +89,7 @@ public:
 	void post_call(void (*fn)(void*), void* arg) {
 		if (closed()) { return; }
 		asio::post(executor_, [this, fn, arg] {
+			if (closed()) { return; }  // arg may belong to a destroyed frame
 			running_on scope(scheduler_ref::of(*this));
 			fn(arg);
 		});
@@ -98,10 +101,15 @@ public:
 	root_list* roots() noexcept { return &roots_; }
 
 	// Phase 2: post, post_demoted and post_call drop what they are given; spawn destroys its task.
-	void close() noexcept { roots_.close(); }
+	void close() noexcept {
+		assert(!runs_here());  // phases 2 and 3 run after the loops joined
+		roots_.close();
+	}
 	bool closed() const noexcept { return roots_.closed(); }
 	// Phase 3: destroys every root, then forgets the demoted handles (they were the roots').
 	void destroy_roots() noexcept {
+		assert(!runs_here());
+		assert(roots_.empty() || !io_ || io_->context().stopped());  // live roots need a stopped loop
 		roots_.destroy_all();
 		demoted_.clear();
 		demoted_count_.store(0, std::memory_order_relaxed);
@@ -223,6 +231,11 @@ private:
 template <typename>
 inline constexpr bool always_false = false;
 
+// How the token overload returns an argument R: R itself when it can be value-initialized (the
+// result of a request that came before the operation started), else a std::optional<R>, empty then.
+template <typename R>
+using abort_arg_t = std::conditional_t<std::is_default_constructible_v<R>, R, std::optional<R>>;
+
 template <typename Sig, typename Init>
 class cancellable_asio_awaiter {
 	static_assert(always_false<Sig>, "await_asio with a token needs a signature beginning with asio::error_code");
@@ -241,7 +254,7 @@ public:
 
 	bool await_ready() {
 		if (!token_.requested()) { return false; }
-		result_.emplace(asio::error::operation_aborted, R{}...);
+		result_.emplace(asio::error::operation_aborted, abort_arg_t<R>{}...);
 		return true;
 	}
 
@@ -262,7 +275,7 @@ public:
 			// Requested in between: initiate nothing. After the reset no callback starts, so
 			// a posted emit's count is the last; give up the handler's and suspend on it.
 			cb_.reset();
-			result_.emplace(asio::error::operation_aborted, R{}...);
+			result_.emplace(asio::error::operation_aborted, abort_arg_t<R>{}...);
 			count_.fetch_sub(1, std::memory_order_relaxed);
 			return park();
 		}
@@ -279,9 +292,9 @@ public:
 		return park();
 	}
 
-	typename asio_result<asio::error_code, R...>::type await_resume() {
+	typename asio_result<asio::error_code, abort_arg_t<R>...>::type await_resume() {
 		if (error_) { std::rethrow_exception(error_); }
-		return asio_result<asio::error_code, R...>::take(*result_);
+		return asio_result<asio::error_code, abort_arg_t<R>...>::take(*result_);
 	}
 
 private:
@@ -313,11 +326,15 @@ private:
 			return;
 		}
 		count_.fetch_add(1, std::memory_order_relaxed);
-		bool posted = false;
+		bool posted = false, threw = false;
 		try {
 			posted = sched_.post_call(&emit_posted, this);
-		} catch (...) {}
-		if (!posted) { count_.fetch_sub(1, std::memory_order_relaxed); }  // no post_call: no cross-thread cancel
+		} catch (...) {
+			threw = true;
+		}
+		// No post_call (or no current scheduler) means no cross-thread cancel (D7); say so in Debug.
+		assert((posted || threw) && "a cross-thread cancel of a token-bound await needs a scheduler with post_call");
+		if (!posted) { count_.fetch_sub(1, std::memory_order_relaxed); }
 	}
 
 	static void emit_posted(void* p) {
@@ -328,7 +345,7 @@ private:
 
 	Init init_;
 	cancel_token token_;
-	std::optional<std::tuple<asio::error_code, R...>> result_;
+	std::optional<std::tuple<asio::error_code, abort_arg_t<R>...>> result_;
 	std::exception_ptr error_;
 	asio::cancellation_signal signal_;
 	bool started_ = false;    // the loop's thread only
@@ -358,8 +375,9 @@ template <typename Sig, typename Init>
 }
 
 // The same with a token; Sig must begin with asio::error_code. A requested token never
-// calls init and completes with operation_aborted (other arguments value-initialized); a
-// request while the operation is pending cancels it through a cancellation slot. The
+// calls init and completes with operation_aborted (other arguments value-initialized; one
+// without a default constructor, such as a socket, comes back as a std::optional, empty then);
+// a request while the operation is pending cancels it through a cancellation slot. The
 // operation's I/O object must run on the awaiting scheduler's loop. A cancel that loses the
 // race returns the operation's real result: check token.requested() to know whether to stop.
 template <typename Sig, typename Init>

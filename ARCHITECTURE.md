@@ -85,7 +85,9 @@ the cancel callback is registered before `init` runs and the token is checked ag
 request on the loop emits `cancellation_type::all` on the operation's slot (or, during
 initiation, leaves it for `await_suspend` to emit), and a request from another thread adds one
 to the count and posts a plain function through `post_call` that emits and drops it. Every exit
-of `await_suspend` (the early-out, a throwing `init`) suspends while that count is pending.
+of `await_suspend` (the early-out, a throwing `init`) suspends while that count is pending. The
+token overload returns an argument without a default constructor (a socket) as a
+`std::optional`, empty when the token was requested before the operation started.
 
 ## Teardown
 
@@ -97,14 +99,18 @@ pops one root at a time and destroys it outside the list's lock; then destroy sc
 Each primitive stays consistent: a lock waiter granted but not resumed unlocks in its awaiter's
 destructor, a token's callback deregisters, a pending Asio operation goes to its stopped
 `io_context`, `when_all` destroys unfinished children. No frame is destroyed while another thread
-runs a handler or an `unlock` against it: the phases run after the join.
+runs a handler or an `unlock` against it: the phases run after the join. The `io_context` is
+not run again after `destroy_roots()`; the scheduler's posted functions check `closed()` before
+touching a frame, so one that does run drops its work. A `deadline` holds no scheduler
+reference and may be destroyed on any thread: its disarm bit is set before the timer dies.
 
 ## Frames
 
 Promise types inherit `operator new`/`operator delete` from `pooled_frame`, which
 uses a thread-local array of free lists in 64-byte classes up to 2 KiB. Allocation
 pops a list; deallocation pushes onto the freeing thread's list. `TASK_FRAME_POOL=0` sends
-every block to `operator new`.
+every block to `operator new`; it and `TASK_COUNT_FRAMES` change inline functions, so every
+translation unit of one program must agree (ODR).
 
 ## when_all
 

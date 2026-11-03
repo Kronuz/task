@@ -365,7 +365,8 @@ inline std::ptrdiff_t live_frames() noexcept {
 }
 
 // TASK_FRAME_POOL=0 sends every pooled block to operator new, so a bench can count task
-// frames against another library's allocations.
+// frames against another library's allocations. Every translation unit of one program must
+// define it (and TASK_COUNT_FRAMES) the same: they change inline functions (ODR).
 #ifndef TASK_FRAME_POOL
 #define TASK_FRAME_POOL 1
 #endif

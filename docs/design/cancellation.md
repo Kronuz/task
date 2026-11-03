@@ -195,13 +195,17 @@ template <class Sig, class Init>
 2. **Requested before start.** With a token, `Sig` must begin with `asio::error_code`
    (`static_assert`). `await_ready` returns `token.requested()`; a requested token completes the
    await at once with `asio::error::operation_aborted` and value-initialized remaining arguments,
-   and `init` never runs.
+   and `init` never runs. An argument without a default constructor (`asio::ip::tcp::socket`,
+   which `async_accept` completes with) comes back as a `std::optional<R>`, empty when the
+   operation never started and engaged otherwise (asio completes a cancelled accept with a
+   socket that is not open); any other argument keeps its type (code review CR4).
 3. **Register, then start.** `await_suspend` records the handle and `current()`, constructs the
    `cancel_callback`, and checks the token again: if the request landed in between, it destroys
    the registration and returns false with `operation_aborted`, initiating nothing. Otherwise it
    sets `initiating`, calls `init(bind_cancellation_slot(signal.slot(), handler))`, clears
    `initiating`, and emits `cancellation_type::all` itself if the callback ran meanwhile on this
-   thread (an emit before the slot holds the operation's handler is lost). The callback:
+   thread (an emit before the slot holds the operation's handler is lost: a request on the loop
+   inside `init`, before or after the operation starts, ends it aborted). The callback:
    - on the waiting scheduler's thread (`runs_here()`), outside initiation: emits `all`
      (reactor's choice, `reactor.h:300`) as its last action;
    - on the waiting scheduler's thread, inside initiation: records the request for
@@ -209,7 +213,8 @@ template <class Sig, class Init>
    - on another thread: adds one to the resume count (D5.4) and posts a plain function through
      `post_call` (D7) that emits on the loop and then drops its count. It is not a frame: a stopped
      loop's `io_context` destroys it unrun, and a closed scheduler drops it (D8), so nothing leaks
-     (CN-R7.1).
+     (CN-R7.1). With no current scheduler, or one without `post_call`, the cancel is lost (D7);
+     Debug asserts when that happens (code review N1).
 
    If the request landed between registration and the check from another thread, its callback
    has already added a count and posted the emit function (NF1): the early-out therefore gives
@@ -358,8 +363,13 @@ may be suspended on:
    task cannot enforce the rule there.
 5. **Phase 4: destroy schedulers, then `io_context`s.** `~asio_scheduler` runs `close()` and
    `destroy_roots()` itself if the owner did not (an owner with one scheduler and no cross-loop
-   frames), with a Debug assertion that live roots imply a stopped `io_context`. Destroying an
-   `io_context` without `stop()` is unsupported, as the decision says.
+   frames). `destroy_roots()` asserts in Debug that live roots imply a stopped `io_context`, and
+   `close()` and `destroy_roots()` that they do not run on a loop thread. Destroying an
+   `io_context` without `stop()` is unsupported, as the decision says. **The `io_context` is
+   never run again after phase 3** (`io.restart(); io.poll()` as a flush is not supported):
+   resumes and emits queued before `close()` stay in its queue and refer to destroyed frames.
+   The scheduler's posted functions check `closed()` before they touch a frame, so one that does
+   run drops its work, and a stopped `io_context` destroys the rest unrun (code review N2).
 6. **Counting and unrooted frames.** `task::detail::live_frames()` counts in
    `pooled_frame::operator new`/`delete` (`task.hh:300-303`), so it covers both allocation paths:
    pooled classes and frames over 2 KiB that `frame_pool` hands to `operator new` (`:255`; http's
