@@ -270,6 +270,13 @@ Asio takes the slot's handler memory from its per-thread recycling allocator
    (`async_compose` over a channel, `http_body_stream.h:60-64`), both completed by posting (probe
    `channel`: a waiting receive never runs inside `async_send` or `try_send`, all builds). Xapiand's
    streamed back-to-back read test is http T4 (j) (TH2-R5), where `push` and `read` live.
+5. **Where it lives (step C3).** `detail::asio_park::resume` (`task_asio.hh:203-215`), called
+   from the `drop()` that reaches zero in the handler or the emit function; the depth is the
+   thread-local `detail::inline_resume_depth` and the bound `detail::inline_resume_bound`
+   (`:186-187`). The tests read the depth to tell an inline resume from a posted one. Under g++'s
+   trampoline (`task.hh:448-461`), a child task's return inside an inline resume queues on the
+   running trampoline instead of nesting, so the frame above an inline-resumed child continues
+   after it returns, from the trampoline's loop; the rules are unchanged.
 
 Expected effect, to be measured (T3, T4): io_context handlers per socket round trip fall from 6.00
 to asio's 4.00.

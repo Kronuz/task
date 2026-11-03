@@ -85,8 +85,18 @@ the cancel callback is registered before `init` runs and the token is checked ag
 request on the loop emits `cancellation_type::all` on the operation's slot (or, during
 initiation, leaves it for `await_suspend` to emit), and a request from another thread adds one
 to the count and posts a plain function through `post_call` that emits and drops it. Every exit
-of `await_suspend` (the early-out, a throwing `init`) suspends while that count is pending. The
-token overload returns an argument without a default constructor (a socket) as a
+of `await_suspend` (the early-out, a throwing `init`) suspends while that count is pending.
+
+A handler or emit function that drops the count to zero resumes the frame inline when it runs
+on the waiting scheduler's thread (`runs_here()`), no other scheduler is current, and fewer than
+four inline resumes nest on the thread (`detail::inline_resume_depth`); otherwise it posts. The
+inline resume runs in a `running_on` scope, so it stamps a fresh slice and later awaits record
+the scheduler, as a posted resume would. Each such completion costs the loop one handler
+instead of two. The bound only limits handlers invoked from inside another inline resume (a resumed
+coroutine that dispatches or emits a cancel that completes at once); past it the next resume is
+posted and its chain starts again at depth 0. Code after the await may therefore run inside the
+completion handler, on the same thread and in the same scope. The token
+overload returns an argument without a default constructor (a socket) as a
 `std::optional`, empty when the token was requested before the operation started.
 
 ## Teardown
