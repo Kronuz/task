@@ -87,14 +87,19 @@ initiation, leaves it for `await_suspend` to emit), and a request from another t
 to the count and posts a plain function through `post_call` that emits and drops it. Every exit
 of `await_suspend` (the early-out, a throwing `init`) suspends while that count is pending.
 
-A handler or emit function that drops the count to zero resumes the frame inline when it runs
-on the waiting scheduler's thread (`runs_here()`), no other scheduler is current, and fewer than
-four inline resumes nest on the thread (`detail::inline_resume_depth`); otherwise it posts. The
-inline resume runs in a `running_on` scope, so it stamps a fresh slice and later awaits record
-the scheduler, as a posted resume would. Each such completion costs the loop one handler
-instead of two. The bound only limits handlers invoked from inside another inline resume (a resumed
-coroutine that dispatches or emits a cancel that completes at once); past it the next resume is
-posted and its chain starts again at depth 0. Code after the await may therefore run inside the
+A handler or emit function that drops the count to zero resumes the frame inline only at the
+top level: on the waiting scheduler's thread (`runs_here()`), with no scheduler current (the
+handler runs directly under the loop, not inside another frame's resume, a scheduler's posted
+call or a cancel request), and with fewer than four inline resumes nested on the thread
+(`detail::inline_resume_depth`); otherwise it posts. So a cancelled frame never finishes inside
+its requester's `request()`, and two tasks completing each other's operations return to the
+loop every round. The inline resume runs in a `running_on` scope, so it stamps a fresh slice and
+later awaits record the scheduler, as a posted resume would, and on a fresh trampoline under
+GCC (`detail::fresh_trampoline`, shared with `sync_wait`), so the resumed frame's parent
+continues inside that scope on both compilers. Each such completion costs the loop one handler
+instead of two. The bound only limits a handler run with no scheduler current inside another
+inline resume (a `sync_wait` driver that dispatches); past it the next resume is posted and its
+chain starts again at depth 0. Code after the await may therefore run inside the
 completion handler, on the same thread and in the same scope. The token
 overload returns an argument without a default constructor (a socket) as a
 `std::optional`, empty when the token was requested before the operation started.

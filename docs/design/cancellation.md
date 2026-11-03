@@ -51,6 +51,9 @@ forwarding members and migrates its one `lock_until` call (D11).
 | XN2 (finding 2) | accepted as a rule | D6.4: completion handlers are invoked with the object consistent and outside its critical section, and never resume the frame inside their own initiation (D5.4); hand-written operations checked; the streamed test is http T4 (j) (TH2-R5) |
 | XN3 (finding 3) | accepted | Q1 text corrected: Xapiand `ShardEndpoint::take_turn` calls `turn.lock_until(*host, deadline)` (`src/database/pool.cc:350`) and migrates to `lock(token)` in the wave |
 | TH2-L1 / TH2-R1 (reactor) | task's part | D8.7: the teardown API reactor codes against |
+| C3 code review CR2, CR3 | the lead's ruling (2026-11-02): inline resume at the top level only | D6.1, D6.3, D6.4; T1 (D6) `sync_cancel`, `pingpong` |
+| C3 code review CR1 | accepted, the reviewer's first fix | D6.5: the inline resume runs on a fresh trampoline; T1 (D6) `trampoline_scope` on clang and g++ |
+| C3 code review CR4, N1-N4 | accepted | T1 (D6) emit-drops-last; N2 the T1 (D6) row; N3 D8.7; N4 D6.3 |
 | Q1, Q2, Q3 | ruled (a) each | D4, D5.6, D8.2; "Rulings adopted" |
 
 Nothing else changed: D1, D9 and D10 are as in revision 1.
@@ -247,18 +250,33 @@ Asio takes the slot's handler memory from its per-thread recycling allocator
 
 ### D6. Inline resume inside the scheduler's scope
 
-1. **When.** The handler or emit function that drops D5.4's count to zero after the park resumes
-   inline when all three hold: `sched_.runs_here()`, no other scheduler is current
-   (`!current() || current() == sched_`), and the thread's inline depth is below 4. It runs
-   `{ running_on scope(sched_); h_.resume(); }`; otherwise it posts as today.
+1. **When: at the top level only** (the lead's ruling on C3 code review CR2 and CR3,
+   2026-11-02). The handler or emit function that drops D5.4's count to zero after the park
+   resumes inline when all three hold: `sched_.runs_here()`, no scheduler is current
+   (`!current()`: the completion runs directly under the loop, not inside another frame's
+   resume, a scheduler's drain or posted call, or a cancel request), and the thread's inline
+   depth is below 4. It runs `{ running_on scope(sched_); h_.resume(); }` on a fresh trampoline
+   (D6.5); otherwise it posts as today. So a completion dispatched from inside a task, a cancel
+   requested from inside one whose operation completes inside the emit, and an emit that
+   `asio_scheduler::post_call` runs in its scope all post: a cancelled frame never ends inside
+   its requester's `request()`, and two tasks that complete each other's operations return to
+   the loop every round (T1 (D6), from the reviewer's probes `sync_cancel` and `pingpong`). The
+   measured gain is unchanged: `posts` 4.00 io handlers per round trip with or without the
+   dropped `current() == sched_` clause, because it comes entirely from top-level handlers. The
+   cost: a cross-thread cancel's resume is posted (one more handler on that path).
 2. **A resume is a resume.** `running_on` stamps a fresh slice (`task.hh:164-168`), so the inline
    resume counts for the per-resume slice: a budget that spends its slice demotes at the next
    checkpoint (`:654`, `:661-662`), the property probe `nocurrent` shows a raw resume loses (0
    yielding checkpoints against 19-20). Awaits after it record `current() == sched_` (`task.hh:444`,
    `:724`, `:882`), so continuations come home to the loop.
-3. **Depth.** Initiation no longer nests a resume (D5.4), so the bound (4, a constant) limits what
-   remains: a handler invoked from inside another inline resume, as when a resumed coroutine
-   dispatches or emits a cancel that completes synchronously. Past it the resume is posted.
+3. **Depth.** Initiation never nests a resume (D5.4), and a completion inside a resumed frame
+   posts (D6.1), so an inline resume nests only under a handler that runs with no scheduler
+   current inside another inline resume: a `sync_wait` driver (`running_on` with an empty
+   reference) or a frame that recorded no scheduler, dispatching on the loop. The bound (4, a
+   constant) limits that; past it the resume is posted. A frame that recorded no scheduler is
+   itself resumed raw by `resume_on` with an empty reference, wherever its operation completes,
+   and the bound does not count those resumes (code review N4; this predates C3, and only such
+   frames are unbounded).
 4. **Reentrancy rule (XN2).** An operation awaited through `await_asio` invokes its completion
    handler with its object's state consistent and outside its own critical section, and the
    handler never resumes the awaiting frame inside its own initiation (D5.4 enforces the second
@@ -269,14 +287,25 @@ Asio takes the slot's handler memory from its per-thread recycling allocator
    (`arm`/`completed`, `try_send` on `done_`, `http_asio.h:549-561`) and `BodyStream`
    (`async_compose` over a channel, `http_body_stream.h:60-64`), both completed by posting (probe
    `channel`: a waiting receive never runs inside `async_send` or `try_send`, all builds). Xapiand's
-   streamed back-to-back read test is http T4 (j) (TH2-R5), where `push` and `read` live.
-5. **Where it lives (step C3).** `detail::asio_park::resume` (`task_asio.hh:203-214`), called
+   streamed back-to-back read test is http T4 (j) (TH2-R5), where `push` and `read` live. With
+   D6.1 at the top level, the rule concerns top-level handlers only: an operation may complete
+   synchronously from another task's code or from its cancellation handler inside the emit,
+   because that resume is posted, and a budget's checkpoint bounds each task of a lockstep pair,
+   because every round returns to the loop.
+5. **Where it lives (step C3).** `detail::asio_park::resume` (`task_asio.hh:204-216`), called
    from the `drop()` that reaches zero in the handler or the emit function; the depth is the
    thread-local `detail::inline_resume_depth` and the bound `detail::inline_resume_bound`
-   (`:186-187`). The tests read the depth to tell an inline resume from a posted one. Under g++'s
-   trampoline (`task.hh:448-461`), a child task's return inside an inline resume queues on the
-   running trampoline instead of nesting, so the frame above an inline-resumed child continues
-   after it returns, from the trampoline's loop; the rules are unchanged.
+   (`:186-187`). The tests read the depth to tell an inline resume from a posted one. On each
+   compiler: with symmetric transfer (clang, `TASK_SYMMETRIC_TRANSFER` 1), the resumed frame's
+   chain (a child's return to its parent, the parent up to its next suspension) runs by tail
+   calls inside `h_.resume()`. Under the trampoline (every other compiler, `task.hh:424-481`), a
+   transfer inside a running trampoline loop only queues, so the resume runs on a fresh
+   trampoline (`detail::fresh_trampoline`, which `sync_wait` shares) and the chain runs in that
+   loop inside the call. On both, the chain finishes inside the scope and the depth: the parent
+   of an inline-resumed child continues with `current() == sched_`, at depth 1, and its next
+   await records `sched_` (T1 (D6) `trampoline_scope`, from code review CR1). The fresh loop's
+   queue allocates once when the resume nests in a running trampoline, which happens only when a
+   coroutine with no scheduler, already inside a trampoline loop, dispatches the completion.
 
 Expected effect, to be measured (T3, T4): io_context handlers per socket round trip fall from 6.00
 to asio's 4.00.
@@ -402,7 +431,10 @@ may be suspended on:
 
    `close()` and `destroy_roots()` are idempotent and are the owner thread's, called after phase
    1's join (a `Reactor`'s `scheduler_` destructor repeats them); `closed()` is a plain read
-   after the join.
+   after the join. No loop runs between the phases: after phase 1 no `io_context` runs again
+   until it is destroyed. Between `close()` and `destroy_roots()` an operation's handler would
+   resume its frame inline (D6.1, which does not check `closed()`), where `close()` drops only
+   posted resumes (C3 code review N3).
 
    reactor's `TcpServer::stop()` runs, after its join (`reactor.h:596-600` at reactor:ade618d):
    `close()` on every reactor's scheduler, then `destroy_roots()` on every one, then destroys the
@@ -465,7 +497,7 @@ shapes (`crossroot` and `holder` run clean under TSan at task:8cad661).
 
 | Row | Target | Procedure |
 | --- | --- | --- |
-| T1 Unit tests | each passes, and fails with its fix reverted (each revert shown once in the ledger) | `test/test.cc`, `sync_test.cc`, `asio_test.cc` gain: **(D1)** reason first-wins across 8 racing threads; `requested()` and `reason()` agree; source construction in a loop of 10,000 adds 0 `operator new` (counting `operator new`, as `bench/bench.cc:37-46`). **(D2)** callback before and after request; deregistration during a callback on another thread waits (TSan); self-deregistration inside the callback; a throwing callback is dropped and the next still runs. **(D3)** parent request reaches a child; a child of a requested parent is born requested; child state freed after parent dies. **(D4)** a deadline requests `deadline` at its time; destroying it first never requests; destroying it after its expiry is queued (probe `late_fire`'s two-timer shape) leaves the token unrequested; a linked deadline takes the parent's reason; `lock(token)`: free lock taken with a requested token, held lock with a requested token returns empty without queueing, request while queued (same thread, other thread under TSan), request between enqueue and registration continues in place. **(D5)** a requested token never calls `init`; an `Init` that completes through `asio::dispatch` on the loop and one that calls the handler directly, each with and without a token, each ending its root in the continuation, ASan clean and the frame ends after `await_suspend` returns; a socket read with a token requested on the loop ends with `operation_aborted` within one `run_one`; requested from another thread, same result and the frame outlives the posted emit (TSan, 10,000 iterations); a lost race returns the real result; empty token binds no slot. **(D6)** a budget loop after an inline-resumed socket read demotes (C1 of the revision-1 review); a continuation after an inline resume runs on the loop's thread (TSan); a chain of 100 completions driven by dispatches from resumed coroutines stays within depth 4. **(D7)** a task spawned through a forwarding wrapper (a `Host`-shaped type declaring `roots`, `runs_here`, `post_call`) is a root destroyed at teardown and resumes inline. **(D8)** under ASan, `live_frames()` back to baseline in each: one loop with roots suspended in `await_asio`, an `event`, a lock wait, a demoted checkpoint and a `when_all`; `crossroot` (root on A suspended on B's timer); `holder` with holder on A and waiter on B, destroyed in both orders (A's roots first, B's first); `grant_destroyed` (grant, destroy the frame unrun, `try_lock()` succeeds); an `event` set by a dying frame with a waiter on another loop; a destructor that spawns during phase 3 (the task is destroyed, not linked); a frame destroyed with a cross-thread emit pending; a connection-sized frame over 2 KiB counted |
+| T1 Unit tests | each passes, and fails with its fix reverted (each revert shown once in the ledger) | `test/test.cc`, `sync_test.cc`, `asio_test.cc` gain: **(D1)** reason first-wins across 8 racing threads; `requested()` and `reason()` agree; source construction in a loop of 10,000 adds 0 `operator new` (counting `operator new`, as `bench/bench.cc:37-46`). **(D2)** callback before and after request; deregistration during a callback on another thread waits (TSan); self-deregistration inside the callback; a throwing callback is dropped and the next still runs. **(D3)** parent request reaches a child; a child of a requested parent is born requested; child state freed after parent dies. **(D4)** a deadline requests `deadline` at its time; destroying it first never requests; destroying it after its expiry is queued (probe `late_fire`'s two-timer shape) leaves the token unrequested; a linked deadline takes the parent's reason; `lock(token)`: free lock taken with a requested token, held lock with a requested token returns empty without queueing, request while queued (same thread, other thread under TSan), request between enqueue and registration continues in place. **(D5)** a requested token never calls `init`; an `Init` that completes through `asio::dispatch` on the loop and one that calls the handler directly, each with and without a token, each ending its root in the continuation, ASan clean and the frame ends after `await_suspend` returns; a socket read with a token requested on the loop ends with `operation_aborted` within one `run_one`; requested from another thread, same result and the frame outlives the posted emit (TSan, 10,000 iterations); a lost race returns the real result; empty token binds no slot. **(D6)** a budget loop after an inline-resumed timer wait demotes (C1 of the revision-1 review); a continuation after an inline resume runs on the loop's thread (TSan); a completion dispatched from inside a task posts; a chain of 100 completions, each dispatched with no scheduler current by the link the last one resumed, stays within depth 4; `sync_cancel` (C3 code review CR2): a cancel requested inside a task, of an operation that completes inside the emit, never resumes the frame inside `request()`, and the cross-thread emit that drops the count last posts the resume on `asio_scheduler` (2,000 rounds); the emit dropping last on a scheduler whose `post_call` runs at the top level resumes inline, in two orders (CR4); `pingpong` (CR3): two tasks completing each other's operations let the loop's other work run every round; `trampoline_scope` (CR1): the parent of a child resumed inline inside a coroutine with no scheduler continues in the scope, on clang and g++. **(D7)** a task spawned through a forwarding wrapper (a `Host`-shaped type declaring `roots`, `runs_here`, `post_call`) is a root destroyed at teardown and resumes inline. **(D8)** under ASan, `live_frames()` back to baseline in each: one loop with roots suspended in `await_asio`, an `event`, a lock wait, a demoted checkpoint and a `when_all`; `crossroot` (root on A suspended on B's timer); `holder` with holder on A and waiter on B, destroyed in both orders (A's roots first, B's first); `grant_destroyed` (grant, destroy the frame unrun, `try_lock()` succeeds); an `event` set by a dying frame with a waiter on another loop; a destructor that spawns during phase 3 (the task is destroyed, not linked); a frame destroyed with a cross-thread emit pending; a connection-sized frame over 2 KiB counted |
 | T2 Sanitizers | 0 reports | T1 and the existing suites in `build-asan`, `build-tsan` and g++ Debug ASan; the Linux CI ASan job (LSan) clean |
 | T3 Architect's probes | revision 1: `cancel` read ends within 1 ms of the request; `teardown` task 1 of 1 after the phases; `posts` task 4.00 io handlers per round trip (asio 4.00), `operator new` ≤ asio's 9 per 10,000; `nocurrent` an inline-resumed loop yields at as many checkpoints as one resumed through the scheduler (19-20 at task:8cad661). Revision 2, in all three builds: `late_fire` 0 requests after disarm; `grant_destroyed` mutex free afterwards; `crossroot`, `holder` exit 0 and ASan clean; `dispatch_inline` ASan clean; `channel`, `race`, `composed` unchanged | copy `http-wt/task-handlers/.scratch/arch-review/` and `.scratch/arch-review-rev2/` to this worktree's `.scratch/` (the originals read only); replace each `src/task.hh` and `src/task_asio.hh` with the branch's. Port revision 1 as before (`cancel` to `await_asio(init, source.token())` with the request posted to the loop; `teardown` to the four phases). Port revision 2: `late_fire` to a `deadline` destroyed by the first timer's handler; `crossroot` and `holder` to `spawn` on A, then `stop`, `close()` on both, `destroy_roots()` on both, then destroy (and `holder` again in the other order); `dispatch_inline` to the branch's `await_asio` with an `Init` calling `asio::dispatch(io, handler)`; `grant_destroyed` unchanged. `quiet light probes 10 "arch probes" -- .scratch/arch-review-rev2/build.sh rel` (and `asan`, `tsan`; same for `arch-review`), then `run.sh`; results in each `results.txt` |
 | T4 task bench | reported by the lead, never gating alone: no-op task and yield-to-resume within the A/A band of task:8cad661; new rows for an `await_asio` socket round trip, posted against inline, with io handlers and `operator new` per round trip, and a linked deadline per read (D3's lock pairs) | `bench/bench.cc` gains the round-trip rows (a socket pair on one io_context, 200,000 round trips, best of 5); the lead runs A (task:8cad661), A' (a copy) and B in one `quiet exclusive` hold, 7 rounds, order rotated, `cpp-libraries/tools/ab_compare.py` |

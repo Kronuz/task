@@ -48,8 +48,9 @@ explains how each piece works.
   `std::optional` with or without a token, so a signature has one result type; it is empty only
   when a request came before the start.
   A cross-thread cancel needs a current scheduler with `post_call`; otherwise it is lost, and
-  Debug asserts. A completion on the awaiting scheduler's own thread, with no other scheduler
-  current, resumes the task inside the handler (in the scheduler's scope, a fresh budget slice;
+  Debug asserts. A completion on the awaiting scheduler's own thread with no scheduler current
+  (a top-level handler, not one run inside a task, a scheduler's posted call or a cancel
+  request) resumes the task inside the handler (in the scheduler's scope, a fresh budget slice;
   up to four such resumes nest, then one is posted); any other completion resumes it through
   the scheduler.
 - Optional scheduler members, found by detection and forwarded by wrappers: `runs_here()`,
