@@ -82,7 +82,8 @@
   (K11), X3 and CR6 (C1 review): see the log.
 - Last verified: 2026-11-02, C3 fix round at task:cc01808: four macOS builds green (Apple clang
   rel, clang ASan+UBSan, clang TSan, g++ 16 ASan+UBSan), 42 mutants caught, the reviewer's probes
-  clean on clang and g++ (see "C3 fix round"). Before: C3 at task:8d5319e: four builds green (Linux lease) and macOS
+  clean on clang and g++ (see "C3 fix round"); CI green on all 8 jobs at task:a40bfe3 (run
+  41579535675; `headers` skipped, as before). Before: C3 at task:8d5319e: four builds green (Linux lease) and macOS
   Apple clang rel, 33 mutants caught (26 C1-C2 rows, 7 D6 rows), probes clean (see "C3 evidence");
   CI green on all 8 jobs at task:a77c434 (run 41568114093; the `headers` job skipped, as at C2).
 
