@@ -1123,8 +1123,25 @@ task::task<void> pingpong_side(pingpong& p, bool is_a) {
 	if (auto f = std::exchange(peer, nullptr)) { asio::post(p.io, [f = std::move(f)]() mutable { f(asio::error_code{}); }); }
 }
 
+// A coroutine type that is not a task: it starts at once and records no scheduler.
+struct eager_co {
+	struct promise_type {
+		eager_co get_return_object() noexcept { return {}; }
+		std::suspend_never initial_suspend() noexcept { return {}; }
+		std::suspend_never final_suspend() noexcept { return {}; }
+		void return_void() noexcept {}
+		void unhandled_exception() noexcept { std::terminate(); }
+	};
+};
+task::task<void> kicked_child(kick* k) { co_await task::await_asio<void(asio::error_code)>(kick_init(k)); }
+task::task<void> kick_from_task(asio::io_context& io, kick* k) {
+	asio::dispatch(io, std::move(*k));
+	co_return;
+}
+eager_co kick_unscoped(asio::io_context& io, kick* k) { co_await kick_from_task(io, k); }
+
 // Inline resume is top-level only (D6.1): a completion inside a task, a cancel request or a
-// scheduler's posted call queues its resume.
+// scheduler's posted call queues its resume; the inline path keeps the scope on both compilers.
 void test_inline_top_level() {
 	const auto base = task::detail::live_frames();
 	// A cancel requested inside a task on the loop, of an operation that completes inside the
@@ -1223,6 +1240,30 @@ void test_inline_top_level() {
 		io.run();
 		std::printf("pingpong: rounds %d, other loop work %d\n", p.rounds, p.ticks);
 		CHECK(p.rounds == p.limit + 1 && p.ticks == p.limit);  // the side released last adds a round
+	}
+	// A task resumed inline inside a coroutine that runs with no scheduler (here a non-task
+	// coroutine awaiting a task): its parent continues in the scheduler's scope and keeps it
+	// across its next await, under symmetric transfer and under g++'s trampoline (CR1).
+	{
+		asio::io_context io;
+		task::asio_scheduler s(io.get_executor());
+		auto r = task::scheduler_ref::of(s);
+		kick k;
+		int scoped_after_child = -1, depth_after_child = -1, scoped_after_next = -1;
+		auto parent = [&]() -> task::task<void> {
+			co_await kicked_child(&k);
+			scoped_after_child = task::current() == r;
+			depth_after_child = task::detail::inline_resume_depth;
+			asio::steady_timer t(io, 1ms);
+			co_await task::await_asio<void(asio::error_code)>([&](auto h) { t.async_wait(std::move(h)); });
+			scoped_after_next = task::current() == r;
+		};
+		task::spawn(r, parent());
+		io.poll();
+		asio::post(io, [&] { kick_unscoped(io, &k); });
+		io.restart();
+		io.run();
+		CHECK(scoped_after_child == 1 && depth_after_child == 1 && scoped_after_next == 1);
 	}
 	CHECK(task::detail::live_frames() == base);
 }

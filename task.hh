@@ -461,6 +461,25 @@ inline std::coroutine_handle<> transfer(std::coroutine_handle<> h) {
 #endif
 }
 
+// Gives the enclosing block a trampoline loop of its own. Inside a running loop a transfer
+// only queues, so a chain resumed in the block would finish after the block, out of its scope.
+struct fresh_trampoline {
+#if TASK_SYMMETRIC_TRANSFER
+	fresh_trampoline() noexcept {}
+#else
+	trampoline outer;
+	bool nested = local_trampoline().active;
+	fresh_trampoline() noexcept {
+		if (nested) { std::swap(local_trampoline(), outer); }
+	}
+	~fresh_trampoline() {
+		if (nested) { std::swap(local_trampoline(), outer); }
+	}
+#endif
+	fresh_trampoline(const fresh_trampoline&) = delete;
+	fresh_trampoline& operator=(const fresh_trampoline&) = delete;
+};
+
 }  // namespace detail
 
 // ---------------------------------------------------------------------------------------------
@@ -752,19 +771,7 @@ T sync_wait(task<T> t) {
 		s.cv.notify_one();
 	};
 	{
-#if !TASK_SYMMETRIC_TRANSFER
-		// Inside a trampoline loop, a transfer only queues; run this one on a fresh loop.
-		detail::trampoline outer;
-		detail::trampoline& local = detail::local_trampoline();
-		const bool nested = local.active;
-		if (nested) { std::swap(local, outer); }
-		struct restore {
-			detail::trampoline& local;
-			detail::trampoline& outer;
-			bool nested;
-			~restore() { if (nested) { std::swap(local, outer); } }
-		} guard{local, outer, nested};
-#endif
+		detail::fresh_trampoline fresh;
 		auto d = drive(std::move(t), st);
 		running_on scope{scheduler_ref{}};
 		d.h.resume();  // d may already be gone when this returns
