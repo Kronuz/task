@@ -191,3 +191,25 @@ round cannot settle it.
 macOS builds; CI (run 41568114093 at task:a77c434 is the author's); T4 timing (the lead's); T6 consumers (strata, prospect, residency,
 Xapiand); a full-buffer socket read loop (by reading asio, `post_immediate_completion` queues each completion behind other work); the
 T3 `nocurrent` probe; strand and thread-pool schedulers (by reading `task_asio.hh:99`, `runs_here()` is false there, so they always post).
+
+## Re-check (C3 fix round, task:9985f2d)
+
+Scoped to CR1-CR4 and the author's TSan note. macOS only (the build lease was busy): Homebrew clang ASan+UBSan and TSan, Apple clang
+-O2, g++ 16 ASan+UBSan. Harness and output in `.scratch/c3r/` (`probes.sh`/`probes.txt`, `rest.sh`/`rest.txt`, `mut.py`, `probe_ft.cc`).
+`mut.py` applies each revert to a scratch copy of the two headers and compiles `test/asio_test.cc` against it, so the worktree is never
+edited (`mutants_rv.py` edits the worktree and its RV7 string no longer exists after the fix, so it was not rerun as written).
+
+| Finding | Verdict | Evidence |
+| --- | --- | --- |
+| CR2, CR3 (ruling) | CLOSED | `task_asio.hh:205` reads `inline_resume_depth < inline_resume_bound && s.runs_here() && !current()`. My `probe_c3` against the branch: `sync_cancel` on-loop `done=1 ran inside requester's request()=0 inline=0`; cross-thread `done=2000 inline=0`; asan, tsan (atomic probe) and g++ all ok. `pingpong 20000` (clang asan/tsan, g++, rel 200,000): `ticks == iters-1` of other loop work in every checkpoint mode (rel: 200,000 of 200,001). The same probes against the C3 head before the fix round (`src-branch`): `inside request()=1`, `inline=2000 of 2000`, and `ticks=27` (clang) / `521` (g++) of 20,001. D6.1 states the rule (`docs/design/cancellation.md:253-267`), D6.3 and D6.4 restate it (the depth bound, the "top-level handlers only" reentrancy rule); `ARCHITECTURE.md` and `docs/API.md` agree. Revert D6g (clause restored, rel): `asio_test` dies at `:986`, `:1174`, `:1195`, `:1241`, as the ledger says |
+| CR1 | CLOSED | `detail::fresh_trampoline` (`task.hh:466-481`) is no-op under symmetric transfer. Otherwise it swaps an empty trampoline in only when `local_trampoline().active` and swaps back in the destructor. The two users destroy it before the `running_on` scope and the depth guard (declaration order in `sync_wait` and in `asio_park::resume`). `probe_c3 trampoline_scope` on g++ 16: `scoped=1 depth=1; after its next await scoped=1`, ok (it printed `0/0` on g++ against the ruling-only headers and against the C3 head, reproduced); clang ok. Revert D6h (g++): `asio_test.cc:1265` dies; the same revert on clang passes (symmetric, as D6.5 says). `sync_wait` unchanged: the old inline block is the same logic moved (same order, same swap), and `test.cc` (nested `sync_wait` `:719`, exceptions `:692-695`, a child completing synchronously `:685`, the draining `inline_scheduler`) passes on g++ 16 and clang, ASan+UBSan. My `probe_ft.cc` (g++, clang with `-DTASK_SYMMETRIC_TRANSFER=0`, clang symmetric): `fresh_trampoline` restores `active`/queue/head after a normal exit and after an exception, nested or not; nested `sync_wait`, an exception through a nested `sync_wait`, and `current()` empty after; mutant (destructor does not swap back) fails it. D6.5 is rewritten truthfully for both compilers (it states the allocation cost of the fresh loop and when it applies) |
+| CR4 | CLOSED | RV4 (asan) now dies in `test_inline_top_level` on 5 of 5 runs (use-after-poison, frames in the test), where it died "by chance" in the race before. RV5 (rel) dies at `asio_test.cc:1215` (`seen.inlined == 1`) in both orders. The tests use a `bare_scheduler` whose `post_call` runs at the top level, so the emit drops last and resumes inline deterministically |
+| Author's note (TSan) | CONFIRMED, probe only | `probe_c3-tsan sync_cancel` reports a race between the main thread's read of `st.done` (a plain `int` on its stack, `probe_c3.cc:109`) and the loop thread's write in `cancelled_frame`; no library frame is in either stack. `.scratch/c3f/probe_c3_atomic.cc` (the same file with `std::atomic<int>` counters) is TSan-clean in `sync_cancel`, `ops_ok`, `throw_inline`, `trampoline_scope` and `pingpong 20000`. Nothing for the library to fix |
+
+Also run, all green: `test` (20,000-task stress), `sync_test`, `pool_off_test` and `asio_test` on g++ 16 and clang, ASan+UBSan; unmutated
+`asio_test` in rel, g++ and asan builds of the mutant harness.
+
+New findings: none.
+
+Not run: Linux (the lease was busy), the T4 timing and `posts`/`nocurrent` (T3) numbers, CI, TSan on the full `asio_test`, RV1-RV3,
+RV6, RV7 and D6a-D6f (the author's `mutants.txt` has them; I reran only the mutants for the findings), and the T6 consumers.
