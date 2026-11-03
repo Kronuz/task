@@ -77,7 +77,8 @@
   CN-R7 (C11), XN1-XN3, Q1-Q3 rulings, TH2-L1 (D8.7), NF1 (K9), NF2-NF3 (K10), the TH2-L1 note
   (K11), X3 and CR6 (C1 review): see the log.
 - Last verified: 2026-11-02, C3 at task:8d5319e: four builds green (Linux lease) and macOS
-  Apple clang rel, 33 mutants caught (26 C1-C2 rows, 7 D6 rows), probes clean (see "C3 evidence").
+  Apple clang rel, 33 mutants caught (26 C1-C2 rows, 7 D6 rows), probes clean (see "C3 evidence");
+  CI green on all 8 jobs at task:a77c434 (run 41568114093; the `headers` job skipped, as at C2).
 
 ## C1 evidence (2026-11-02)
 
