@@ -15,10 +15,12 @@
 #include <asio/steady_timer.hpp>
 #include <asio/write.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <future>
 #include <memory>
 #include <optional>
@@ -538,7 +540,7 @@ task::task<void> request_in_init(asio::steady_timer& timer, task::cancel_source&
 // A cross-thread request that races the operation's own completion. kind 0: a timer; 1: the
 // handler runs inside init through a dispatch; 2: init throws.
 struct race_stats {
-	std::atomic<int> aborted{0}, ok{0}, thrown{0}, other{0}, finished{0};
+	std::atomic<int> aborted{0}, ok{0}, thrown{0}, other{0}, finished{0}, inlined{0};
 };
 task::task<void> race_one(asio::io_context& io, task::cancel_token t, int kind, race_stats* st) {
 	try {
@@ -553,6 +555,7 @@ task::task<void> race_one(asio::io_context& io, task::cancel_token t, int kind, 
 		} else {
 			ec = co_await task::await_asio<void(asio::error_code)>([&](auto h) { timer.async_wait(std::move(h)); }, t);
 		}
+		st->inlined += task::detail::inline_resume_depth > 0;  // the handler or the emit resumed it inline
 		if (!ec) {
 			++st->ok;
 		} else if (ec == asio::error::operation_aborted) {
@@ -674,7 +677,7 @@ void test_await_token() {
 		int ran = 0;
 		while (done == 0 && ran < 10) { ran += int(io.run_one()); }
 		CHECK(done == 1 && ec == asio::error::operation_aborted && n == 0);
-		CHECK(ran <= 3);  // the request, the handler, the resume (C3's inline resume drops the last)
+		CHECK(ran == 2);  // the request, then the handler, which resumes the read inline (D6)
 	}
 	// A cancel that loses the race: the data was there, the read completed during initiation,
 	// and the request inside init is emitted after: the real result comes back.
@@ -753,7 +756,8 @@ void test_await_token() {
 		while (st.finished.load() < rounds) { std::this_thread::sleep_for(1ms); }
 		l.stop();
 		CHECK(st.other == 0 && st.finished == rounds && st.ok + st.aborted + st.thrown == rounds);
-		std::printf("race: ok %d aborted %d thrown %d\n", st.ok.load(), st.aborted.load(), st.thrown.load());
+		CHECK(st.inlined > 0);
+		std::printf("race: ok %d aborted %d thrown %d, resumed inline %d\n", st.ok.load(), st.aborted.load(), st.thrown.load(), st.inlined.load());
 	}
 	CHECK(task::detail::live_frames() == base);
 }
@@ -835,6 +839,215 @@ void test_await_token_move_only() {
 		io.restart();
 		io.run_for(10s);
 		CHECK(done == 1 && !out.ec && out.engaged && out.open && out.peer_port == client.local_endpoint().port());
+	}
+	CHECK(task::detail::live_frames() == base);
+}
+
+// Inline resume (D6)
+
+using kick = std::function<void()>;
+
+// An init that leaves the handler in `slot` until someone calls it. The tests await it in the
+// frame they observe: a child task's return would go through g++'s trampoline instead.
+auto kick_init(kick* slot) {
+	return [slot](auto h) { *slot = [h = std::move(h)]() mutable { std::move(h)(asio::error_code{}); }; };
+}
+
+// A chain of links: each resumed link dispatches the next one's handler on the loop.
+struct chain {
+	asio::io_context& io;
+	std::vector<kick> next;
+	int stop_at = -1;
+	int nest = 0, max_nest = 0, max_depth = 0, done = 0, posted = 0;
+};
+task::task<void> chain_link(chain& c, int i, std::atomic<int>* destroyed) {
+	destroy_mark m{destroyed};
+	task::cancel_source src;
+	if (i % 2) {
+		co_await task::await_asio<void(asio::error_code)>(kick_init(&c.next[std::size_t(i)]), src.token());
+	} else {
+		co_await task::await_asio<void(asio::error_code)>(kick_init(&c.next[std::size_t(i)]));
+	}
+	++c.nest;
+	c.max_nest = std::max(c.max_nest, c.nest);
+	c.max_depth = std::max(c.max_depth, task::detail::inline_resume_depth);
+	c.posted += task::detail::inline_resume_depth == 0;
+	if (i == c.stop_at) { c.io.stop(); }
+	if (std::size_t(i + 1) < c.next.size()) { asio::dispatch(c.io, std::move(c.next[std::size_t(i + 1)])); }
+	--c.nest;
+	++c.done;
+}
+
+// A budget loop over `slice`: runs until `cap` checkpoints let other loop work run, or `limit`.
+task::task<void> budget_loop(std::chrono::nanoseconds slice, std::chrono::nanoseconds limit, int cap, const int* others, int* yields) {
+	task::budget b(slice);
+	auto until = std::chrono::steady_clock::now() + limit;
+	do {
+		const bool spent = b.exhausted();
+		const int before = *others;
+		co_await b.checkpoint();
+		if (spent && *others != before) { ++*yields; }
+	} while (*yields < cap && std::chrono::steady_clock::now() < until);
+}
+
+void test_inline_resume() {
+	const auto base = task::detail::live_frames();
+	// On the loop's thread with no scheduler current: inline, in the scheduler's scope, with
+	// no queue trip (the spawn's post and the timer's handler: 2 io handlers, not 3).
+	for (bool token : {false, true}) {
+		asio::io_context io;
+		task::asio_scheduler s(io.get_executor());
+		auto r = task::scheduler_ref::of(s);
+		int depth = -1;
+		bool scoped = false;
+		auto wait_timer = [&]() -> task::task<void> {
+			asio::steady_timer t(io, 1ms);
+			task::cancel_source src;
+			auto init = [&](auto h) { t.async_wait(std::move(h)); };
+			asio::error_code ec = token ? co_await task::await_asio<void(asio::error_code)>(init, src.token())
+			                            : co_await task::await_asio<void(asio::error_code)>(init);
+			depth = ec ? -2 : task::detail::inline_resume_depth;
+			scoped = task::current() == r;
+		};
+		task::spawn(r, wait_timer());
+		CHECK(io.run() == 2);
+		CHECK(depth == 1 && scoped);
+	}
+	// A loop on its own thread: the continuation runs on that thread, inline (TSan).
+	{
+		loop l;
+		l.start();
+		std::atomic<bool> finished{false};
+		std::thread::id ran_on;
+		int depth = -1;
+		auto on_loop = [&]() -> task::task<void> {
+			asio::steady_timer t(l.io, 1ms);
+			co_await task::await_asio<void(asio::error_code)>([&](auto h) { t.async_wait(std::move(h)); });
+			ran_on = std::this_thread::get_id();
+			depth = task::detail::inline_resume_depth;
+			finished = true;
+		};
+		task::spawn(l.ref(), on_loop());
+		wait_for(finished);
+		const auto loop_id = l.thread.get_id();
+		l.stop();
+		CHECK(finished && ran_on == loop_id && depth == 1);
+	}
+	// A completion on another loop's thread is posted to the waiting scheduler's loop.
+	{
+		loop a, b;
+		a.start();
+		b.start();
+		std::atomic<bool> finished{false};
+		std::thread::id ran_on;
+		int depth = -1;
+		auto cross_loop = [&]() -> task::task<void> {
+			asio::steady_timer t(b.io, 1ms);
+			co_await task::await_asio<void(asio::error_code)>([&](auto h) { t.async_wait(std::move(h)); });
+			ran_on = std::this_thread::get_id();
+			depth = task::detail::inline_resume_depth;
+			finished = true;
+		};
+		task::spawn(a.ref(), cross_loop());
+		wait_for(finished);
+		const auto a_id = a.thread.get_id();
+		a.stop();
+		b.stop();
+		CHECK(finished && ran_on == a_id && depth == 0);
+	}
+	// A handler dispatched by a coroutine of the same scheduler resumes its waiter inside the
+	// dispatch; one dispatched by a coroutine of another scheduler on the same thread is posted.
+	for (bool same : {true, false}) {
+		asio::io_context io;
+		task::asio_scheduler s1(io.get_executor()), s2(io.get_executor());
+		kick k;
+		bool waiter_done = false, dispatcher_after = false, saw_dispatcher_after = true;
+		int depth = -1;
+		auto waiter = [&]() -> task::task<void> {
+			co_await task::await_asio<void(asio::error_code)>(kick_init(&k));
+			saw_dispatcher_after = dispatcher_after;
+			depth = task::detail::inline_resume_depth;
+			CHECK(task::current() == task::scheduler_ref::of(s1));
+			waiter_done = true;
+		};
+		task::spawn(task::scheduler_ref::of(s1), waiter());
+		io.poll();
+		auto dispatcher = [&]() -> task::task<void> {
+			asio::dispatch(io, std::move(k));
+			dispatcher_after = true;
+			co_return;
+		};
+		task::spawn(task::scheduler_ref::of(same ? s1 : s2), dispatcher());
+		io.restart();
+		io.run();
+		CHECK(waiter_done);
+		CHECK(saw_dispatcher_after == !same && depth == (same ? 1 : 0));
+	}
+	// A chain of 100 completions, each dispatched by the link the previous one resumed: inline
+	// resumes nest at most four deep, then one is posted and the chain goes on from it.
+	{
+		asio::io_context io;
+		task::asio_scheduler s(io.get_executor());
+		chain c{io, std::vector<kick>(100)};
+		std::atomic<int> destroyed{0};
+		for (int i = 0; i < 100; ++i) { task::spawn(task::scheduler_ref::of(s), chain_link(c, i, &destroyed)); }
+		io.poll();
+		asio::post(io, [&] { c.next[0](); });
+		io.restart();
+		io.run();
+		CHECK(c.done == 100 && destroyed == 100);
+		// Links 0-3 resume inline at depths 1-4; link 4 is posted and starts the next run of
+		// five (a posted link, then four inline): links 4, 9, ..., 99 are posted.
+		CHECK(c.max_depth == task::detail::inline_resume_bound && c.max_nest == task::detail::inline_resume_bound + 1);
+		CHECK(c.posted == 20);
+	}
+	// An inline resume is a resume: its slice starts fresh, and a budget that spends it yields
+	// (probe nocurrent's raw resume never does).
+	{
+		asio::io_context io;
+		task::asio_scheduler s(io.get_executor());
+		int others = 0, yields = 0, fresh_yields = -1;
+		bool done = false;
+		std::function<void()> tick = [&] {
+			if (!done) {
+				++others;
+				asio::post(io, tick);
+			}
+		};
+		auto spender = [&]() -> task::task<void> {
+			asio::steady_timer t(io, 1ms);
+			co_await task::await_asio<void(asio::error_code)>([&](auto h) { t.async_wait(std::move(h)); });
+			CHECK(task::detail::inline_resume_depth == 1);
+			fresh_yields = 0;
+			co_await budget_loop(1s, 0ns, 1, &others, &fresh_yields);  // one checkpoint early in a 1 s slice
+			co_await budget_loop(200us, 2s, 10, &others, &yields);
+			done = true;
+		};
+		task::spawn(task::scheduler_ref::of(s), spender());
+		asio::post(io, tick);
+		io.run();
+		CHECK(fresh_yields == 0);
+		CHECK(yields == 10);
+	}
+	// Teardown with a chain in flight: the loop stops inside an inline resume, leaving one
+	// posted resume queued and later links suspended; the phases destroy them (ASan).
+	{
+		std::atomic<int> destroyed{0};
+		{
+			asio::io_context io;
+			auto s = std::make_unique<task::asio_scheduler>(io.get_executor());
+			chain c{io, std::vector<kick>(12), 6};
+			for (int i = 0; i < 12; ++i) { task::spawn(task::scheduler_ref::of(*s), chain_link(c, i, &destroyed)); }
+			io.poll();
+			asio::post(io, [&] { c.next[0](); });
+			io.restart();
+			io.run();
+			CHECK(c.done == 9 && destroyed == 9);  // links 0-8 ran; link 9's resume was posted
+			s->close();
+			s->destroy_roots();
+			CHECK(destroyed == 12);
+		}
+		CHECK(destroyed == 12);
 	}
 	CHECK(task::detail::live_frames() == base);
 }
@@ -925,6 +1138,22 @@ void test_wrapper() {
 	src.request();
 	for (int i = 0; i < 2000 && done == 0; ++i) { std::this_thread::sleep_for(1ms); }
 	CHECK(done == 1 && destroyed == 1);
+	// A completion on the loop resumes a task spawned through the wrapper inline, in its scope.
+	{
+		std::atomic<bool> finished{false};
+		int depth = -1;
+		bool scoped = false;
+		auto inline_wait = [&]() -> task::task<void> {
+			asio::steady_timer t(l.io, 1ms);
+			co_await task::await_asio<void(asio::error_code)>([&](auto h) { t.async_wait(std::move(h)); });
+			depth = task::detail::inline_resume_depth;
+			scoped = task::current() == hr;
+			finished = true;
+		};
+		task::spawn(hr, inline_wait());
+		wait_for(finished);
+		CHECK(finished && depth == 1 && scoped);
+	}
 	// A task spawned through the wrapper is a root of the reactor's scheduler.
 	task::spawn(hr, sleep_on(l.io, &destroyed, &parked2));
 	wait_for(parked2);
@@ -1293,6 +1522,7 @@ int main() {
 	test_primitives();
 	test_await_token();
 	test_await_token_move_only();
+	test_inline_resume();
 	test_wrapper();
 	test_teardown();
 	test_sizes();

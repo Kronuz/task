@@ -182,6 +182,10 @@ struct asio_result<A> {
 	static A take(std::tuple<A>& t) { return std::move(std::get<0>(t)); }
 };
 
+// How many inline resumes nest on this thread, and the bound past which a resume is posted.
+inline constexpr int inline_resume_bound = 4;
+inline thread_local int inline_resume_depth = 0;
+
 // One resume count: await_suspend's park and the handler hold one each, and a cancel posted
 // from another thread adds one. Whoever drops it to zero resumes the frame; await_suspend
 // dropping last continues in place, so a handler run inside initiation never resumes it.
@@ -190,9 +194,24 @@ struct asio_park {
 	std::coroutine_handle<> h_;
 	scheduler_ref sched_;
 	void drop() {
-		if (count_.fetch_sub(1, std::memory_order_acq_rel) == 1) { resume_on(sched_, h_); }
+		if (count_.fetch_sub(1, std::memory_order_acq_rel) == 1) { resume(sched_, h_); }
 	}
 	bool park() noexcept { return count_.fetch_sub(1, std::memory_order_acq_rel) != 1; }
+
+	// Inline on the scheduler's own thread, in its scope (a fresh slice), when no other
+	// scheduler is current and fewer than inline_resume_bound inline resumes nest; else posted.
+	static void resume(scheduler_ref s, std::coroutine_handle<> h) {
+		if (inline_resume_depth < inline_resume_bound && s.runs_here() && (!current() || current() == s)) {
+			struct nest {
+				nest() noexcept { ++inline_resume_depth; }
+				~nest() { --inline_resume_depth; }
+			} n;
+			running_on scope(s);
+			h.resume();
+		} else {
+			resume_on(s, h);
+		}
+	}
 };
 
 // How await_asio returns an argument R after an error_code, with or without a token: R itself when
@@ -373,9 +392,11 @@ private:
 }  // namespace detail
 
 // Awaits an Asio operation: `init(handler)` starts it, and when the handler runs with the
-// arguments of the completion signature Sig, the task resumes through the scheduler it
-// suspended on. A handler that runs inside init (a dispatch on the loop, a direct call)
-// only stores the result: the task then continues in place after init returns. The result
+// arguments of the completion signature Sig, the task resumes: inside the handler when it
+// runs on the scheduler's own thread with no other scheduler current (up to four such
+// resumes nested), else through the scheduler it suspended on. A handler that runs inside
+// init (a dispatch on the loop, a direct call) only stores the result: the task then
+// continues in place after init returns. The result
 // is void, the single argument, or a std::tuple of the arguments; an error_code is
 // returned like any other argument.
 //   auto [ec, n] = co_await task::await_asio<void(asio::error_code, std::size_t)>(
