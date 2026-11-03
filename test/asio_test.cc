@@ -748,8 +748,7 @@ void test_await_token() {
 		for (int i = 0; i < rounds; ++i) {
 			task::cancel_source src;
 			task::spawn(l.ref(), race_one(l.io, src.token(), i, &st));
-			int spin = int(rng() % 400);
-			for (volatile int k = 0; k < spin * 20; k = k + 1) {}
+			spin(std::chrono::nanoseconds(rng() % 400 * 100));  // 0-40 us
 			src.request(task::cancel_reason::shutdown);
 			if ((i & 63) == 0) { std::this_thread::yield(); }
 		}
