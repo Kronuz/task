@@ -94,8 +94,8 @@ call or a cancel request), and with fewer than four inline resumes nested on the
 (`detail::inline_resume_depth`); otherwise it posts. So a cancelled frame never finishes inside
 its requester's `request()`, and two tasks completing each other's operations return to the
 loop every round. The inline resume runs in a `running_on` scope, so it stamps a fresh slice and
-later awaits record the scheduler, as a posted resume would, and on a fresh trampoline under
-GCC (`detail::fresh_trampoline`, shared with `sync_wait`), so the resumed frame's parent
+later awaits record the scheduler, as a posted resume would, and on a trampoline loop of its own
+under GCC (every `running_on` scope carries a `detail::fresh_trampoline`), so the resumed frame's parent
 continues inside that scope on both compilers. Each such completion costs the loop one handler
 instead of two. The bound only limits a handler run with no scheduler current inside another
 inline resume (a `sync_wait` driver that dispatches); past it the next resume is posted and its

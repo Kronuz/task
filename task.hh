@@ -998,7 +998,7 @@ namespace detail {
 bool token_empty(const cancel_token& t) noexcept;
 }
 
-// A view of a source's state: polling is one relaxed load, and an empty token (the default)
+// A view of a source's state: polling is one acquire load, and an empty token (the default)
 // is never requested and allocates nothing.
 class cancel_token {
 public:
