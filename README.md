@@ -150,6 +150,14 @@ cmake --build build --target task_bench
   locks, frames, and `when_all`.
 - [docs/mechanisms/async-mutex.md](docs/mechanisms/async-mutex.md): how `async_mutex`
   hands the lock over and gives up at a deadline.
+- [docs/mechanisms/cancellation.md](docs/mechanisms/cancellation.md): cancel sources, tokens,
+  callbacks, deadlines and budget checkpoints.
+- [docs/mechanisms/await-asio.md](docs/mechanisms/await-asio.md): awaiting an Asio operation,
+  its cancellation, the resume count and the inline resume.
+- [docs/mechanisms/asio-scheduler-teardown.md](docs/mechanisms/asio-scheduler-teardown.md): the
+  four teardown phases and the zero-live-frames check.
+- [docs/mechanisms/transfers.md](docs/mechanisms/transfers.md): symmetric transfer, the
+  trampoline, and the trampoline each `running_on` scope owns.
 - [AGENTS.md](AGENTS.md): repository map, invariants, and how to verify a change.
 - [Catalog entry](https://github.com/Kronuz/cpp-libraries/blob/main/AGENTS.md#task).
 
