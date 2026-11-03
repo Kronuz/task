@@ -847,13 +847,13 @@ void test_await_token_move_only() {
 
 using kick = std::function<void()>;
 
-// An init that leaves the handler in `slot` until someone calls it. The tests await it in the
-// frame they observe: a child task's return would go through g++'s trampoline instead.
+// An init that leaves the handler in `slot` until someone calls it.
 auto kick_init(kick* slot) {
 	return [slot](auto h) { *slot = [h = std::move(h)]() mutable { std::move(h)(asio::error_code{}); }; };
 }
 
-// A chain of links: each resumed link dispatches the next one's handler on the loop.
+// A chain of links: each resumed link dispatches the next one's handler on the loop with no
+// scheduler current (as inside sync_wait's driver), so the next resume is a top-level one.
 struct chain {
 	asio::io_context& io;
 	std::vector<kick> next;
@@ -873,7 +873,10 @@ task::task<void> chain_link(chain& c, int i, std::atomic<int>* destroyed) {
 	c.max_depth = std::max(c.max_depth, task::detail::inline_resume_depth);
 	c.posted += task::detail::inline_resume_depth == 0;
 	if (i == c.stop_at) { c.io.stop(); }
-	if (std::size_t(i + 1) < c.next.size()) { asio::dispatch(c.io, std::move(c.next[std::size_t(i + 1)])); }
+	if (std::size_t(i + 1) < c.next.size()) {
+		task::running_on none{task::scheduler_ref{}};
+		asio::dispatch(c.io, std::move(c.next[std::size_t(i + 1)]));
+	}
 	--c.nest;
 	++c.done;
 }
@@ -955,8 +958,8 @@ void test_inline_resume() {
 		b.stop();
 		CHECK(finished && ran_on == a_id && depth == 0);
 	}
-	// A handler dispatched by a coroutine of the same scheduler resumes its waiter inside the
-	// dispatch; one dispatched by a coroutine of another scheduler on the same thread is posted.
+	// A handler dispatched by a coroutine, of the same scheduler or another on the same thread,
+	// posts its waiter's resume: inline resume is top-level only (D6.1).
 	for (bool same : {true, false}) {
 		asio::io_context io;
 		task::asio_scheduler s1(io.get_executor()), s2(io.get_executor());
@@ -981,7 +984,7 @@ void test_inline_resume() {
 		io.restart();
 		io.run();
 		CHECK(waiter_done);
-		CHECK(saw_dispatcher_after == !same && depth == (same ? 1 : 0));
+		CHECK(saw_dispatcher_after && depth == 0);
 	}
 	// A chain of 100 completions, each dispatched by the link the previous one resumed: inline
 	// resumes nest at most four deep, then one is posted and the chain goes on from it.
@@ -1048,6 +1051,178 @@ void test_inline_resume() {
 			CHECK(destroyed == 12);
 		}
 		CHECK(destroyed == 12);
+	}
+	CHECK(task::detail::live_frames() == base);
+}
+
+// An operation whose cancellation handler completes it inside the emit (a hand-written
+// operation; asio's own post their cancelled completions).
+struct sync_op {
+	std::function<void(asio::error_code)> h;
+	auto init() {
+		return [this](auto handler) {
+			auto slot = asio::get_associated_cancellation_slot(handler);
+			h = [hh = std::move(handler)](asio::error_code ec) mutable { std::move(hh)(ec); };
+			if (slot.is_connected()) {
+				slot.assign([this](asio::cancellation_type) { complete(asio::error::operation_aborted); });
+			}
+		};
+	}
+	void complete(asio::error_code ec) {
+		if (auto f = std::exchange(h, nullptr)) { f(ec); }
+	}
+};
+
+struct sync_seen {
+	std::atomic<int> done{0}, inlined{0};
+	asio::error_code ec;
+	task::scheduler_ref scope;
+};
+task::task<void> await_sync_op(sync_op& op, task::cancel_token t, sync_seen* seen) {
+	seen->ec = co_await task::await_asio<void(asio::error_code)>(op.init(), std::move(t));
+	seen->inlined += task::detail::inline_resume_depth > 0;
+	seen->scope = task::current();
+	++seen->done;
+}
+
+// A scheduler whose post_call runs its function as a top-level handler, with no scheduler
+// current (D7 does not require a scope there), so a posted emit may resume its frame inline.
+struct bare_scheduler {
+	asio::io_context& io;
+	void post(std::coroutine_handle<> h) {
+		asio::post(io, [this, h] {
+			task::running_on scope(task::scheduler_ref::of(*this));
+			h.resume();
+		});
+	}
+	std::uint64_t now() const noexcept { return 0; }
+	bool runs_here() const noexcept { return io.get_executor().running_in_this_thread(); }
+	void post_call(void (*fn)(void*), void* arg) {
+		asio::post(io, [fn, arg] { fn(arg); });
+	}
+};
+
+// Two tasks whose operations complete through each other's initiation.
+struct pingpong {
+	asio::io_context& io;
+	std::function<void(asio::error_code)> a, b;
+	int rounds = 0, limit = 0, ticks = 0;
+};
+task::task<void> pingpong_side(pingpong& p, bool is_a) {
+	auto& mine = is_a ? p.a : p.b;
+	auto& peer = is_a ? p.b : p.a;
+	while (p.rounds < p.limit) {
+		co_await task::await_asio<void(asio::error_code)>([&](auto h) {
+			mine = [h = std::move(h)](asio::error_code ec) mutable { std::move(h)(ec); };
+			if (auto f = std::exchange(peer, nullptr)) {
+				asio::dispatch(p.io, [f = std::move(f)]() mutable { f(asio::error_code{}); });
+			}
+		});
+		++p.rounds;
+	}
+	if (auto f = std::exchange(peer, nullptr)) { asio::post(p.io, [f = std::move(f)]() mutable { f(asio::error_code{}); }); }
+}
+
+// Inline resume is top-level only (D6.1): a completion inside a task, a cancel request or a
+// scheduler's posted call queues its resume.
+void test_inline_top_level() {
+	const auto base = task::detail::live_frames();
+	// A cancel requested inside a task on the loop, of an operation that completes inside the
+	// emit: the cancelled frame resumes through the queue, never inside request() (CR2).
+	{
+		asio::io_context io;
+		task::asio_scheduler s(io.get_executor());
+		auto r = task::scheduler_ref::of(s);
+		sync_op op;
+		task::cancel_source src;
+		bool in_request = false;
+		int done = 0, inside = -1, depth = -1;
+		auto cancelled = [&]() -> task::task<void> {
+			auto ec = co_await task::await_asio<void(asio::error_code)>(op.init(), src.token());
+			CHECK(ec == asio::error::operation_aborted);
+			inside = in_request;
+			depth = task::detail::inline_resume_depth;
+			++done;
+		};
+		auto requester = [&]() -> task::task<void> {
+			in_request = true;
+			src.request();
+			in_request = false;
+			co_return;
+		};
+		task::spawn(r, cancelled());
+		io.poll();
+		task::spawn(r, requester());
+		io.restart();
+		io.run();
+		CHECK(done == 1 && inside == 0 && depth == 0);
+	}
+	// A cross-thread cancel of that operation: the posted emit completes it and drops the count
+	// last, inside asio_scheduler's post_call scope, so the resume is posted (CR2, CR4).
+	{
+		loop l;
+		l.start();
+		constexpr int rounds = 2000;
+		sync_seen seen;
+		for (int i = 0; i < rounds; ++i) {
+			sync_op op;
+			task::cancel_source src;
+			std::atomic<bool> parked{false};
+			task::spawn(l.ref(), await_sync_op(op, src.token(), &seen));
+			asio::post(l.io, [&] { parked = true; });  // after the frame's first run: it has parked
+			wait_for(parked);
+			src.request();
+			while (seen.done.load() != i + 1) { std::this_thread::yield(); }
+			CHECK(seen.ec == asio::error::operation_aborted);
+		}
+		l.stop();
+		CHECK(seen.done == rounds && seen.inlined == 0);
+	}
+	// The emit drops the count last on a scheduler whose post_call runs it at the top level: it
+	// resumes the frame inline, in the scheduler's scope, and touches nothing after (CR4). The
+	// operation completes inside the emit, or before the emit runs (the real result wins).
+	for (bool completed_first : {false, true}) {
+		asio::io_context io;
+		bare_scheduler b{io};
+		auto br = task::scheduler_ref::of(b);
+		for (int i = 0; i < 100; ++i) {
+			sync_op op;
+			task::cancel_source src;
+			sync_seen seen;
+			task::spawn(br, await_sync_op(op, src.token(), &seen));
+			io.restart();
+			io.poll();
+			if (completed_first) { asio::post(io, [&] { op.complete(asio::error_code{}); }); }
+			src.request();  // off the loop: the emit is posted behind the completion
+			io.restart();
+			io.run();
+			CHECK(seen.done == 1 && seen.inlined == 1 && seen.scope == br);
+			if (completed_first) {
+				CHECK(!seen.ec);
+			} else {
+				CHECK(seen.ec == asio::error::operation_aborted);
+			}
+		}
+	}
+	// Two tasks in lockstep, each completing the other's operation from its initiation: every
+	// round goes through the loop's queue, so other work runs between rounds (CR3).
+	{
+		asio::io_context io;
+		task::asio_scheduler s(io.get_executor());
+		pingpong p{io};
+		p.limit = 2000;
+		std::function<void()> tick = [&] {
+			if (p.rounds < p.limit) {
+				++p.ticks;
+				asio::post(io, tick);
+			}
+		};
+		task::spawn(task::scheduler_ref::of(s), pingpong_side(p, true));
+		task::spawn(task::scheduler_ref::of(s), pingpong_side(p, false));
+		asio::post(io, tick);
+		io.run();
+		std::printf("pingpong: rounds %d, other loop work %d\n", p.rounds, p.ticks);
+		CHECK(p.rounds == p.limit + 1 && p.ticks == p.limit);  // the side released last adds a round
 	}
 	CHECK(task::detail::live_frames() == base);
 }
@@ -1523,6 +1698,7 @@ int main() {
 	test_await_token();
 	test_await_token_move_only();
 	test_inline_resume();
+	test_inline_top_level();
 	test_wrapper();
 	test_teardown();
 	test_sizes();

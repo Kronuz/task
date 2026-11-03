@@ -198,10 +198,11 @@ struct asio_park {
 	}
 	bool park() noexcept { return count_.fetch_sub(1, std::memory_order_acq_rel) != 1; }
 
-	// Inline on the scheduler's own thread, in its scope (a fresh slice), when no other
-	// scheduler is current and fewer than inline_resume_bound inline resumes nest; else posted.
+	// Inline at the top level only: on the scheduler's own thread with no scheduler current
+	// (never inside another frame's resume), in its scope (a fresh slice), and fewer than
+	// inline_resume_bound inline resumes nested; else posted.
 	static void resume(scheduler_ref s, std::coroutine_handle<> h) {
-		if (inline_resume_depth < inline_resume_bound && s.runs_here() && (!current() || current() == s)) {
+		if (inline_resume_depth < inline_resume_bound && s.runs_here() && !current()) {
 			struct nest {
 				nest() noexcept { ++inline_resume_depth; }
 				~nest() { --inline_resume_depth; }
@@ -393,8 +394,8 @@ private:
 
 // Awaits an Asio operation: `init(handler)` starts it, and when the handler runs with the
 // arguments of the completion signature Sig, the task resumes: inside the handler when it
-// runs on the scheduler's own thread with no other scheduler current (up to four such
-// resumes nested), else through the scheduler it suspended on. A handler that runs inside
+// runs on the scheduler's own thread with no scheduler current (a top-level handler; up to
+// four such resumes nested), else through the scheduler it suspended on. A handler that runs inside
 // init (a dispatch on the loop, a direct call) only stores the result: the task then
 // continues in place after init returns. The result
 // is void, the single argument, or a std::tuple of the arguments; an error_code is
