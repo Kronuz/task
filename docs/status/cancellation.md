@@ -11,8 +11,9 @@
   `docs/reviews/cancellation-c2-code.md` (CR1-CR4, N1-N5).
 - Branch / worktree: C3 on `phase/cancellation-c3` at `~/code/Kronuz/task-wt/cancellation-c3`
   (from task:d3d94f3, C2 landed); head: `git log -1`.
-- State: C2 landed (task:d3d94f3). C3 (D6) implemented and proven (see "C3 evidence"), ready for
-  review.
+- State: C2 landed (task:d3d94f3). C3 (D6) code review APPROVE WITH CONDITIONS
+  (`docs/reviews/cancellation-c3-code.md`); fix round done (CR1-CR4, N1-N4, the lead's top-level
+  ruling; see "C3 fix round"), ready for the rechecker.
 - Done criteria (set by the lead; contributors tick, never edit; they apply to steps C1-C3):
   - [x] K1 Every decision's T1 tests pass, and each fails with its fix reverted (the revert and the
     failure recorded here once per decision, D1-D8): D1-D4 in "C1 evidence"; D5, D7, D8 (and D9,
@@ -68,15 +69,20 @@
   (deadline test, N4); ledger below.
 - Done (C3): task:096c4dd (D6 code and tests), task:8d5319e (T4 bench rows, D6.5, `ARCHITECTURE.md`,
   `docs/API.md`), and this ledger.
+- Done (C3 fix round): task:d8e1f27 (top-level ruling, CR2-CR4 tests), task:fa09539 (CR1),
+  task:81b2175 (N1), task:cc01808 (D6, D8.7, T1 row: N2-N4), task:5a54c52 and this ledger.
 - Doing: nothing.
 - Next:
-  1. Code review of C3 (D6 is concurrency); the lead runs T4 on Linux.
+  1. The rechecker closes CR1, CR4 and the ruling against `.scratch/review-c3/`; the lead runs T4
+     on Linux (the fix round's clang 18 and g++ 14 Linux builds ran only in CI: no lease slot).
   2. T6 (K6) at the C3 pin: strata, prospect, residency; Xapiand by its lead.
 - Blocked on: nothing.
 - Findings folded in: CN-L1/CN-R1, CN-L2/CN-R2, CN-R3, CN-R4 (C8), CN-R5 (C9), CN-R6 (C10),
   CN-R7 (C11), XN1-XN3, Q1-Q3 rulings, TH2-L1 (D8.7), NF1 (K9), NF2-NF3 (K10), the TH2-L1 note
   (K11), X3 and CR6 (C1 review): see the log.
-- Last verified: 2026-11-02, C3 at task:8d5319e: four builds green (Linux lease) and macOS
+- Last verified: 2026-11-02, C3 fix round at task:cc01808: four macOS builds green (Apple clang
+  rel, clang ASan+UBSan, clang TSan, g++ 16 ASan+UBSan), 42 mutants caught, the reviewer's probes
+  clean on clang and g++ (see "C3 fix round"). Before: C3 at task:8d5319e: four builds green (Linux lease) and macOS
   Apple clang rel, 33 mutants caught (26 C1-C2 rows, 7 D6 rows), probes clean (see "C3 evidence");
   CI green on all 8 jobs at task:a77c434 (run 41568114093; the `headers` job skipped, as at C2).
 
@@ -440,3 +446,7 @@ stack of the inline resume (empty under symmetric transfer).
   scheduler's thread in its scope, depth bound 4 (D6); T1 (D6), T4 rows; four builds green, 33
   mutants caught, `posts` 4.00 io handlers per round trip, `nocurrent` 19-21 (task:096c4dd,
   task:8d5319e).
+- 2026-11-02: C3 code review (APPROVE WITH CONDITIONS) folded in: the lead's ruling (inline resume
+  at the top level only, CR2, CR3), CR1 (fresh trampoline), CR4 (emit-drops-last tests), N1-N4;
+  four builds green, 42 mutants caught, `posts` 4.00, `trampoline_scope` 1/1/1 on g++
+  (task:d8e1f27, task:fa09539, task:81b2175, task:cc01808).
