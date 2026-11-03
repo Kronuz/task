@@ -199,16 +199,15 @@ struct asio_park {
 	bool park() noexcept { return count_.fetch_sub(1, std::memory_order_acq_rel) != 1; }
 
 	// Inline at the top level only: on the scheduler's own thread with no scheduler current
-	// (never inside another frame's resume), in its scope (a fresh slice) on a trampoline loop
-	// of its own, and fewer than inline_resume_bound inline resumes nested; else posted.
+	// (never inside another frame's resume), in its scope (a fresh slice and a trampoline loop
+	// of its own), and fewer than inline_resume_bound inline resumes nested; else posted.
 	static void resume(scheduler_ref s, std::coroutine_handle<> h) {
 		if (inline_resume_depth < inline_resume_bound && s.runs_here() && !current()) {
 			struct nest {
 				nest() noexcept { ++inline_resume_depth; }
 				~nest() { --inline_resume_depth; }
 			} n;
-			running_on scope(s);
-			detail::fresh_trampoline fresh;  // the frame's chain (a child's parent) finishes in the scope
+			running_on scope(s);  // with a trampoline of its own: the frame's chain finishes in it
 			h.resume();
 		} else {
 			resume_on(s, h);

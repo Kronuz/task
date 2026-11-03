@@ -11,6 +11,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -564,6 +565,32 @@ void test_cancel_tokens() {
 	CHECK(task::detail::live_frames() == base);
 }
 
+// A driver that blocks its thread to run a task (a run loop, like sync_wait) called from inside a
+// task another such loop is running: the inner chain must not wait on the outer loop's queue.
+struct blocking_loop {
+	std::deque<std::coroutine_handle<>> ready;
+	void post(std::coroutine_handle<> h) { ready.push_back(h); }
+	std::uint64_t now() const noexcept { return 0; }
+	bool run(task::task<void> t) {
+		bool done = false;
+		task::spawn(task::scheduler_ref::of(*this), std::move(t), [&](std::exception_ptr) { done = true; });
+		while (!done) {
+			if (ready.empty()) { return false; }  // stuck: the task waits on a loop nobody runs
+			auto h = ready.front();
+			ready.pop_front();
+			task::running_on scope(task::scheduler_ref::of(*this));
+			h.resume();
+		}
+		return true;
+	}
+};
+task::task<void> nested_leaf() { co_return; }
+task::task<void> nested_outer(bool* inner_ok) {
+	blocking_loop inner;
+	*inner_ok = inner.run(nested_leaf());
+	co_return;
+}
+
 int main(int argc, char** argv) {
 	task::cycles::calibrate();
 	task::inline_scheduler s;
@@ -576,6 +603,14 @@ int main(int argc, char** argv) {
 	bool threw = false;
 	try { task::run(s, fails()); } catch (const std::runtime_error& e) { threw = std::string(e.what()) == "boom"; }
 	CHECK(threw);
+
+	// A blocking driver nested inside another's resume (g++'s trampoline: each scope has its own).
+	{
+		blocking_loop outer;
+		bool inner_ok = false;
+		CHECK(outer.run(nested_outer(&inner_ok)));
+		CHECK(inner_ok);
+	}
 
 	// Symmetric transfer: a million synchronous awaits and a deep chain in constant stack.
 	CHECK(task::run(s, many_awaits(1000000)) == 42000000L);

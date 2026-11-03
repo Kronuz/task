@@ -207,8 +207,78 @@ inline thread_local std::uint64_t slice_start = 0;
 // The scheduler running on this thread right now (empty outside any scheduler).
 inline scheduler_ref current() noexcept { return detail::current_scheduler; }
 
+// ---------------------------------------------------------------------------------------------
+// Transfers between coroutines
+
+// Symmetric transfer keeps chains of synchronous completions in constant stack only when
+// the compiler turns the resume into a tail call. Clang always does; GCC does only when
+// optimizing without sanitizers. Elsewhere, transfers go through a per-thread trampoline
+// that resumes queued handles in a loop instead of recursing.
+#ifndef TASK_SYMMETRIC_TRANSFER
+#if defined(__clang__)
+#define TASK_SYMMETRIC_TRANSFER 1
+#else
+#define TASK_SYMMETRIC_TRANSFER 0
+#endif
+#endif
+
+namespace detail {
+
+#if !TASK_SYMMETRIC_TRANSFER
+struct trampoline {
+	std::vector<std::coroutine_handle<>> queue;
+	std::size_t head = 0;
+	bool active = false;
+};
+
+inline trampoline& local_trampoline() {
+	thread_local trampoline t;
+	return t;
+}
+#endif
+
+// What an await_suspend returns to continue with h without growing the stack.
+inline std::coroutine_handle<> transfer(std::coroutine_handle<> h) {
+#if TASK_SYMMETRIC_TRANSFER
+	return h;
+#else
+	trampoline& t = local_trampoline();
+	t.queue.push_back(h);
+	if (t.active) { return std::noop_coroutine(); }  // the running loop resumes it
+	t.active = true;
+	while (t.head < t.queue.size()) { t.queue[t.head++].resume(); }
+	t.queue.clear();
+	t.head = 0;
+	t.active = false;
+	return std::noop_coroutine();
+#endif
+}
+
+// Gives the enclosing scope a trampoline loop of its own. Inside a running loop a transfer only
+// queues, so a chain resumed in the scope would wait for that loop, which the scope may be blocking.
+struct fresh_trampoline {
+#if TASK_SYMMETRIC_TRANSFER
+	fresh_trampoline() noexcept {}
+#else
+	trampoline outer;
+	bool nested = local_trampoline().active;
+	fresh_trampoline() noexcept {
+		if (nested) { std::swap(local_trampoline(), outer); }
+	}
+	~fresh_trampoline() {
+		if (nested) { std::swap(local_trampoline(), outer); }
+	}
+#endif
+	fresh_trampoline(const fresh_trampoline&) = delete;
+	fresh_trampoline& operator=(const fresh_trampoline&) = delete;
+};
+
+}  // namespace detail
+
 // Marks code as running on a scheduler; schedulers wrap each resume in one. Entering a scope
-// starts a time slice (see budget), and leaving it restores the enclosing scope's.
+// starts a time slice (see budget), and leaving it restores the enclosing scope's. Each scope
+// runs transfers on a trampoline loop of its own, so a driver that blocks its thread inside
+// another loop's resume (a nested sync_wait or run loop) never waits on that loop's queue.
 class running_on {
 public:
 	explicit running_on(scheduler_ref s) noexcept
@@ -224,6 +294,7 @@ public:
 	running_on& operator=(const running_on&) = delete;
 
 private:
+	[[no_unique_address]] detail::fresh_trampoline fresh_;
 	scheduler_ref previous_;
 	std::uint64_t previous_start_;
 };
@@ -414,73 +485,6 @@ inline thread_local void (*asio_registered)() = nullptr; // await_asio(init, tok
 #define TASK_TEST_HOOK(name) ((void)0)
 #endif
 
-// ---------------------------------------------------------------------------------------------
-// Transfers between coroutines
-
-// Symmetric transfer keeps chains of synchronous completions in constant stack only when
-// the compiler turns the resume into a tail call. Clang always does; GCC does only when
-// optimizing without sanitizers. Elsewhere, transfers go through a per-thread trampoline
-// that resumes queued handles in a loop instead of recursing.
-#ifndef TASK_SYMMETRIC_TRANSFER
-#if defined(__clang__)
-#define TASK_SYMMETRIC_TRANSFER 1
-#else
-#define TASK_SYMMETRIC_TRANSFER 0
-#endif
-#endif
-
-namespace detail {
-
-#if !TASK_SYMMETRIC_TRANSFER
-struct trampoline {
-	std::vector<std::coroutine_handle<>> queue;
-	std::size_t head = 0;
-	bool active = false;
-};
-
-inline trampoline& local_trampoline() {
-	thread_local trampoline t;
-	return t;
-}
-#endif
-
-// What an await_suspend returns to continue with h without growing the stack.
-inline std::coroutine_handle<> transfer(std::coroutine_handle<> h) {
-#if TASK_SYMMETRIC_TRANSFER
-	return h;
-#else
-	trampoline& t = local_trampoline();
-	t.queue.push_back(h);
-	if (t.active) { return std::noop_coroutine(); }  // the running loop resumes it
-	t.active = true;
-	while (t.head < t.queue.size()) { t.queue[t.head++].resume(); }
-	t.queue.clear();
-	t.head = 0;
-	t.active = false;
-	return std::noop_coroutine();
-#endif
-}
-
-// Gives the enclosing block a trampoline loop of its own. Inside a running loop a transfer
-// only queues, so a chain resumed in the block would finish after the block, out of its scope.
-struct fresh_trampoline {
-#if TASK_SYMMETRIC_TRANSFER
-	fresh_trampoline() noexcept {}
-#else
-	trampoline outer;
-	bool nested = local_trampoline().active;
-	fresh_trampoline() noexcept {
-		if (nested) { std::swap(local_trampoline(), outer); }
-	}
-	~fresh_trampoline() {
-		if (nested) { std::swap(local_trampoline(), outer); }
-	}
-#endif
-	fresh_trampoline(const fresh_trampoline&) = delete;
-	fresh_trampoline& operator=(const fresh_trampoline&) = delete;
-};
-
-}  // namespace detail
 
 // ---------------------------------------------------------------------------------------------
 // task<T>
@@ -771,7 +775,6 @@ T sync_wait(task<T> t) {
 		s.cv.notify_one();
 	};
 	{
-		detail::fresh_trampoline fresh;
 		auto d = drive(std::move(t), st);
 		running_on scope{scheduler_ref{}};
 		d.h.resume();  // d may already be gone when this returns
