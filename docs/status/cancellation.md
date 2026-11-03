@@ -7,11 +7,13 @@
   Reviews: architect, http `docs/reviews/task-handlers-rev2-design.md` at http:1ae1390, REJECT
   (2026-11-02, CN-L1, CN-L2, C8-C11; Q1-Q3 ruled (a)); re-check CLEARED WITH CONDITIONS
   (`docs/reviews/cancellation-design.md`); Xapiand lead, `docs/reviews/cancellation-xapiand.md`
-  (XN1-XN3); C1 code review `docs/reviews/cancellation-c1-code.md` (CR1-CR6, X3).
+  (XN1-XN3); C1 code review `docs/reviews/cancellation-c1-code.md` (CR1-CR6, X3); C2 code review
+  `docs/reviews/cancellation-c2-code.md` (CR1-CR4, N1-N5).
 - Branch / worktree: C2 on `phase/cancellation-c2` at `~/code/Kronuz/task-wt/cancellation-c2`
   (from task:b406766, C1 landed); head: `git log -1`.
-- State: C2 (D5, D7-D10, K9-K12) implemented and proven (see "C2 evidence"), ready for code
-  review; C3 (D6) not started.
+- State: C2 (D5, D7-D10, K9-K12) implemented, proven (see "C2 evidence") and reviewed (APPROVE WITH
+  CONDITIONS); the fix round for CR1-CR4 and N1-N5 is done (see "C2 fix round"), ready for the
+  scoped re-check; C3 (D6) not started.
 - Done criteria (set by the lead; contributors tick, never edit; they apply to steps C1-C3):
   - [ ] K1 Every decision's T1 tests pass, and each fails with its fix reverted (the revert and the
     failure recorded here once per decision, D1-D8): D1-D4 in "C1 evidence"; D5, D7, D8 (and D9,
@@ -63,9 +65,11 @@
 - Done: revision 1 (task:6d361ca); revision 2 (task:1132c04); C1 (landed, task:b406766).
 - Done (C2): task:213020d (code and tests: D5, D7-D10, K9-K12, X3, CR6), task:1c30b8b (design
   text and docs), and this ledger.
+- Done (C2 fix round): task:a8eef9a (CR1), task:36c7703 (CR2-CR4, N1-N3, N5), task:a958d7e
+  (deadline test, N4); ledger below.
 - Doing: nothing.
 - Next:
-  1. Code review of C2 (the lead launches it); fold findings in.
+  1. Scoped re-check of CR1-CR4 and the N2 text (`rechecker`); the lead lands C2.
   2. C3 (D6): inline resume through the count's last drop; T3 `posts`, `nocurrent` (still 6.00
      io handlers per round trip and 19-20 checkpoints at C2, as expected); the on-loop cancel
      then ends a read in 2 `run_one`s instead of 3 (`test_await_token` checks `<= 3`).
@@ -201,7 +205,7 @@ Reverts (K1's C2 part): `.scratch/c2/mutants.py` (output `.scratch/c2/mutants.tx
 | D8f | `~event` does not orphan | asan | heap-use-after-free |
 | D8g | X3: abandon before deregistering | asan | use-after-poison in `lock_waiter::wake` |
 | D8h | `~asio_scheduler` runs no phases | rel | destructor-phases check |
-| D8i | `~deadline` asserts nothing | asan | `aborts(deadline_off_loop)` |
+| D8i | `~deadline` asserts nothing | asan | `aborts(deadline_off_loop)`; retired in the C2 fix round (CR1 removed the assertion) |
 | D9a | `when_all` does not own unfinished children | rel | D9 destroyed count, `live_frames()` |
 | K12a | `TASK_FRAME_POOL=0` ignored | rel | `task_pool_off` (first try reverted only `operator new` and survived, since pooled frees then went to `operator delete`; reverting both is caught) |
 
@@ -228,9 +232,62 @@ with an empty token and 0 with an unrequested one. Nothing was timed.
 Notes for the reviewer: `await_asio(init, token)` is a second overload with its own awaiter
 type, so awaits without a token keep the 72-byte awaiter. `scheduler_ref::post_call` returns
 whether the scheduler declares one. `root_list::link`/`unlink` are public (spawn calls them).
-`~deadline` keeps a reference to its scheduler for the assertion; a test that destroys a deadline
-off the loop now closes its scheduler first. `when_all` keeps eager freeing: a finished child
+(The `~deadline` reference and assertion are gone; see the C2 fix round.) `when_all` keeps eager freeing: a finished child
 clears its owner's slot and destroys itself.
+
+## C2 fix round (code review CR1-CR4, N1-N5, 2026-11-02)
+
+Builds rel, ASan+UBSan, TSan and g++ Debug ASan via `.scratch/c2/build.sh` under `quiet light` (logs
+in `.scratch/c2f/`), each its own directory, removed after: 4 of 4 ctest pass in each, no compiler
+warning, no sanitizer report. Mutants (`.scratch/c2/mutants.py`, output `.scratch/c2f/mutants.txt`,
+`mutant-cr1.txt`): 25 rows rerun on the final headers plus the new CR1 row, all 26 die; D8i is retired.
+
+| ID | Change | Test | Revert (K1) |
+| --- | --- | --- | --- |
+| CR1 | `~deadline` asserts nothing and keeps no scheduler: `task.hh:1127-1128`, the `S& sched_` member gone; D4, `docs/API.md`, `ARCHITECTURE.md` say a deadline may be destroyed on any thread | the real-timer deadline in `test_primitives` no longer closes its scheduler; a deadline destroyed from another thread on a running loop, 300 rounds, requests nothing after it (`asio_test.cc:371-390`); `deadline_off_loop` removed | CR1 mutant (the assertion and member back): `Assertion failed: (sched_.runs_here() \|\| sched_.closed())`, abort. **D8i retired**: it asserted what CR1 deletes |
+| CR2 | none (the code was right) | `request_in_init` x 4 in `test_await_token` (`asio_test.cc:620-634`): a request inside `init` before and after `async_wait`, on the loop and from another thread | R8 (drop `if (pending_) emit`), rel: `CHECK(done == 1 && ec == operation_aborted)` fails (the await hangs to the 10 s cap) |
+| CR3 | none | `race_one`, 20,000 rounds of a cross-thread request against completion (timer, dispatch inside `init`, throwing `init`; `asio_test.cc:736-757`); every task ends once as ok, aborted or thrown, `live_frames()` back to base | R9 (drop the handler's `cb_.reset()`), asan: use-after-poison in `race_one`'s awaiter. The whole ASan ctest takes about 30 s |
+| CR4 | `abort_arg_t<R>` (`task_asio.hh:234-237`): R when default-constructible, else `std::optional<R>`; the requested-before-start path builds `abort_arg_t<R>{}`, never `R{}`; the result type of `await_resume` follows | `test_await_token_move_only`: `tcp::acceptor`, `async_accept` as `void(error_code, tcp::socket)`: requested before start (init not called, empty optional), cancelled while pending on the loop and from another thread (`operation_aborted`, engaged, not open), accepted (open, `remote_endpoint` matches the client); `static_assert`s on both result types | CR4a (the handler stores `abort_arg_t<R>{}` for the real arguments), asan: the accept cases and the 4-byte read fail |
+| N1 | Debug assert in `cancel()` when `post_call` is missing and did not throw (`task_asio.hh:336`) | death test `cancel_without_scheduler`: `sync_wait` of a token-bound timer, request from another thread | N1a (assert removed), asan: `CHECK(aborts(cancel_without_scheduler))` fails |
+| N2 | `post` and `post_call` lambdas return if `closed()` (`task_asio.hh:72`, `:92`); `destroy_roots()` asserts a stopped loop when roots are live; D8.5, API.md, ARCHITECTURE.md state the `io_context` is not run again after phase 3 | `test_teardown`: `io.restart(); io.poll()` after phase 3 with a queued resume and with a queued cancel emit (the reviewer's `poll_after`, `poll_after_emit`); death test `destroy_roots_on_running_loop` | N2a / N2b (a check removed), asan: SEGV / use-after-poison; N3b: the death test fails |
+| N3 | `close()` and `destroy_roots()` assert `!runs_here()` (Debug only; no field, no Release code) | death test `close_on_loop` | N3a, asan: `CHECK(aborts(close_on_loop))` fails |
+| N4 | sizes below | `test_sizes` prints `deadline` and the `event` awaiter | none |
+| N5 | ODR note at `TASK_FRAME_POOL` (`task.hh:367-369`), `docs/API.md`, `ARCHITECTURE.md` | none (text) | none |
+
+Decisions taken, for the re-check: (CR4) the token overload's result for a non-default-constructible
+`R` is a `std::optional<R>` in that position, empty only when the token was requested before the
+operation started; other signatures keep their types, so `[ec, n]` of a read is unchanged and
+reactor's accept loop reads `if (!ec) { use *peer }`. (N3) the owner-thread check is the stateless
+`!runs_here()`, not a thread id stamp: the owner may not be the constructing thread, and a stamp
+would cost a field. (N2) running the `io_context` after phase 3 stays unsupported: a pending
+operation of an I/O object destroyed with its frame completes into the queue with a handler that
+refers to the dead awaiter, which no check in the scheduler can reach; the `closed()` checks cover
+only what the scheduler posted (resumes and emits). The two `closed()` loads are on the Release
+posted-handler path (one acquire load of the flag `post` already read); not timed.
+
+T5 sizes (rel, a probe against e0264bd and against this branch, `.scratch/c2f/sizes.txt`; the test
+prints the same rows): `await_asio` awaiter 72 without a token (unchanged); with a token and a
+`size_t` argument 152 before, 152 after; with a `tcp::socket` argument 240 (new signature);
+`deadline<asio_scheduler>` 136 before, 128 after (the `S&`); `event` awaiter 48 (the state byte was
+already in e0264bd); `scheduler_ref` 16. 10,000 reads after warm-up: 0 `operator new` with an empty
+and with an unrequested token (unchanged). Nothing was timed.
+
+Mutant builds: D5a-D5c, D8e-D8g, R9, CR1, CR4a, N1a-N3b asan; D5d, D5e, D7a, D7b, D8a-D8d, D8h, R8,
+D9a, K12a rel; D8i retired. The CR1 row ran after the deadline test was added; the other 25 ran
+before it (a test-only addition).
+
+Reviewer probes rerun on the branch headers (`.scratch/c2f/probes.sh`, output `probes.txt`,
+`.scratch/review-c2/probe_c2.cc` built asan, tsan, Debug): `dl_no_hooks`, `dl_hook_only`,
+`dl_both_false`, `dl_in_frame_on_loop`, `dl_main_after_run`, `dl_main_after_poll`,
+`dl_main_never_run`, `dl_main_after_stop`, `dl_strand_in_frame`, `dl_thread_pool_in_frame`,
+`dl_other_thread_while_running`, `dl_closed_in_main`: all survive (no abort), asan; `dl_stress
+20000` tsan: 0 reports (287 expired at destruction). `req_in_init` asan and tsan: aborted in
+0.1-0.5 ms both ways. `stress 200000` asan: `other=0`, `live_delta=0`; `stress 20000` tsan and Debug:
+the same. `nosched` asan and Debug: assertion `a cross-thread cancel of a token-bound await needs a
+scheduler with post_call`, exit 134 (was: ends after 1001 ms with `aborted=0`). `poll_after`,
+`poll_after_emit` asan and Debug: exit 0, one handler polled and dropped (was SEGV and
+use-after-poison). `accept_sig.cc` (`await_asio<void(error_code, tcp::socket)>(init, token)`)
+compiles (was two errors).
 
 ## Log
 - 2026-11-02: C1 (D1-D4) on `phase/cancellation-c1`: reasons, callbacks, linked sources,
@@ -245,3 +302,5 @@ clears its owner's slot and destroys itself.
   deadline and when_all teardown rules (D8, D9, K10, K11), `as_awaitable` removed (D10),
   `TASK_FRAME_POOL` (K12), X3 and CR6 tests; four builds green, 18 mutants caught, probes clean,
   CI green on 8 jobs (task:213020d, task:1c30b8b).
+- 2026-11-02: C2 code review (APPROVE WITH CONDITIONS) folded in: CR1-CR4 and N1-N5 (see "C2 fix
+  round"); four builds green, 25 mutants caught and D8i retired, the reviewer's probes clean.
