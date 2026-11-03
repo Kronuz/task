@@ -364,6 +364,63 @@ posted one. (3) `current() == s` compares the scheduler pointer, so an emit func
 a wrapper's `post_call` runs in the inner scheduler's scope and posts its resume through the wrapper
 rather than resuming inline: correct, one extra handler on that cancel path.
 
+## C3 fix round (code review CR1-CR4, N1-N4, 2026-11-02)
+
+The lead's ruling on CR2 and CR3 (2026-11-02): inline resume happens only at the top level, when
+`!current()` (the completion runs directly under the loop, not inside another frame's resume, a
+scheduler drain or a cancel request); the `current() == sched_` clause goes. Reason: the reviewer
+measured the top-level-only variant at T3 `posts` 4.00 io handlers per round trip, the same as with
+the clause, and it removes CR2 and CR3. Fewer inline paths, same measured gain.
+
+Builds: the Linux lease had no slot (exit 3, twice), so every build ran on macOS under `quiet light`
+through `.scratch/c3/build.sh` (`.scratch/c3f/all.sh`, logs `.scratch/c3f/build-*.log`, summaries
+`all-2.txt`, `all-3.txt`): `build-rel` (Apple clang `-O2`), `build-asan` and `build-tsan` (Homebrew
+clang, ASan+UBSan and TSan), `build-gcc` (g++ 16 Debug ASan+UBSan, the trampoline path). `ctest` 4 of
+4 in each, no compiler warning (N1's `-Wvolatile` is gone), no sanitizer report. Not run here: clang
+18 and g++ 14 on Linux; CI's Linux jobs cover them.
+
+| ID | Change | Test | Mutant (revert) |
+| --- | --- | --- | --- |
+| CR2, CR3 (ruling) | `asio_park::resume` resumes inline only when `!current()` (`task_asio.hh:204-216`); D6.1, D6.3, D6.4, `ARCHITECTURE.md`, `docs/API.md` state the rule | `test_inline_top_level` (`asio_test.cc`): `sync_cancel` on the loop (a requester task's `request()`, the operation completes inside the emit: done 1, ran inside `request()` 0, resumed by a post); `sync_cancel` across threads (2,000 rounds, the posted emit drops last: 2,000 done, 0 inline); `pingpong` (2,000 rounds: 2,001 rounds, 2,000 ticks of other loop work, one per round). `test_inline_resume`: a dispatch from a task of the same scheduler now posts (depth 0) | D6g (the clause restored), rel: dies at `asio_test.cc:986` (same-scheduler dispatch), `:1174` (on-loop `sync_cancel`), `:1195` (cross-thread, `inlined == 0`), `:1241` (`pingpong`, ticks 0) |
+| CR1 | `detail::fresh_trampoline` (`task.hh:466-481`), shared by `sync_wait` (`:774`) and the inline resume (`task_asio.hh:211`): when the thread's trampoline loop is running, the block swaps in an empty one, so the resumed frame's chain runs inside the scope. No-op under symmetric transfer. D6.5 states what holds on each compiler | `trampoline_scope` in `test_inline_top_level`: a child resumed inline inside a non-task coroutine with no scheduler; its parent continues with `current() == s`, depth 1, and keeps `s` after its next await. Passes in all four builds (clang symmetric, g++ trampoline) | D6h (fresh trampoline removed), gcc: dies at `asio_test.cc:1265`. Evidence that the ruling alone does not close CR1: the reviewer's `probe_c3 trampoline_scope` built with g++ against the ruling-only headers (`.scratch/c3f/hdr-ruling/`) prints `scoped=0 depth=0; after its next await scoped=0` (`probes.txt`), as at C3 |
+| CR4 | none (tests) | `test_inline_top_level`: a `bare_scheduler` whose `post_call` runs at the top level (no scope; D7 allows it); the posted emit drops the count last, 100 rounds each in two orders, deterministic on one thread (request made off the loop): the operation completes inside the emit (`operation_aborted`), or completed before the emit ran (the real result); every frame resumes inline from the emit, in the scheduler's scope | RV5 (emit always posts), rel: dies at `:1215` in every round. RV4 (drop before emit), asan: use-after-poison in `emit_posted` from `test_inline_top_level` (the completed-first order) |
+| N1 | the race's spin is `spin(ns)` (timed, 0-40 us) instead of a `volatile` counter | g++ builds warning-free | none (text of a test). A first version with a compiler-barrier counter spun too briefly: the request landed before every frame started and `CHECK(st.inlined > 0)` failed (rel: thrown 0, inline 0); the timed spin keeps the C3 distribution |
+| N2 | T1 (D6) row text: "inline-resumed timer wait"; the row also names the new tests | none | none |
+| N3 | D8.7: no loop runs between the phases; between `close()` and `destroy_roots()` an operation handler would resume its frame inline | none (text) | none |
+| N4 | D6.3: a frame that recorded no scheduler is resumed raw and the bound does not count it; pre-existing, no code change (no scheduler to post to) | none | none |
+
+Mutants (`.scratch/c3f/mutants.py`, output `.scratch/c3f/mutants.txt`, detail for D6e, D6g, D6h,
+RV4, RV5 in `mutants-detail.txt`): all 42 die. The 26 C1-C2 rows; D6a-D6f and D6d-tsan, rewritten
+for the new condition; D6g and D6h (new); the reviewer's RV1-RV7 (RV7's string follows the new
+`fresh_trampoline` line). RV5 survived at C3 and dies now; RV4 died only by chance in the race and
+now dies deterministically.
+
+Reviewer probes (`.scratch/c3f/probes.sh`: `.scratch/review-c3/probe_c3.cc` and `probe_c2.cc` built on
+macOS, asan and tsan Homebrew clang, gcc g++ 16 ASan, rel Apple clang; output `probes.txt`):
+
+| Probe | clang (asan, tsan, rel) | g++ 16 ASan |
+| --- | --- | --- |
+| `ops_ok` (10 kinds x token) | ok, all inline | ok |
+| `sync_cancel` | on-loop: inside `request()` 0, inline 0; cross-thread: 2,000 done, inline 0; `owns_deadline`: inline 1 (asan). TSan reports a race on the probe's own plain `int` counter (`sc_stats::done`, read by main while the posted resume writes it); with the counters atomic (`.scratch/c3f/probe_c3_atomic.cc`) TSan is clean and prints the same values | same as asan |
+| `pingpong` | 20,001 iterations, 20,000 ticks, A and B yields 0 (asan, tsan, every checkpoint mode); rel 200,000: 200,001 and 200,000 | same |
+| `throw_inline` | ok | ok |
+| `trampoline_scope` | scoped 1, depth 1, after next await 1 | **1, 1, 1** (was 0, 0, 0; still 0, 0, 0 with the ruling alone) |
+| C2's `ops`, `inline`, `idem`, `req_in_init`, `poll_after`, `poll_after_emit`, `vhost`, `ops_teardown`, `stress 20000`, `topo 2000` | exit 0 | exit 0 |
+| C2's `nosched` | aborts on its Debug assertion, as designed | same |
+
+T3 (`.scratch/c3f/t3.sh`, `.scratch/arch-review/probe_loop.cc` against the C3 head headers,
+`review-c3/src-branch/`, and the fix round's, `src-fix/`; Apple clang `-O2`; output `t3.txt`): `posts`
+task + `await_asio` 4.00 io handlers per round trip before and after (asio's coroutine 4.00),
+`operator new` 5 per 10,000 both (asio 9). `nocurrent`, yielding checkpoints of a 200 us budget for
+5 ms: through the scheduler 21 before, 18 after; inline by `await_asio` 20 before, 18 after; raw
+resume 0 both. One run each; the inline row matches the scheduler row in both.
+
+T5 (`test_sizes`, rel, before at C3 and after): `await_asio` awaiter 72 and 72, with a token 152 and
+152, with a socket argument 240 and 240, `scheduler_ref` 16, `deadline<asio_scheduler>` 128,
+`event` awaiter 48, `cancel_callback` (lock) 40, `lock(token)` awaiter 80; 0 `operator new` per
+10,000 reads with an empty or unrequested token. `fresh_trampoline` adds no member: it lives on the
+stack of the inline resume (empty under symmetric transfer).
+
 ## Log
 - 2026-11-02: C1 (D1-D4) on `phase/cancellation-c1`: reasons, callbacks, linked sources,
   `deadline` with the disarm bit, `lock(token)` replacing `lock_until`/`lock_for`, D8.4's
