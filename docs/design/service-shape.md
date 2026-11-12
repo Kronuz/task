@@ -206,7 +206,7 @@ sleep still armed at teardown is cancelled when phase 3 destroys its frame (D10)
 | Metrics | `server_metrics_impl` `:1284`; `reactor_lag_metrics` `:1348`; labels `:883` | a function over the services' counters; labels set in `main` |
 | Signals | self-pipe `:186-215`; "you insisted" `:646-662`; `sig_handler` `main.cc:232-262,296` | `stop_signals` (`SA_RESTART`; its thread logs each signal's name); the second signal replaces "you insisted"; a `cancel_callback` on `signals.stop()` points stdin at `/dev/null`; the third signal replaces `exit(EX_SOFTWARE)` once deinited. SIGUSR1 and SIGINFO keep a dump `signal_set` |
 | Shutdown retries | `PeriodicTimer` `:184,708`; `shutdown_checks` `:739` | gone (D80); `PeriodicTimer` leaves Kronuz/reactor |
-| Admin stop | `/_quit`, `/_flush?clients` (`search_views.cc:1534,1551`) | Q3 |
+| Admin stop | `/_quit`, `/_flush?clients` (`search_views.cc:1534,1551`) | `QUIT` stays behind `--admin-commands` and calls `signals.request_stop()`, the SIGTERM path; `FLUSH?clients` closes idle connections through http's idle close (Detent D81); `FLUSH?databases` unchanged (owner, Xapiand D76) |
 | A control task that fails | `control_task_failed` `:731` | `signals.fail()`; `main` keeps the exit code |
 
 ## Decisions
@@ -240,12 +240,6 @@ sleep still armed at teardown is cancelled when phase 3 destroys its frame (D10)
   migration removes its own.
 - A non-root frame still sleeping when its scheduler dies gets a `false` fire and never resumes.
 - The third signal exits 130 or 143, without a log flush.
-
-## Open question
-
-- **Q3 (Xapiand lead): the admin stop.** `/_quit` and `/_flush?clients` do nothing today unless a
-  signal came first (`manager.cc:703-707`). Options: remove them, or map them to
-  `signals.request_stop()`, a remote stop Xapiand does not have today. Recommendation: remove.
 
 ## Checks and first steps
 
