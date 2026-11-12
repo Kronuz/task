@@ -116,10 +116,27 @@ struct cand_f {
 	}
 };
 
+// ---- (t) ----------------------------------------------------------------------------------
+struct cand_t {
+	using entry = task::timer_entry;
+	static constexpr bool cross = true;
+	static constexpr const char* shape = "task::timer_wheel";
+	std::unique_ptr<task::timer_wheel> w;
+	explicit cand_t(u64 base) : w(std::make_unique<task::timer_wheel>(base)) {}
+	const void* heads() const { return w.get(); }
+	static u64 deadline(const entry& e) { return e.deadline; }
+	void arm(entry& e, u64 d) { w->arm(e, d); }
+	void cancel(entry& e) { w->cancel(e); }
+	void arm_from(entry& e, u64 d) { w->arm_remote(e, d); }
+	template <class F>
+	std::size_t expire(u64 now, F&& f) { return w->expire(now, [&](task::timer_entry& e) { f(e); }); }
+};
+
 template <class F>
 auto dispatch(std::string_view arm, F&& f) {
 	if (arm == "a" || arm == "a2") { return f(static_cast<cand_a*>(nullptr)); }
 	if (arm == "f" || arm == "f2") { return f(static_cast<cand_f*>(nullptr)); }
+	if (arm == "t") { return f(static_cast<cand_t*>(nullptr)); }
 	std::fprintf(stderr, "unknown arm %.*s\n", int(arm.size()), arm.data());
 	std::exit(2);
 }

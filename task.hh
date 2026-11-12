@@ -31,8 +31,10 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cassert>
 #include <chrono>
 #include <concepts>
@@ -122,17 +124,19 @@ concept scheduler = requires(S& s, std::coroutine_handle<> h) {
 };
 
 class root_list;
+class timer_wheel;
 
 namespace detail {
 
-// What scheduler_ref calls through. post_call, runs_here and roots are optional: null when
-// the scheduler does not declare them.
+// What scheduler_ref calls through. post_call, runs_here, roots and wheel are optional: null
+// when the scheduler does not declare them.
 struct scheduler_vtable {
 	void (*post)(void*, std::coroutine_handle<>);
 	void (*post_demoted)(void*, std::coroutine_handle<>);
 	void (*post_call)(void*, void (*)(void*), void*);
 	bool (*runs_here)(void*) noexcept;
 	root_list* (*roots)(void*) noexcept;
+	timer_wheel* (*wheel)(void*);
 };
 
 template <typename S>
@@ -153,6 +157,9 @@ constexpr scheduler_vtable make_scheduler_vtable() noexcept {
 	if constexpr (requires(S& s) { { s.roots() } -> std::convertible_to<root_list*>; }) {
 		t.roots = [](void* p) noexcept -> root_list* { return static_cast<S*>(p)->roots(); };
 	}
+	if constexpr (requires(S& s) { { s.wheel() } -> std::same_as<timer_wheel&>; }) {
+		t.wheel = [](void* p) -> timer_wheel* { return &static_cast<S*>(p)->wheel(); };
+	}
 	return t;
 }
 
@@ -166,6 +173,7 @@ inline constexpr scheduler_vtable scheduler_vtable_of = make_scheduler_vtable<S>
 //   bool runs_here() const noexcept;               true on the scheduler's own thread
 //   void post_call(void (*fn)(void*), void* arg);  runs fn(arg) on it; dropped when closed
 //   task::root_list* roots() noexcept;             spawned tasks are roots there (teardown)
+//   task::timer_wheel& wheel();                    its loop's timers, on its own thread
 class scheduler_ref {
 public:
 	scheduler_ref() = default;
@@ -190,6 +198,8 @@ public:
 	bool runs_here() const noexcept { return vt_ && vt_->runs_here && vt_->runs_here(self_); }
 	// Where spawn links its roots; null when the scheduler owns none.
 	root_list* roots() const noexcept { return vt_ && vt_->roots ? vt_->roots(self_) : nullptr; }
+	// The scheduler's timer wheel, used on its own thread; null when it has none.
+	timer_wheel* wheel() const { return vt_ && vt_->wheel ? vt_->wheel(self_) : nullptr; }
 	explicit operator bool() const noexcept { return self_ != nullptr; }
 	friend bool operator==(const scheduler_ref& a, const scheduler_ref& b) noexcept { return a.self_ == b.self_; }
 
@@ -299,6 +309,275 @@ private:
 	std::uint64_t previous_start_;
 };
 
+// ---------------------------------------------------------------------------------------------
+// Timers
+
+// What a timer_wheel files: 32 bytes inside its owner, so arming allocates nothing.
+struct timer_entry {
+	timer_entry* next = nullptr;    // the slot's list; the inbox's while another thread's arm waits
+	timer_entry** pprev = nullptr;  // the pointer that points here; null while unarmed
+	std::uint64_t deadline = 0;     // nanoseconds on the wheel's clock
+	// What expire() runs at the deadline (true), or a destroyed wheel for an entry still armed (false).
+	void (*fire)(timer_entry&, bool expired) noexcept = nullptr;
+	bool armed() const noexcept { return pprev != nullptr; }
+};
+
+// A single-owner hierarchical timer wheel: 4,096 slots of 1 ms, six upper levels of 64 slots
+// each 64 times wider (4.1 s, 4.4 min, 4.7 h, 12.4 days, 2.2 years, 142 years), occupancy bitmaps
+// for next(), and a 64-stripe inbox for arms from other threads. Deadlines are nanoseconds on
+// the owner's clock (steady or manual). An arm is O(1); a far deadline waits in an upper level
+// and moves down when the cursor enters its slot's span, at most six times in its life, so it
+// fires at most one tick late, never early, and no tick walks entries that are not due.
+// Two threading contracts:
+//   - the owner thread arms, re-arms, cancels and expires; the first such call binds it
+//     (Debug-asserted), and release() unbinds it once the loop is stopped and closed;
+//   - any thread may arm_remote() an unarmed entry, which the owner files at its next expire()
+//     (or arm or cancel of that entry); only the owner re-arms or cancels it after that.
+class timer_wheel {
+public:
+	static constexpr std::uint64_t tick = 1'000'000;  // 1 ms
+	static constexpr std::size_t slots = 4096, mask = slots - 1, levels = 6, level_slots = 64, stripes = 64;
+	static constexpr std::uint64_t never = ~std::uint64_t{0};
+
+	explicit timer_wheel(std::uint64_t now = 0) noexcept : cursor_(now / tick) {}
+	timer_wheel(const timer_wheel&) = delete;
+	timer_wheel& operator=(const timer_wheel&) = delete;
+	// Unlinks what is still armed or queued and runs its fire(e, false).
+	~timer_wheel() {
+		owner_check();
+		drain();
+		for (std::size_t w = 0; w < words; ++w) {
+			while (std::uint64_t bits = bits_[w]) {
+				timer_entry* e = head_[w * 64 + static_cast<std::size_t>(std::countr_zero(bits))];
+				unlink(*e);
+				if (e->fire) { e->fire(*e, false); }
+			}
+		}
+	}
+
+	void release() noexcept {
+#ifndef NDEBUG
+		owner_ = std::thread::id{};
+#endif
+	}
+
+	// Owner: files e at `deadline`, unlinking it first if armed.
+	void arm(timer_entry& e, std::uint64_t deadline) noexcept {
+		owner_check();
+		if (e.armed()) {
+			unlink(e);
+		} else if (queued()) {  // e may still wait in the inbox
+			drain();
+			if (e.armed()) { unlink(e); }
+		}
+		e.deadline = deadline;
+		file(e);
+	}
+	// Owner: unlinks e if armed; a no-op otherwise.
+	void cancel(timer_entry& e) noexcept {
+		owner_check();
+		if (!e.armed() && queued()) { drain(); }
+		if (e.armed()) { unlink(e); }
+	}
+	// Any thread, an unarmed entry: `next` links its stripe until the owner files it. The owner
+	// learns of it at its next expire(); waking an owner that sleeps is the caller's part.
+	void arm_remote(timer_entry& e, std::uint64_t deadline) noexcept {
+		assert(!e.armed() && "another thread arms only an unarmed entry");
+		e.deadline = deadline;
+		const unsigned s = stripe();
+		auto& head = inbox_[s].head;
+		timer_entry* first = head.load(std::memory_order_relaxed);
+		do {
+			e.next = first;
+		} while (!head.compare_exchange_weak(first, &e, std::memory_order_release, std::memory_order_relaxed));
+		if (!first) { queued_.fetch_or(std::uint64_t{1} << s, std::memory_order_release); }
+	}
+
+	// Owner: fires every entry due at `now`, at most one tick after its deadline and never before.
+	// The due entries move to a detached list first, so a fire may cancel or re-arm any entry,
+	// itself included; one armed during the fires for a time already due fires on the next call.
+	template <typename F>
+	std::size_t expire(std::uint64_t now, F&& fire) {
+		owner_check();
+		assert(!expiring_ && "expire() is not re-entrant");
+		drain();
+		const std::uint64_t last = now / tick;
+		if (last < cursor_) { return 0; }
+		const std::uint64_t first = cursor_;
+		cursor_ = last;
+		if ((first >> 12) != (last >> 12)) { cascade(first, last); }
+		const std::uint64_t steps = last - first + 1 > slots ? slots : last - first + 1;
+		timer_entry** tail = &due_;  // the due list keeps slot order
+		for (std::uint64_t k = 0; k < steps; ++k) {
+			const std::size_t s = (first + k) & mask;
+			if (!(bits_[s / 64] & (std::uint64_t{1} << (s % 64)))) { continue; }
+			for (timer_entry* e = head_[s]; e;) {
+				timer_entry* following = e->next;
+				if (e->deadline <= now) {
+					unlink(*e);
+					e->next = nullptr;
+					*tail = e;
+					e->pprev = tail;
+					tail = &e->next;
+					++count_;
+				}
+				e = following;
+			}
+		}
+		expiring_ = true;
+		std::size_t fired = 0;
+		while (timer_entry* e = due_) {
+			unlink(*e);
+			++fired;
+			fire(*e);
+		}
+		expiring_ = false;
+		return fired;
+	}
+	std::size_t expire(std::uint64_t now) {
+		return expire(now, [](timer_entry& e) { e.fire(e, true); });
+	}
+
+	// Owner: when expire() next has work: the end of the next occupied 1 ms slot, or the start of
+	// the next occupied upper slot's span (its entries move down then); 0 while other threads'
+	// arms wait to be filed (expire() files them); `never` when empty.
+	std::uint64_t next() const noexcept {
+		if (queued()) { return 0; }
+		if (!count_) { return never; }
+		std::uint64_t best = never;
+		const std::size_t start = cursor_ & mask;  // level 0 holds ticks [cursor_, cursor_ + slots)
+		for (std::size_t k = 0; k <= slots / 64; ++k) {
+			const std::size_t w = (start / 64 + k) % (slots / 64);
+			std::uint64_t word = bits_[w];
+			if (k == 0) { word &= ~std::uint64_t{0} << (start % 64); }
+			if (word) {
+				const std::size_t s = w * 64 + static_cast<std::size_t>(std::countr_zero(word));
+				best = (cursor_ + ((s - start) & mask) + 1) * tick;
+				break;
+			}
+		}
+		unsigned shift = 12;
+		for (std::size_t level = 0; level < levels; ++level, shift += 6) {
+			const std::uint64_t word = bits_[slots / 64 + level];
+			if (!word) { continue; }
+			const std::uint64_t from = (cursor_ >> shift) + 1;  // upper entries lie in (cursor's slot, +64)
+			const std::uint64_t span = from + static_cast<std::uint64_t>(std::countr_zero(std::rotr(word, static_cast<int>(from & 63))));
+			best = std::min(best, (span << shift) * tick);
+		}
+		return best;
+	}
+	// Owner: the entries filed (not those still in the inbox).
+	std::size_t size() const noexcept { return count_; }
+
+private:
+	static constexpr std::size_t all_slots = slots + levels * level_slots, words = all_slots / 64;
+
+	struct alignas(64) stripe_head {
+		std::atomic<timer_entry*> head{nullptr};
+	};
+
+	// Each thread pushes on its own stripe, by first use; past 64 threads stripes are shared.
+	static unsigned stripe() noexcept {
+		static std::atomic<unsigned> seq{0};
+		static thread_local const unsigned mine = seq.fetch_add(1, std::memory_order_relaxed) % stripes;
+		return mine;
+	}
+	bool queued() const noexcept { return queued_.load(std::memory_order_relaxed) != 0; }
+	// Files every entry other threads queued, from the stripes whose bits it takes.
+	void drain() noexcept {
+		if (!queued()) { return; }
+		for (std::uint64_t bits = queued_.exchange(0, std::memory_order_acquire); bits; bits &= bits - 1) {
+			auto& head = inbox_[static_cast<std::size_t>(std::countr_zero(bits))].head;
+			for (timer_entry* e = head.exchange(nullptr, std::memory_order_acquire); e;) {
+				timer_entry* following = e->next;
+				e->next = nullptr;
+				arm(*e, e->deadline);
+				e = following;
+			}
+		}
+	}
+	// Links an unarmed e by its deadline: in level 0 within a round of the cursor (a deadline
+	// already passed goes in the cursor's slot), else in the lowest upper level whose 64 slots
+	// reach it, in a slot after the cursor's.
+	void file(timer_entry& e) noexcept {
+		const std::uint64_t t = e.deadline / tick;
+		std::size_t s;
+		if (t < cursor_ + slots) {
+			s = (t < cursor_ ? cursor_ : t) & mask;
+		} else {
+			unsigned shift = 12;
+			std::size_t level = 0;
+			while (level + 1 < levels && (t >> shift) - (cursor_ >> shift) >= level_slots) {
+				++level;
+				shift += 6;
+			}
+			s = slots + level * level_slots + ((t >> shift) & (level_slots - 1));
+		}
+		link(e, head_[s]);
+		bits_[s / 64] |= std::uint64_t{1} << (s % 64);
+	}
+	// The cursor moved from `first` to `last`: every upper slot whose span it entered files its
+	// entries again, now relative to `last`, so they move to lower levels.
+	void cascade(std::uint64_t first, std::uint64_t last) noexcept {
+		unsigned shift = 12;
+		for (std::size_t level = 0; level < levels; ++level, shift += 6) {
+			const std::uint64_t from = first >> shift, to = last >> shift;
+			if (from == to) { return; }  // and so for every level above
+			const std::uint64_t n = to - from < level_slots ? to - from : level_slots;
+			for (std::uint64_t j = 1; j <= n; ++j) {
+				const std::size_t s = slots + level * level_slots + ((from + j) & (level_slots - 1));
+				while (timer_entry* e = head_[s]) {
+					unlink(*e);
+					file(*e);
+				}
+			}
+		}
+	}
+	void owner_check() noexcept {
+#ifndef NDEBUG
+		if (owner_ == std::thread::id{}) { owner_ = std::this_thread::get_id(); }
+		assert(owner_ == std::this_thread::get_id() && "a wheel is armed, cancelled and expired only on its owner's thread");
+#endif
+	}
+	void link(timer_entry& e, timer_entry*& head) noexcept {
+		e.next = head;
+		if (e.next) { e.next->pprev = &e.next; }
+		head = &e;
+		e.pprev = &head;
+		++count_;
+	}
+	void unlink(timer_entry& e) noexcept {
+		*e.pprev = e.next;
+		if (e.next) { e.next->pprev = e.pprev; }
+		auto** first = head_.data();
+		if (e.pprev >= first && e.pprev < first + all_slots && !*e.pprev) {
+			const std::size_t s = static_cast<std::size_t>(e.pprev - first);
+			bits_[s / 64] &= ~(std::uint64_t{1} << (s % 64));
+		}
+		e.next = nullptr;
+		e.pprev = nullptr;
+		--count_;
+	}
+
+	std::array<timer_entry*, all_slots> head_{};  // level 0's 4,096, then 64 per upper level
+	std::array<std::uint64_t, words> bits_{};
+	timer_entry* due_ = nullptr;
+	std::uint64_t cursor_;  // the tick expire() last reached
+	std::size_t count_ = 0;
+	bool expiring_ = false;
+#ifndef NDEBUG
+	std::thread::id owner_{};
+#endif
+	alignas(64) std::atomic<std::uint64_t> queued_{0};  // a bit per stripe that holds entries
+	std::array<stripe_head, stripes> inbox_{};
+};
+
+namespace detail {
+struct timed_cancel_state;
+template <typename S>
+class wheel_timer;
+}  // namespace detail
+
 class inline_scheduler;
 
 namespace detail {
@@ -307,13 +586,37 @@ inline thread_local inline_scheduler* draining_scheduler = nullptr;
 }
 
 // A deterministic single-threaded scheduler: FIFO, demoted handles only when nothing
-// else is ready, and a manual clock. For tests and simulation.
+// else is ready, and a manual clock whose advance() fires the timers it passes, with no real
+// time. For tests and simulation.
 class inline_scheduler {
 public:
+	// The manual clock: nanoseconds that only advance() moves. It has no static now(); the
+	// scheduler's now() reads it.
+	struct clock {
+		using rep = std::int64_t;
+		using period = std::nano;
+		using duration = std::chrono::nanoseconds;
+		using time_point = std::chrono::time_point<clock>;
+		static constexpr bool is_steady = true;
+	};
+
 	void post(std::coroutine_handle<> h) { ready_.push_back(h); }
 	void post_demoted(std::coroutine_handle<> h) { demoted_.push_back(h); }
 	std::uint64_t now() const noexcept { return now_; }
-	void advance(std::uint64_t ns) noexcept { now_ += ns; }
+	// Moves the clock and fires every timer due by then.
+	void advance(std::uint64_t ns) noexcept {
+		now_ += ns;
+		if (wheel_) { wheel_->expire(now_); }
+	}
+
+	// The timers advance() fires, made on first use.
+	timer_wheel& wheel() {
+		if (!wheel_) { wheel_ = std::make_unique<timer_wheel>(now_); }
+		return *wheel_;
+	}
+	// Files task::deadline's entry on the wheel at `at`; it fires in the advance() that passes it.
+	template <typename F>
+	detail::wheel_timer<inline_scheduler> start_timer(clock::time_point at, F&& on_fire);
 
 	// Runs until no handle is queued; returns how many ran.
 	std::size_t run() {
@@ -344,8 +647,12 @@ public:
 	std::size_t queued() const noexcept { return ready_.size() + demoted_.size(); }
 
 private:
+	friend class detail::wheel_timer<inline_scheduler>;
+	void drop_timer(detail::timed_cancel_state* s) noexcept;
+
 	std::deque<std::coroutine_handle<>> ready_, demoted_;
 	std::uint64_t now_ = 0;
+	std::unique_ptr<timer_wheel> wheel_;
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -822,6 +1129,8 @@ enum class cancel_reason : std::uint32_t { none = 0, requested = 1, deadline = 2
 
 namespace detail {
 
+struct linked_cancel_state;
+
 // A registered callback; request() unlinks one at a time and runs it with no lock held.
 struct cancel_node {
 	cancel_node* prev = nullptr;
@@ -834,13 +1143,15 @@ struct cancel_node {
 // load and requested() never disagrees with reason(). Callbacks follow std::stop_callback.
 class cancel_state : public pooled_frame {
 public:
-	static constexpr std::uint64_t requested_bit = 1, locked_bit = 2, disarmed_bit = 4, linked_bit = 8;
+	static constexpr std::uint64_t requested_bit = 1, locked_bit = 2, disarmed_bit = 4, linked_bit = 8, timed_bit = 16;
 
 	static cancel_state* make(cancel_state* parent);
+	static timed_cancel_state* make_timed(cancel_state* parent);
 
 	bool requested() const noexcept { return word_.load(std::memory_order_acquire) & requested_bit; }
 	cancel_reason reason() const noexcept { return cancel_reason(word_.load(std::memory_order_acquire) >> 32); }
 	void disarm() noexcept { word_.fetch_or(disarmed_bit, std::memory_order_release); }
+	bool disarmed() const noexcept { return word_.load(std::memory_order_acquire) & disarmed_bit; }
 
 	void retain() noexcept { refs_.fetch_add(1, std::memory_order_relaxed); }
 	void release() noexcept {
@@ -942,6 +1253,7 @@ private:
 	}
 	void unlock() noexcept { word_.fetch_and(~locked_bit, std::memory_order_release); }
 	void destroy() noexcept;
+	static void link(linked_cancel_state* s, cancel_state* parent) noexcept;
 
 	std::atomic<std::uint64_t> word_{0};
 	std::atomic<std::uint32_t> refs_{1};
@@ -953,7 +1265,30 @@ private:
 };
 
 // A linked source's state: its node on the parent requests it with the parent's reason.
-struct linked_cancel_state final : cancel_state, cancel_node {};
+struct linked_cancel_state : cancel_state, cancel_node {};
+
+// A deadline's state: a linked state (with or without a parent) and the entry a scheduler's
+// wheel files. The wheel holds a reference while the entry is armed; the fire requests the
+// deadline unless it is disarmed, and releases that reference.
+struct timed_cancel_state final : timer_entry, linked_cancel_state {
+	timed_cancel_state() noexcept { fire = &on_wheel; }
+	static void on_wheel(timer_entry& e, bool expired) noexcept {
+		auto& s = static_cast<timed_cancel_state&>(e);
+		if (expired) { s.request(cancel_reason::deadline, disarmed_bit); }
+		s.release();
+	}
+};
+
+inline void cancel_state::link(linked_cancel_state* s, cancel_state* parent) noexcept {
+	TASK_TEST_HOOK(before_link);
+	s->run = [](cancel_node* n, cancel_reason r) noexcept { static_cast<linked_cancel_state*>(n)->request(r); };
+	if (parent->add(s)) {
+		parent->retain();
+		s->parent_ = parent;
+	} else {
+		s->request(parent->reason());  // requested meanwhile
+	}
+}
 
 inline cancel_state* cancel_state::make(cancel_state* parent) {
 	if (!parent) { return new cancel_state; }
@@ -962,27 +1297,32 @@ inline cancel_state* cancel_state::make(cancel_state* parent) {
 		s->word_.store(requested_bit | (std::uint64_t(parent->reason()) << 32), std::memory_order_relaxed);
 		return s;
 	}
-	TASK_TEST_HOOK(before_link);
 	auto* s = new linked_cancel_state;
 	s->word_.store(linked_bit, std::memory_order_relaxed);
-	s->run = [](cancel_node* n, cancel_reason r) noexcept { static_cast<linked_cancel_state*>(n)->request(r); };
-	if (parent->add(s)) {
-		parent->retain();
-		s->parent_ = parent;
-	} else {
-		s->request(parent->reason());  // requested meanwhile
-	}
+	link(s, parent);
+	return s;
+}
+
+inline timed_cancel_state* cancel_state::make_timed(cancel_state* parent) {
+	auto* s = new timed_cancel_state;
+	s->word_.store(linked_bit | timed_bit, std::memory_order_relaxed);
+	if (parent) { link(s, parent); }
 	return s;
 }
 
 inline void cancel_state::destroy() noexcept {
-	if (word_.load(std::memory_order_relaxed) & linked_bit) {
+	const std::uint64_t w = word_.load(std::memory_order_relaxed);
+	if (w & linked_bit) {
 		auto* self = static_cast<linked_cancel_state*>(this);
 		if (cancel_state* p = parent_) {
 			p->remove(self);
 			p->release();
 		}
-		delete self;
+		if (w & timed_bit) {
+			delete static_cast<timed_cancel_state*>(self);
+		} else {
+			delete self;
+		}
 	} else {
 		delete this;
 	}
@@ -1061,6 +1401,8 @@ public:
 private:
 	template <typename S>
 	friend class deadline;
+	struct timed_tag {};
+	cancel_source(const cancel_token& parent, timed_tag) : s_(detail::cancel_state::make_timed(parent.s_)) {}
 	detail::cancel_state* s_;
 };
 
@@ -1110,28 +1452,64 @@ private:
 template <typename F>
 cancel_callback(const cancel_token&, F) -> cancel_callback<F>;
 
+namespace detail {
+
+// The clock a scheduler's deadlines are on: S::clock when S declares one, else steady_clock.
+template <typename S, typename = void>
+struct clock_of {
+	using type = std::chrono::steady_clock;
+};
+template <typename S>
+struct clock_of<S, std::void_t<typename S::clock>> {
+	using type = typename S::clock;
+};
+
+// A reference to a deadline's state, called once at the deadline: it requests the deadline
+// unless disarmed. A scheduler with a wheel take()s the reference for the entry it arms.
+struct deadline_fire {
+	timed_cancel_state* s;
+	explicit deadline_fire(timed_cancel_state* st) noexcept : s(st) { s->retain(); }
+	deadline_fire(deadline_fire&& o) noexcept : s(std::exchange(o.s, nullptr)) {}
+	deadline_fire(const deadline_fire&) = delete;
+	deadline_fire& operator=(const deadline_fire&) = delete;
+	~deadline_fire() {
+		if (s) { s->release(); }
+	}
+	void operator()() noexcept { s->request(cancel_reason::deadline, cancel_state::disarmed_bit); }
+	timed_cancel_state* take() noexcept { return std::exchange(s, nullptr); }
+};
+
+// What start_timer returns on a scheduler with a wheel: destroying it hands the deadline's
+// entry to the scheduler's drop_timer, which unfiles it on the wheel's thread.
+template <typename S>
+class wheel_timer {
+public:
+	wheel_timer(S& s, timed_cancel_state* st) noexcept : s_(&s), st_(st) {}
+	wheel_timer(const wheel_timer&) = delete;
+	wheel_timer& operator=(const wheel_timer&) = delete;
+	~wheel_timer() { s_->drop_timer(st_); }
+
+private:
+	S* s_;
+	timed_cancel_state* st_;  // the deadline's source holds it
+};
+
+}  // namespace detail
+
 // A cancel source that a timer requests with cancel_reason::deadline at `at`, linked to
-// `parent`. S provides start_timer(steady_clock::time_point, F), which runs F once at the
-// deadline. The timer's callback holds the state and requests only while the deadline is
-// armed, so an expiry already queued when the deadline is destroyed requests nothing.
+// `parent`; `at` is on S::clock when S declares one, else on steady_clock. S provides
+// start_timer(time_point, F), which runs F once at the deadline; on a scheduler with a wheel
+// (inline_scheduler, asio_scheduler) the deadline's state carries the entry, so arming
+// allocates nothing more. The timer's callback holds the state and requests only while the
+// deadline is armed, so an expiry already queued when the deadline is destroyed requests nothing.
 template <typename S>
 class deadline {
-	struct fire {
-		detail::cancel_state* s;
-		explicit fire(detail::cancel_state* st) noexcept : s(st) { s->retain(); }
-		fire(fire&& o) noexcept : s(std::exchange(o.s, nullptr)) {}
-		fire(const fire&) = delete;
-		fire& operator=(const fire&) = delete;
-		~fire() {
-			if (s) { s->release(); }
-		}
-		void operator()() noexcept { s->request(cancel_reason::deadline, detail::cancel_state::disarmed_bit); }
-	};
-	using timer_type = decltype(std::declval<S&>().start_timer(std::chrono::steady_clock::time_point{}, std::declval<fire>()));
+	using time_point = typename detail::clock_of<S>::type::time_point;
+	using timer_type = decltype(std::declval<S&>().start_timer(time_point{}, std::declval<detail::deadline_fire>()));
 
 public:
-	deadline(S& s, std::chrono::steady_clock::time_point at, const cancel_token& parent = {})
-		: source_(parent), timer_(s.start_timer(at, fire{source_.s_})) {}
+	deadline(S& s, time_point at, const cancel_token& parent = {})
+		: source_(parent, cancel_source::timed_tag{}), timer_(s.start_timer(at, detail::deadline_fire(state()))) {}
 	deadline(const deadline&) = delete;
 	deadline& operator=(const deadline&) = delete;
 	// Any thread: the disarm bit is set before the timer dies, and the timer's callback holds the state.
@@ -1141,9 +1519,26 @@ public:
 	bool expired() const noexcept { return source_.reason() == cancel_reason::deadline; }
 
 private:
+	detail::timed_cancel_state* state() const noexcept { return static_cast<detail::timed_cancel_state*>(source_.s_); }
+
 	cancel_source source_;
 	timer_type timer_;
 };
+
+template <typename F>
+detail::wheel_timer<inline_scheduler> inline_scheduler::start_timer(clock::time_point at, F&& on_fire) {
+	static_assert(std::is_same_v<std::remove_cvref_t<F>, detail::deadline_fire>, "a wheel's start_timer files task::deadline's entry");
+	detail::timed_cancel_state* s = on_fire.take();  // the wheel's reference
+	wheel().arm(*s, std::uint64_t(std::max<std::int64_t>(0, at.time_since_epoch().count())));
+	return {*this, s};
+}
+
+inline void inline_scheduler::drop_timer(detail::timed_cancel_state* s) noexcept {
+	if (s->armed()) {
+		wheel_->cancel(*s);
+		s->release();
+	}
+}
 
 // A time slice. checkpoint() is free while the slice lasts; once it is spent, it
 // requeues the coroutine as demoted. Both throw cancelled when the token is set.

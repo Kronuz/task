@@ -35,9 +35,12 @@
 #include <asio/post.hpp>
 #include <asio/steady_timer.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <exception>
+#include <memory>
 #include <optional>
 #include <tuple>
 #include <type_traits>
@@ -101,9 +104,11 @@ public:
 	root_list* roots() noexcept { return &roots_; }
 
 	// Phase 2: post, post_demoted and post_call drop what they are given; spawn destroys its task.
+	// The wheel is released: what it still holds, it drops when the scheduler is destroyed.
 	void close() noexcept {
 		assert(!runs_here());  // phases 2 and 3 run after the loops joined
 		roots_.close();
+		if (timers_) { timers_->wheel.release(); }
 	}
 	bool closed() const noexcept { return roots_.closed(); }
 	// Phase 3: destroys every root, then forgets the demoted handles (they were the roots').
@@ -122,22 +127,92 @@ public:
 	// Handles waiting in the demoted queue; readable from any thread (admission, metrics).
 	std::size_t demoted() const noexcept { return demoted_count_.load(std::memory_order_relaxed); }
 
-	// Runs on_fire() on the executor at the deadline. Destroying the returned timer before
-	// the deadline destroys on_fire unrun, but an expiry Asio has already queued still runs
-	// it, so on_fire must hold what it touches and check whether it is still wanted, as
-	// task::deadline's disarm bit does.
+	using clock = std::chrono::steady_clock;
+
+	// The loop's timers, on the executor's thread: one asio::steady_timer wakes the loop at the
+	// wheel's next(). Made on first use.
+	timer_wheel& wheel() { return timers().wheel; }
+
+	// Files task::deadline's entry on the wheel at `at`; it fires on the executor at most 1 ms
+	// late. On the executor's thread it is filed at once; from another thread the filing is
+	// posted (dropped once closed). Destroying the returned timer unfiles it the same way.
 	template <typename F>
-	asio::steady_timer start_timer(std::chrono::steady_clock::time_point deadline, F&& on_fire) {
-		asio::steady_timer timer(executor_, deadline);
-		timer.async_wait([f = std::forward<F>(on_fire)](const asio::error_code& ec) mutable {
-			if (!ec) { f(); }
-		});
-		return timer;
+	detail::wheel_timer<asio_scheduler> start_timer(clock::time_point at, F&& on_fire) {
+		static_assert(std::is_same_v<std::remove_cvref_t<F>, detail::deadline_fire>, "a wheel's start_timer files task::deadline's entry");
+		detail::timed_cancel_state* s = on_fire.s;
+		s->deadline = std::uint64_t(std::max<clock::rep>(0, std::chrono::duration_cast<std::chrono::nanoseconds>(at.time_since_epoch()).count()));
+		if (runs_here()) {
+			file(on_fire.take());
+		} else if (!closed()) {
+			asio::post(executor_, [this, f = std::move(on_fire)]() mutable {
+				if (!closed()) { file(f.take()); }
+			});
+		}
+		return {*this, s};
 	}
 
 	const asio::any_io_executor& executor() const noexcept { return executor_; }
 
 private:
+	friend class detail::wheel_timer<asio_scheduler>;
+
+	struct timer_loop {
+		timer_wheel wheel;
+		asio::steady_timer wake;
+		std::uint64_t wake_at = timer_wheel::never;  // when `wake` is set for
+		explicit timer_loop(asio_scheduler& s) : wheel(s.now()), wake(s.executor_) {}
+	};
+	timer_loop& timers() {
+		if (!timers_) { timers_ = std::make_unique<timer_loop>(*this); }
+		return *timers_;
+	}
+	// On the executor's thread; s carries the wheel's reference.
+	void file(detail::timed_cancel_state* s) {
+		if (s->disarmed()) {
+			s->release();
+			return;
+		}
+		timer_loop& t = timers();
+		t.wheel.arm(*s, s->deadline);
+		wake_by((s->deadline / timer_wheel::tick + 1) * timer_wheel::tick);  // the end of its slot
+	}
+	// On the executor's thread: takes the entry off the wheel, releasing the wheel's reference.
+	void unfile(detail::timed_cancel_state* s) noexcept {
+		if (!s->armed()) { return; }
+		timer_loop& t = *timers_;
+		t.wheel.cancel(*s);
+		s->release();
+		if (!t.wheel.size() && t.wake_at != timer_wheel::never) {  // nothing armed: run() may return
+			t.wake_at = timer_wheel::never;
+			t.wake.cancel();
+		}
+	}
+	// A deadline's timer died: unfile it on the loop; once closed the wheel drops it.
+	void drop_timer(detail::timed_cancel_state* s) noexcept {
+		if (runs_here()) {
+			unfile(s);
+		} else if (!closed()) {
+			asio::post(executor_, [this, f = detail::deadline_fire(s)] {
+				if (!closed()) { unfile(f.s); }
+			});
+		}
+	}
+	void wake_by(std::uint64_t at) {
+		timer_loop& t = *timers_;
+		if (at >= t.wake_at) { return; }
+		t.wake_at = at;
+		t.wake.expires_at(clock::time_point(std::chrono::nanoseconds(at)));
+		t.wake.async_wait([this](const asio::error_code& ec) {
+			if (!ec && !closed()) { on_wake(); }
+		});
+	}
+	void on_wake() {
+		timer_loop& t = *timers_;
+		t.wake_at = timer_wheel::never;
+		t.wheel.expire(now());
+		if (const std::uint64_t n = t.wheel.next(); n != timer_wheel::never) { wake_by(n); }
+	}
+
 	void drain() {
 		if (demoted_.empty()) {  // destroy_roots() forgot them
 			draining_ = false;
@@ -163,6 +238,7 @@ private:
 	std::deque<std::coroutine_handle<>> demoted_;
 	std::atomic<std::size_t> demoted_count_{0};
 	bool draining_ = false;
+	std::unique_ptr<timer_loop> timers_;
 };
 
 namespace detail {
