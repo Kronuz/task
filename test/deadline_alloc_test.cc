@@ -46,7 +46,6 @@ constexpr u64 ms = 1'000'000;
 void deadlines() {
 	using tp = task::inline_scheduler::clock::time_point;
 	task::inline_scheduler s;
-	(void)s.wheel();
 	for (int i = 0; i < 64; ++i) { task::deadline<task::inline_scheduler> warm(s, tp(std::chrono::nanoseconds(5 * ms))); }  // the pool
 	const std::size_t before = allocations.load();
 	std::size_t expired = 0;

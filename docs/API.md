@@ -16,10 +16,14 @@ explains how each piece works.
   `post_demoted(handle)`. The library owns no run queue; the host's loop is the
   queue. `inline_scheduler` is a deterministic one for tests and simulation, with a manual
   clock whose `advance(ns)` fires the timers it passes, and `asio_scheduler` runs on an Asio
-  executor. Both declare a `clock` and a `wheel()`, which `scheduler_ref::wheel()` returns.
-- `wheel()`: the scheduler's `wheel::timer_wheel`, from
-  [Kronuz/wheel](https://github.com/Kronuz/wheel), used on the scheduler's own thread. Deadlines
-  run on it (`docs/mechanisms/deadlines.md`).
+  executor that runs on one thread: an `io_context` run by one thread, not a strand over a
+  multi-threaded one. Both declare a `clock`.
+- Timers: `inline_scheduler` and `asio_scheduler` own a `wheel::timer_wheel` from
+  [Kronuz/wheel](https://github.com/Kronuz/wheel). On the scheduler's own thread,
+  `arm(entry, at)` files a `wheel::timer_entry` to fire there at `at` (nanoseconds, as `now()`),
+  or moves it, and wakes the loop by then; `cancel(entry)` unfiles it and returns whether it was
+  armed. `scheduler_ref` forwards `now()`, `arm` and `cancel`; its `arm` returns false when the
+  scheduler has none. Deadlines run on the same timers (`docs/mechanisms/deadlines.md`).
 - `budget`: a time slice measured with the CPU cycle counter. `co_await
   budget.checkpoint()` costs one counter read while the slice lasts; once it is
   spent, the coroutine requeues as demoted, so a long computation cannot hold a loop
@@ -34,10 +38,14 @@ explains how each piece works.
   `cancel_source(parent_token)` is requested with its parent. `cancel_callback(token, f)`
   runs `f(reason)` on the requesting thread, with `std::stop_callback`'s lifetime rules.
   `deadline(sched, time_point, parent = {})` is a source its scheduler's timer requests
-  with `cancel_reason::deadline`, at most 1 ms late on a wheel; `time_point` is on `sched`'s
-  `clock` when it declares one, else `steady_clock`, and `sched` supplies `start_timer`
-  (`inline_scheduler` and `asio_scheduler` file the deadline's own entry on their wheel). It may
-  be created and destroyed on any thread, before or after the expiry; `sched` outlives it.
+  with `cancel_reason::deadline`, at most one 1 ms tick late on a wheel, plus the loop's wake
+  latency on `asio_scheduler`; `time_point` is on `sched`'s `clock` when it declares one, else
+  `steady_clock`, and `sched` supplies `start_timer` (`inline_scheduler` and `asio_scheduler`
+  file the deadline's own entry on their wheel). On `asio_scheduler` it may be created and
+  destroyed on any thread, before or after the expiry; on `inline_scheduler`, on the thread that
+  runs it. What `start_timer` returns decides what outlives the deadline: on task's schedulers
+  the scheduler itself; on a host such as Xapiand's `engine::Host`, what its timers hold (the
+  `io_context`, or the blocking scheduler).
 - `event`: a one-shot completion. `co_await e` suspends until `e.set()` (any thread); each
   waiter resumes through the scheduler it suspended on, in arrival order.
 - `async_mutex`: a FIFO mutex for coroutines, usable from every scheduler at once.

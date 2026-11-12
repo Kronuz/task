@@ -128,15 +128,17 @@ class root_list;
 
 namespace detail {
 
-// What scheduler_ref calls through. post_call, runs_here, roots and wheel are optional: null
-// when the scheduler does not declare them.
+// What scheduler_ref calls through. post_call, runs_here, roots, arm and cancel are optional:
+// null when the scheduler does not declare them.
 struct scheduler_vtable {
 	void (*post)(void*, std::coroutine_handle<>);
 	void (*post_demoted)(void*, std::coroutine_handle<>);
+	std::uint64_t (*now)(void*);
 	void (*post_call)(void*, void (*)(void*), void*);
 	bool (*runs_here)(void*) noexcept;
 	root_list* (*roots)(void*) noexcept;
-	wheel::timer_wheel* (*wheel)(void*);
+	void (*arm)(void*, wheel::timer_entry&, std::uint64_t);
+	bool (*cancel)(void*, wheel::timer_entry&) noexcept;
 };
 
 template <typename S>
@@ -148,6 +150,7 @@ constexpr scheduler_vtable make_scheduler_vtable() noexcept {
 	} else {
 		t.post_demoted = t.post;
 	}
+	t.now = [](void* p) -> std::uint64_t { return static_cast<S*>(p)->now(); };
 	if constexpr (requires(S& s, void (*f)(void*), void* a) { s.post_call(f, a); }) {
 		t.post_call = [](void* p, void (*f)(void*), void* a) { static_cast<S*>(p)->post_call(f, a); };
 	}
@@ -157,8 +160,12 @@ constexpr scheduler_vtable make_scheduler_vtable() noexcept {
 	if constexpr (requires(S& s) { { s.roots() } -> std::convertible_to<root_list*>; }) {
 		t.roots = [](void* p) noexcept -> root_list* { return static_cast<S*>(p)->roots(); };
 	}
-	if constexpr (requires(S& s) { { s.wheel() } -> std::same_as<wheel::timer_wheel&>; }) {
-		t.wheel = [](void* p) -> wheel::timer_wheel* { return &static_cast<S*>(p)->wheel(); };
+	if constexpr (requires(S& s, wheel::timer_entry& e, std::uint64_t at) {
+		s.arm(e, at);
+		{ s.cancel(e) } -> std::same_as<bool>;
+	}) {
+		t.arm = [](void* p, wheel::timer_entry& e, std::uint64_t at) { static_cast<S*>(p)->arm(e, at); };
+		t.cancel = [](void* p, wheel::timer_entry& e) noexcept -> bool { return static_cast<S*>(p)->cancel(e); };
 	}
 	return t;
 }
@@ -173,7 +180,8 @@ inline constexpr scheduler_vtable scheduler_vtable_of = make_scheduler_vtable<S>
 //   bool runs_here() const noexcept;               true on the scheduler's own thread
 //   void post_call(void (*fn)(void*), void* arg);  runs fn(arg) on it; dropped when closed
 //   task::root_list* roots() noexcept;             spawned tasks are roots there (teardown)
-//   wheel::timer_wheel& wheel();                   its loop's timers, on its own thread
+//   void arm(wheel::timer_entry&, std::uint64_t);  files a timer at a now() time, on its own thread
+//   bool cancel(wheel::timer_entry&) noexcept;     unfiles it, on its own thread; true if it was armed
 class scheduler_ref {
 public:
 	scheduler_ref() = default;
@@ -188,6 +196,8 @@ public:
 
 	void post(std::coroutine_handle<> h) const { vt_->post(self_, h); }
 	void post_demoted(std::coroutine_handle<> h) const { vt_->post_demoted(self_, h); }
+	// The scheduler's clock, in nanoseconds: what arm() takes.
+	std::uint64_t now() const { return vt_->now(self_); }
 	// Queues fn(arg) on the scheduler; false (nothing queued) when it declares no post_call.
 	bool post_call(void (*fn)(void*), void* arg) const {
 		if (!vt_ || !vt_->post_call) { return false; }
@@ -198,8 +208,15 @@ public:
 	bool runs_here() const noexcept { return vt_ && vt_->runs_here && vt_->runs_here(self_); }
 	// Where spawn links its roots; null when the scheduler owns none.
 	root_list* roots() const noexcept { return vt_ && vt_->roots ? vt_->roots(self_) : nullptr; }
-	// The scheduler's timer wheel, used on its own thread; null when it has none.
-	wheel::timer_wheel* wheel() const { return vt_ && vt_->wheel ? vt_->wheel(self_) : nullptr; }
+	// On the scheduler's thread: files e to fire there at `at` (as now()), waking its loop by
+	// then, or moves it if armed. False (nothing armed) when the scheduler has no timers.
+	bool arm(wheel::timer_entry& e, std::uint64_t at) const {
+		if (!vt_ || !vt_->arm) { return false; }
+		vt_->arm(self_, e, at);
+		return true;
+	}
+	// On the scheduler's thread: takes e off its timers; true if e was armed there.
+	bool cancel(wheel::timer_entry& e) const noexcept { return vt_ && vt_->cancel && vt_->cancel(self_, e); }
 	explicit operator bool() const noexcept { return self_ != nullptr; }
 	friend bool operator==(const scheduler_ref& a, const scheduler_ref& b) noexcept { return a.self_ == b.self_; }
 
@@ -349,11 +366,16 @@ public:
 		if (wheel_) { wheel_->expire(now_); }
 	}
 
-	// The timers advance() fires, made on first use.
-	wheel::timer_wheel& wheel() {
-		if (!wheel_) { wheel_ = std::make_unique<wheel::timer_wheel>(now_); }
-		return *wheel_;
+	// Files e to fire in the advance() that passes `at`, or moves it if armed.
+	void arm(wheel::timer_entry& e, std::uint64_t at) { wheel().arm(e, at); }
+	// Takes e off the timers; true if it was armed.
+	bool cancel(wheel::timer_entry& e) noexcept {
+		if (!e.armed()) { return false; }
+		wheel_->cancel(e);
+		return true;
 	}
+	// Entries armed on its timers.
+	std::size_t armed_timers() const noexcept { return wheel_ ? wheel_->size() : 0; }
 	// Files task::deadline's entry on the wheel at `at`; it fires in the advance() that passes it.
 	template <typename F>
 	detail::wheel_timer<inline_scheduler> start_timer(clock::time_point at, F&& on_fire);
@@ -389,6 +411,11 @@ public:
 private:
 	friend class detail::wheel_timer<inline_scheduler>;
 	void drop_timer(detail::timed_cancel_state* s) noexcept;
+	// The timers advance() fires, made on first use.
+	wheel::timer_wheel& wheel() {
+		if (!wheel_) { wheel_ = std::make_unique<wheel::timer_wheel>(now_); }
+		return *wheel_;
+	}
 
 	std::deque<std::coroutine_handle<>> ready_, demoted_;
 	std::uint64_t now_ = 0;
@@ -1141,8 +1168,11 @@ public:
 private:
 	template <typename S>
 	friend class deadline;
-	struct timed_tag {};
-	cancel_source(const cancel_token& parent, timed_tag) : s_(detail::cancel_state::make_timed(parent.s_)) {}
+	struct timed_tag {
+		bool entry;  // a wheel files the state's entry
+	};
+	cancel_source(const cancel_token& parent, timed_tag t)
+		: s_(t.entry ? detail::cancel_state::make_timed(parent.s_) : detail::cancel_state::make(parent.s_)) {}
 	detail::cancel_state* s_;
 };
 
@@ -1205,10 +1235,11 @@ struct clock_of<S, std::void_t<typename S::clock>> {
 };
 
 // A reference to a deadline's state, called once at the deadline: it requests the deadline
-// unless disarmed. A scheduler with a wheel take()s the reference for the entry it arms.
+// unless disarmed. A scheduler with a wheel take()s the reference for the entry it arms (the
+// state is then a timed_cancel_state).
 struct deadline_fire {
-	timed_cancel_state* s;
-	explicit deadline_fire(timed_cancel_state* st) noexcept : s(st) { s->retain(); }
+	cancel_state* s;
+	explicit deadline_fire(cancel_state* st) noexcept : s(st) { s->retain(); }
 	deadline_fire(deadline_fire&& o) noexcept : s(std::exchange(o.s, nullptr)) {}
 	deadline_fire(const deadline_fire&) = delete;
 	deadline_fire& operator=(const deadline_fire&) = delete;
@@ -1216,7 +1247,8 @@ struct deadline_fire {
 		if (s) { s->release(); }
 	}
 	void operator()() noexcept { s->request(cancel_reason::deadline, cancel_state::disarmed_bit); }
-	timed_cancel_state* take() noexcept { return std::exchange(s, nullptr); }
+	timed_cancel_state* timed() const noexcept { return static_cast<timed_cancel_state*>(s); }
+	timed_cancel_state* take() noexcept { return static_cast<timed_cancel_state*>(std::exchange(s, nullptr)); }
 };
 
 // What start_timer returns on a scheduler with a wheel: destroying it hands the deadline's
@@ -1240,16 +1272,18 @@ private:
 // `parent`; `at` is on S::clock when S declares one, else on steady_clock. S provides
 // start_timer(time_point, F), which runs F once at the deadline; on a scheduler with a wheel
 // (inline_scheduler, asio_scheduler) the deadline's state carries the entry, so arming
-// allocates nothing more. The timer's callback holds the state and requests only while the
-// deadline is armed, so an expiry already queued when the deadline is destroyed requests nothing.
+// allocates nothing more; elsewhere it carries none. The timer's callback holds the state and
+// requests only while the deadline is armed, so an expiry already queued when the deadline is
+// destroyed requests nothing.
 template <typename S>
 class deadline {
 	using time_point = typename detail::clock_of<S>::type::time_point;
 	using timer_type = decltype(std::declval<S&>().start_timer(time_point{}, std::declval<detail::deadline_fire>()));
+	static constexpr bool on_wheel = std::is_same_v<timer_type, detail::wheel_timer<S>>;
 
 public:
 	deadline(S& s, time_point at, const cancel_token& parent = {})
-		: source_(parent, cancel_source::timed_tag{}), timer_(s.start_timer(at, detail::deadline_fire(state()))) {}
+		: source_(parent, cancel_source::timed_tag{on_wheel}), timer_(s.start_timer(at, detail::deadline_fire(source_.s_))) {}
 	deadline(const deadline&) = delete;
 	deadline& operator=(const deadline&) = delete;
 	// Any thread: the disarm bit is set before the timer dies, and the timer's callback holds the state.
@@ -1259,8 +1293,6 @@ public:
 	bool expired() const noexcept { return source_.reason() == cancel_reason::deadline; }
 
 private:
-	detail::timed_cancel_state* state() const noexcept { return static_cast<detail::timed_cancel_state*>(source_.s_); }
-
 	cancel_source source_;
 	timer_type timer_;
 };
@@ -1269,15 +1301,12 @@ template <typename F>
 detail::wheel_timer<inline_scheduler> inline_scheduler::start_timer(clock::time_point at, F&& on_fire) {
 	static_assert(std::is_same_v<std::remove_cvref_t<F>, detail::deadline_fire>, "a wheel's start_timer files task::deadline's entry");
 	detail::timed_cancel_state* s = on_fire.take();  // the wheel's reference
-	wheel().arm(*s, std::uint64_t(std::max<std::int64_t>(0, at.time_since_epoch().count())));
+	arm(*s, std::uint64_t(std::max<std::int64_t>(0, at.time_since_epoch().count())));
 	return {*this, s};
 }
 
 inline void inline_scheduler::drop_timer(detail::timed_cancel_state* s) noexcept {
-	if (s->armed()) {
-		wheel_->cancel(*s);
-		s->release();
-	}
+	if (cancel(*s)) { s->release(); }
 }
 
 // A time slice. checkpoint() is free while the slice lasts; once it is spent, it

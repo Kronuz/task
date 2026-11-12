@@ -1,8 +1,8 @@
-// task::deadline on the wheels of inline_scheduler and scheduler_ref (Kronuz/wheel's own
-// tests cover the wheel):
+// task::deadline on inline_scheduler's wheel, and timers armed through scheduler_ref
+// (Kronuz/wheel's own tests cover the wheel):
 //   manual    deadline<inline_scheduler> on its manual clock, advance() fires it, no real time
 //   chain     a fired parent deadline cancels a linked child whose callback destroys it
-//   ref       scheduler_ref::wheel()
+//   ref       scheduler_ref::arm and cancel on inline_scheduler; false without timers
 // Every frame and cancel state is freed at the end (TASK_COUNT_FRAMES).
 #define TASK_COUNT_FRAMES 1
 #include "task.hh"
@@ -67,9 +67,9 @@ void manual() {
 		// one destroyed before its time never fires and leaves the wheel
 		auto early = std::make_unique<task::deadline<task::inline_scheduler>>(s, task::inline_scheduler::clock::time_point(60s));
 		const auto token = early->token();
-		CHECK(s.wheel().size() == 1);
+		CHECK(s.armed_timers() == 1);
 		early.reset();
-		CHECK(s.wheel().size() == 0);
+		CHECK(s.armed_timers() == 0);
 		s.advance(120'000 * ms);
 		CHECK(!token.requested());
 	}
@@ -94,7 +94,7 @@ void chain() {
 			destroyed = true;
 		});
 		s.advance(4 * ms);
-		CHECK(destroyed && child_token.requested() && s.wheel().size() == 0);
+		CHECK(destroyed && child_token.requested() && s.armed_timers() == 0);
 		CHECK(order ? child_token.reason() == task::cancel_reason::deadline : true);
 		parent.reset();
 		std::printf("chain order=%s ok\n", order ? "child-first" : "parent-first");
@@ -107,11 +107,23 @@ struct no_wheel {
 };
 
 void ref() {
+	static int fired = 0;
+	wheel::timer_entry e;
+	e.fire = [](wheel::timer_entry&, bool expired) noexcept { fired += expired; };
 	task::inline_scheduler s;
-	CHECK(task::scheduler_ref::of(s).wheel() == &s.wheel());
+	const auto r = task::scheduler_ref::of(s);
+	s.advance(3 * ms);
+	CHECK(r.now() == 3 * ms);
+	CHECK(r.arm(e, r.now() + 2 * ms) && s.armed_timers() == 1);
+	CHECK(r.cancel(e) && !r.cancel(e) && s.armed_timers() == 0);
+	CHECK(r.arm(e, r.now() + 2 * ms));
+	s.advance(1 * ms);
+	CHECK(fired == 0);
+	s.advance(1 * ms);
+	CHECK(fired == 1 && !e.armed());
 	no_wheel plain;
-	CHECK(task::scheduler_ref::of(plain).wheel() == nullptr);
-	CHECK(task::scheduler_ref{}.wheel() == nullptr);
+	CHECK(!task::scheduler_ref::of(plain).arm(e, 0) && !e.armed() && !task::scheduler_ref::of(plain).cancel(e));
+	CHECK(!task::scheduler_ref{}.arm(e, 0) && !task::scheduler_ref{}.cancel(e));
 	std::printf("ref ok\n");
 }
 }  // namespace

@@ -56,8 +56,8 @@ destroying the child unlinks it (waiting for a parent request running it on anot
 
 ## deadline
 
-`deadline<S>(s, at, parent)` is a linked source plus a timer from `s.start_timer(at, fire)`
-(`task.hh:1246`). `fire` holds a reference to the state and calls
+`deadline<S>(s, at, parent)` is a source linked to `parent` plus a timer from `s.start_timer(at, fire)`
+(`task.hh:1279`). `fire` holds a reference to the state and calls
 `request(deadline, forbid = disarmed_bit)`. On `inline_scheduler` and `asio_scheduler` the state
 carries the wheel entry `start_timer` files (`deadlines.md`).
 

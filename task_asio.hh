@@ -47,10 +47,12 @@
 
 namespace task {
 
-// Runs handles on an Asio executor. Demoted handles wait in a local queue that a
-// self-reposting drainer empties one handle per pass, so ordinary posts that arrive
-// meanwhile run first. All calls happen on the executor's thread except post(),
-// post_call(), demoted(), and the teardown calls. Spawned tasks are roots until they end.
+// Runs handles on an Asio executor that runs on one thread: an io_context run by one thread,
+// not a strand over a multi-threaded one (the timers' wheel has one owner thread). Demoted
+// handles wait in a local queue that a self-reposting drainer empties one handle per pass, so
+// ordinary posts that arrive meanwhile run first. All calls happen on the executor's thread
+// except post(), post_call(), demoted(), and the teardown calls. Spawned tasks are roots until
+// they end.
 //
 // Teardown, across every scheduler and pool a root may be suspended on: (1) stop and join
 // every loop; (2) close() every scheduler; (3) destroy_roots() on every one, with every
@@ -129,17 +131,38 @@ public:
 
 	using clock = std::chrono::steady_clock;
 
-	// The loop's timers, on the executor's thread: one asio::steady_timer wakes the loop at the
-	// wheel's next(). Made on first use.
-	wheel::timer_wheel& wheel() { return timers().wheel; }
+	// On the executor's thread: files e on the loop's timers at `at` (nanoseconds, as now()), or
+	// moves it if armed, and wakes the loop by the end of its 1 ms slot. Its fire runs on the
+	// loop, at most one tick plus the loop's wake latency late. Once closed, nothing fires: the
+	// destroyed scheduler fires what is still armed with expired false.
+	void arm(wheel::timer_entry& e, std::uint64_t at) {
+		assert(!io_ || runs_here());
+		timer_loop& t = timers();
+		t.wheel.arm(e, at);
+		wake_by((at / wheel::timer_wheel::tick + 1) * wheel::timer_wheel::tick);
+	}
+	// On the executor's thread: takes e off the timers; true if it was armed. The last one
+	// cancels the wake, so run() may return.
+	bool cancel(wheel::timer_entry& e) noexcept {
+		assert(!io_ || runs_here());
+		if (!e.armed()) { return false; }
+		timer_loop& t = *timers_;
+		t.wheel.cancel(e);
+		if (!t.wheel.size() && t.wake_at != wheel::timer_wheel::never) {
+			t.wake_at = wheel::timer_wheel::never;
+			t.wake.cancel();
+		}
+		return true;
+	}
+	// Entries armed on its timers, on the executor's thread.
+	std::size_t armed_timers() const noexcept { return timers_ ? timers_->wheel.size() : 0; }
 
-	// Files task::deadline's entry on the wheel at `at`; it fires on the executor at most 1 ms
-	// late. On the executor's thread it is filed at once; from another thread the filing is
+	// Files task::deadline's entry on the timers at `at`; it fires on the executor as arm()'s do. On the executor's thread it is filed at once; from another thread the filing is
 	// posted (dropped once closed). Destroying the returned timer unfiles it the same way.
 	template <typename F>
 	detail::wheel_timer<asio_scheduler> start_timer(clock::time_point at, F&& on_fire) {
 		static_assert(std::is_same_v<std::remove_cvref_t<F>, detail::deadline_fire>, "a wheel's start_timer files task::deadline's entry");
-		detail::timed_cancel_state* s = on_fire.s;
+		detail::timed_cancel_state* s = on_fire.timed();
 		s->deadline = std::uint64_t(std::max<clock::rep>(0, std::chrono::duration_cast<std::chrono::nanoseconds>(at.time_since_epoch()).count()));
 		if (runs_here()) {
 			file(on_fire.take());
@@ -172,20 +195,11 @@ private:
 			s->release();
 			return;
 		}
-		timer_loop& t = timers();
-		t.wheel.arm(*s, s->deadline);
-		wake_by((s->deadline / wheel::timer_wheel::tick + 1) * wheel::timer_wheel::tick);  // the end of its slot
+		arm(*s, s->deadline);
 	}
 	// On the executor's thread: takes the entry off the wheel, releasing the wheel's reference.
 	void unfile(detail::timed_cancel_state* s) noexcept {
-		if (!s->armed()) { return; }
-		timer_loop& t = *timers_;
-		t.wheel.cancel(*s);
-		s->release();
-		if (!t.wheel.size() && t.wake_at != wheel::timer_wheel::never) {  // nothing armed: run() may return
-			t.wake_at = wheel::timer_wheel::never;
-			t.wake.cancel();
-		}
+		if (cancel(*s)) { s->release(); }
 	}
 	// A deadline's timer died: unfile it on the loop; once closed the wheel drops it.
 	void drop_timer(detail::timed_cancel_state* s) noexcept {
@@ -193,7 +207,7 @@ private:
 			unfile(s);
 		} else if (!closed()) {
 			asio::post(executor_, [this, f = detail::deadline_fire(s)] {
-				if (!closed()) { unfile(f.s); }
+				if (!closed()) { unfile(f.timed()); }
 			});
 		}
 	}

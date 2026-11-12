@@ -24,8 +24,8 @@ several children from one `await_suspend`.
 ## Schedulers
 
 `scheduler_ref` erases a scheduler to its address plus a pointer to a per-type table
-(`post`, `post_demoted`, and the optional `post_call`, `runs_here`, `roots`, `wheel`, filled by
-detection). A thread-local `current` reference says which scheduler is
+(`post`, `post_demoted`, `now`, and the optional `post_call`, `runs_here`, `roots`, `arm`,
+`cancel`, filled by detection). A thread-local `current` reference says which scheduler is
 running; schedulers set it around every resume with `running_on`. Affinity checks,
 `yield()`, and budget checkpoints all go through it, so code written against `task`
 never names a concrete scheduler.
@@ -35,12 +35,14 @@ only when nothing is ready: least-attained service, where a task that spent its
 slice waits behind tasks that have not. `asio_scheduler` posts ready handles to its
 executor and keeps demoted handles in a local queue drained one per executor pass.
 
-Each also owns a `wheel::timer_wheel` from Kronuz/wheel, made on first use
-(`docs/mechanisms/deadlines.md`). A deadline's cancel state carries its wheel entry;
-`start_timer` files it, and the wheel holds a reference to the state while it is armed.
+Each also owns a `wheel::timer_wheel` from Kronuz/wheel, made on first use and kept private
+(`docs/mechanisms/deadlines.md`). `arm(entry, at)` and `cancel(entry)`, on the scheduler's
+thread, are the one way to file a timer: `asio_scheduler`'s `arm` also wakes its loop by the
+entry's time. A deadline's cancel state carries its wheel entry; `start_timer` files it through
+`arm`, and the wheel holds a reference to the state while it is armed.
 `inline_scheduler::advance` expires the wheel on its manual clock; `asio_scheduler` wakes its
 loop with one `steady_timer` at `next()`, files and unfiles on the loop thread, and posts both
-from any other.
+from any other, so its executor runs on one thread.
 
 ## Budgets
 
