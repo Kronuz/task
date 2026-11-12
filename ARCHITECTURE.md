@@ -24,7 +24,7 @@ several children from one `await_suspend`.
 ## Schedulers
 
 `scheduler_ref` erases a scheduler to its address plus a pointer to a per-type table
-(`post`, `post_demoted`, and the optional `post_call`, `runs_here`, `roots`, filled by
+(`post`, `post_demoted`, and the optional `post_call`, `runs_here`, `roots`, `wheel`, filled by
 detection). A thread-local `current` reference says which scheduler is
 running; schedulers set it around every resume with `running_on`. Affinity checks,
 `yield()`, and budget checkpoints all go through it, so code written against `task`
@@ -34,6 +34,12 @@ never names a concrete scheduler.
 only when nothing is ready: least-attained service, where a task that spent its
 slice waits behind tasks that have not. `asio_scheduler` posts ready handles to its
 executor and keeps demoted handles in a local queue drained one per executor pass.
+
+Each also owns a `timer_wheel`, made on first use (`docs/timer-wheel.md`). A deadline's cancel
+state carries its wheel entry; `start_timer` files it, and the wheel holds a reference to the
+state while it is armed. `inline_scheduler::advance` expires the wheel on its manual clock;
+`asio_scheduler` wakes its loop with one `steady_timer` at `next()`, files and unfiles on the
+loop thread, and posts both from any other.
 
 ## Budgets
 
@@ -116,8 +122,10 @@ destructor, a token's callback deregisters, a pending Asio operation goes to its
 `io_context`, `when_all` destroys unfinished children. No frame is destroyed while another thread
 runs a handler or an `unlock` against it: the phases run after the join. The `io_context` is
 not run again after `destroy_roots()`; the scheduler's posted functions check `closed()` before
-touching a frame, so one that does run drops its work. A `deadline` holds no scheduler
-reference and may be destroyed on any thread: its disarm bit is set before the timer dies.
+touching a frame, so one that does run drops its work. A `deadline` may be destroyed on any
+thread: its disarm bit is set before the timer dies. On `asio_scheduler` its unfile is posted
+from another thread, `close()` releases the wheel so teardown's thread may destroy it, and the
+destroyed scheduler's wheel drops what is still filed.
 
 ## Frames
 

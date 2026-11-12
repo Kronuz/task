@@ -14,8 +14,12 @@ explains how each piece works.
   awaiter is posted back to its own scheduler (executor affinity).
 - Schedulers: anything with `post(handle)` and `now()`, optionally
   `post_demoted(handle)`. The library owns no run queue; the host's loop is the
-  queue. `inline_scheduler` is a deterministic one for tests and simulation, and
-  `asio_scheduler` runs on an Asio executor.
+  queue. `inline_scheduler` is a deterministic one for tests and simulation, with a manual
+  clock whose `advance(ns)` fires the timers it passes, and `asio_scheduler` runs on an Asio
+  executor. Both declare a `clock` and a `wheel()`, which `scheduler_ref::wheel()` returns.
+- `timer_wheel`: the loop's timers (`docs/timer-wheel.md`). A `timer_entry` is 32 bytes inside its
+  owner; the owner thread `arm`s, re-arms, `cancel`s and `expire(now)`s, O(1) per arm with no
+  allocation, and arms the loop's one timer at `next()`; any thread `arm_remote`s an unarmed entry.
 - `budget`: a time slice measured with the CPU cycle counter. `co_await
   budget.checkpoint()` costs one counter read while the slice lasts; once it is
   spent, the coroutine requeues as demoted, so a long computation cannot hold a loop
@@ -30,8 +34,10 @@ explains how each piece works.
   `cancel_source(parent_token)` is requested with its parent. `cancel_callback(token, f)`
   runs `f(reason)` on the requesting thread, with `std::stop_callback`'s lifetime rules.
   `deadline(sched, time_point, parent = {})` is a source its scheduler's timer requests
-  with `cancel_reason::deadline`; `sched` supplies `start_timer` (`asio_scheduler` does). It
-  keeps no reference to `sched` and may be destroyed on any thread, before or after the expiry.
+  with `cancel_reason::deadline`, at most 1 ms late on a wheel; `time_point` is on `sched`'s
+  `clock` when it declares one, else `steady_clock`, and `sched` supplies `start_timer`
+  (`inline_scheduler` and `asio_scheduler` file the deadline's own entry on their wheel). It may
+  be created and destroyed on any thread, before or after the expiry; `sched` outlives it.
 - `event`: a one-shot completion. `co_await e` suspends until `e.set()` (any thread); each
   waiter resumes through the scheduler it suspended on, in arrival order.
 - `async_mutex`: a FIFO mutex for coroutines, usable from every scheduler at once.

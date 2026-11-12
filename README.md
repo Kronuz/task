@@ -24,6 +24,9 @@ it.
 - **Bring your own loop.** A scheduler is anything with `post(handle)` and `now()`; the
   library owns no run queue. `inline_scheduler` is deterministic for tests, and
   `asio_scheduler` runs on an Asio executor.
+- **One timer wheel per loop.** `timer_wheel` arms in O(1) with no allocation, 32 bytes inside
+  the owner, and takes arms from other threads through a striped inbox; deadlines run on it,
+  on a manual clock in tests.
 - **Time-slice budgets.** `co_await budget.checkpoint()` costs one cycle-counter read
   while the slice lasts, and requeues the coroutine as demoted once it is spent.
 - **Cancellation.** A `cancel_token` carries a reason and callbacks; sources link to a parent,
