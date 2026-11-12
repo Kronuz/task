@@ -91,8 +91,8 @@ struct stop_bound {
 struct stop_timing { std::chrono::nanoseconds bound = 35s, grace = 5s; };
 
 template <typename S>
-concept service = requires(S& s, const stop_bound& b) {
-	{ s.start() } -> std::same_as<task<void>>;  // on the loop; returns once serving
+concept service = requires(S& s, cancel_token stop, const stop_bound& b) {
+	{ s.start(stop) } -> std::same_as<task<void>>;  // on the loop; returns once serving, or at stop
 	s.stop();   // any thread, at once, idempotent: refuse new outside work
 	{ s.drain(b) } -> std::same_as<task<std::vector<std::string>>>;  // on the loop; what it left
 	s.flush();  // any thread, blocking, idempotent: acknowledged writes are durable on return
@@ -153,8 +153,10 @@ b.cancel + grace        -> b.abandon: a drain stops waiting and reports what is 
 signal 3                -> the signal thread runs every flush(), then SIG_DFL and raise
 ```
 
-1. `serve` adds each service's `flush` to `signals` and awaits its `start()`, in order. A start
-   that throws becomes `failure`, and the started ones stop and drain. Then it calls `ready`.
+1. `serve` adds each service's `flush` to `signals` and awaits its `start(signals.stop())`, in
+   order, so a first signal ends a start's wait (detentd's lone-quorum wait, the agent's
+   preparation) as it does today. A start that throws, or one a stop ended, becomes `failure`
+   or a stop, and the started ones stop and drain. Then it calls `ready`.
 2. At `signals.stop()` it makes `b.cancel`, a `deadline(loop, now + bound - grace,
    signals.hurry())`, and `b.abandon`, `grace` after `b.cancel`.
 3. It calls every `stop()` in reverse, then each drain in reverse. In a drain no wait takes the
@@ -163,6 +165,9 @@ signal 3                -> the signal thread runs every flush(), then SIG_DFL an
 4. A drain's throw becomes `failure`. A drain that returns lines leaves threads that may use the
    later services, so those only `flush()`, on a thread (D11). `main` then exits `EX_TEMPFAIL`
    without teardown, as Xapiand does (`manager.cc:1188-1195`).
+5. Every path ends with each started service's `flush()`, in reverse, before `serve` returns: a
+   normal stop, a start that throws, a drain that throws (later drains still run), and an
+   unfinished drain. Xapiand's WAL join on a normal stop is that `flush()`.
 
 Every `stop()` before any drain is what detentd needs: the authority's `stop()` answers held
 polls 503 before HTTP's drain waits, as `begin_shutdown` precedes `service.stop()` today
@@ -248,7 +253,8 @@ sleep still armed at teardown is cancelled when phase 3 destroys its frame (D10)
   finds four headings, and `campaign verify service-shape` runs the docs check.
 - A3: one `design` review, plus the Xapiand lead's agreement, recorded in the journal.
 
-Each step is its own quest with tests that fail without it:
+Each step is its own quest with tests that fail without it (among them: `flush()` runs once on
+each path of step 5, and a signal during `start()` ends it):
 
 1. task: sleeps, `event::wait`, D10, D14; under ASan, phase 3 destroying a sleeping root, one a
    root of another scheduler.
