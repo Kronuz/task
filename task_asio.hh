@@ -139,7 +139,8 @@ public:
 		assert(!io_ || runs_here());
 		timer_loop& t = timers();
 		t.wheel.arm(e, at);
-		wake_by((at / wheel::timer_wheel::tick + 1) * wheel::timer_wheel::tick);
+		constexpr std::uint64_t tick = wheel::timer_wheel::tick;
+		wake_by(at > wheel::timer_wheel::never - tick ? at : (at / tick + 1) * tick);
 	}
 	// On the executor's thread: takes e off the timers; true if it was armed. The last one
 	// cancels the wake, so run() may return.
@@ -215,7 +216,8 @@ private:
 		timer_loop& t = *timers_;
 		if (at >= t.wake_at) { return; }
 		t.wake_at = at;
-		t.wake.expires_at(clock::time_point(std::chrono::nanoseconds(at)));
+		constexpr std::uint64_t latest = std::uint64_t(std::chrono::nanoseconds::max().count());  // the clock never gets past it
+		t.wake.expires_at(at > latest ? clock::time_point::max() : clock::time_point(std::chrono::nanoseconds(std::int64_t(at))));
 		t.wake.async_wait([this](const asio::error_code& ec) {
 			if (!ec && !closed()) { on_wake(); }
 		});

@@ -7,6 +7,8 @@
 //   idle       a far deadline destroyed on the loop cancels the wake, so run() returns
 //   direct     an entry armed through scheduler_ref::arm, with no deadline armed, wakes the
 //              loop and fires on time; one cancelled through it never fires
+//   far        an entry armed past the clock's range (the wheel's never, 2^63 ns + 1 ms) does
+//              not spin the loop
 // Every frame and cancel state is freed at the end (TASK_COUNT_FRAMES).
 #define TASK_COUNT_FRAMES 1
 #include "task_asio.hh"
@@ -154,6 +156,22 @@ void direct() {
 	runner.join();
 	std::printf("direct late_us=%llu ok\n", static_cast<unsigned long long>(late_us));
 }
+
+void far() {
+	for (const std::uint64_t at : {wheel::timer_wheel::never, (std::uint64_t(1) << 63) + 1'000'000}) {
+		asio::io_context io;
+		task::asio_scheduler s(io.get_executor());
+		wheel::timer_entry e;
+		e.fire = [](wheel::timer_entry&, bool) noexcept {};
+		asio::post(io, [&] { CHECK(task::scheduler_ref::of(s).arm(e, at)); });
+		const std::size_t handlers = io.run_for(100ms);
+		CHECK(handlers < 10);  // a wake past the clock's range would spin the loop
+		asio::post(io, [&] { CHECK(task::scheduler_ref::of(s).cancel(e)); });
+		io.restart();
+		io.run_for(10ms);
+		std::printf("far at=%llu handlers=%zu ok\n", static_cast<unsigned long long>(at), handlers);
+	}
+}
 }  // namespace
 
 int main() {
@@ -162,6 +180,7 @@ int main() {
 	teardown();
 	idle();
 	direct();
+	far();
 	CHECK(task::detail::live_frames() == baseline);
 	std::printf("deadline_asio_test: ok\n");
 	return 0;
