@@ -491,7 +491,7 @@ private:
 			for (timer_entry* e = head.exchange(nullptr, std::memory_order_acquire); e;) {
 				timer_entry* following = e->next;
 				e->next = nullptr;
-				arm(*e, e->deadline);
+				file(*e);  // unarmed: an arm() here would drain again while producers refill
 				e = following;
 			}
 		}
