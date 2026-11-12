@@ -51,8 +51,8 @@ void wheel() {
 	std::vector<task::timer_entry> entries(n);
 	auto w = std::make_unique<task::timer_wheel>(0);
 	std::mt19937_64 random(5);
-	w->arm_remote(entries[0], 1);  // this thread's stripe, chosen on first use
-	CHECK(w->expire(1 * ms) == 0 && w->size() == 1);
+	w->arm_remote(entries[0], 50 * ms);  // this thread's stripe, chosen on first use
+	CHECK(w->expire(1 * ms, [](task::timer_entry&) {}) == 0 && w->size() == 1);
 	w->cancel(entries[0]);
 	const std::size_t before = allocations.load();
 	std::size_t fired = 0;
