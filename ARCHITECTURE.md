@@ -35,11 +35,12 @@ only when nothing is ready: least-attained service, where a task that spent its
 slice waits behind tasks that have not. `asio_scheduler` posts ready handles to its
 executor and keeps demoted handles in a local queue drained one per executor pass.
 
-Each also owns a `timer_wheel`, made on first use (`docs/timer-wheel.md`). A deadline's cancel
-state carries its wheel entry; `start_timer` files it, and the wheel holds a reference to the
-state while it is armed. `inline_scheduler::advance` expires the wheel on its manual clock;
-`asio_scheduler` wakes its loop with one `steady_timer` at `next()`, files and unfiles on the
-loop thread, and posts both from any other.
+Each also owns a `wheel::timer_wheel` from Kronuz/wheel, made on first use
+(`docs/mechanisms/deadlines.md`). A deadline's cancel state carries its wheel entry;
+`start_timer` files it, and the wheel holds a reference to the state while it is armed.
+`inline_scheduler::advance` expires the wheel on its manual clock; `asio_scheduler` wakes its
+loop with one `steady_timer` at `next()`, files and unfiles on the loop thread, and posts both
+from any other.
 
 ## Budgets
 

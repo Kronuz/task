@@ -57,13 +57,13 @@ destroying the child unlinks it (waiting for a parent request running it on anot
 ## deadline
 
 `deadline<S>(s, at, parent)` is a linked source plus a timer from `s.start_timer(at, fire)`
-(`task.hh:1118`; `asio_scheduler::start_timer`, `task_asio.hh:130`). `fire` holds a reference
-to the state and calls `request(deadline, forbid = disarmed_bit)`.
+(`task.hh:1246`). `fire` holds a reference to the state and calls
+`request(deadline, forbid = disarmed_bit)`. On `inline_scheduler` and `asio_scheduler` the state
+carries the wheel entry `start_timer` files (`deadlines.md`).
 
-- `~deadline` sets the `disarmed` bit, then the timer dies. Destroying an Asio timer does
-  not stop an expiry Asio already queued; that `fire` still runs, holds the state alive, and
-  its request fails on the bit. So a deadline may be destroyed on any thread, before or after
-  its expiry, and never requests afterwards.
+- `~deadline` sets the `disarmed` bit, then the timer dies. A fire already under way when the
+  timer dies holds the state alive, and its request fails on the bit. So a deadline may be
+  destroyed on any thread, before or after its expiry, and never requests afterwards.
 - `expired()` is `reason == deadline`. A deadline linked to a parent that was requested first
   reports the parent's reason.
 - A timer that cannot start throws from the constructor and frees the state.

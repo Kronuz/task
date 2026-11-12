@@ -17,9 +17,9 @@ explains how each piece works.
   queue. `inline_scheduler` is a deterministic one for tests and simulation, with a manual
   clock whose `advance(ns)` fires the timers it passes, and `asio_scheduler` runs on an Asio
   executor. Both declare a `clock` and a `wheel()`, which `scheduler_ref::wheel()` returns.
-- `timer_wheel`: the loop's timers (`docs/timer-wheel.md`). A `timer_entry` is 32 bytes inside its
-  owner; the owner thread `arm`s, re-arms, `cancel`s and `expire(now)`s, O(1) per arm with no
-  allocation, and arms the loop's one timer at `next()`; any thread `arm_remote`s an unarmed entry.
+- `wheel()`: the scheduler's `wheel::timer_wheel`, from
+  [Kronuz/wheel](https://github.com/Kronuz/wheel), used on the scheduler's own thread. Deadlines
+  run on it (`docs/mechanisms/deadlines.md`).
 - `budget`: a time slice measured with the CPU cycle counter. `co_await
   budget.checkpoint()` costs one counter read while the slice lasts; once it is
   spent, the coroutine requeues as demoted, so a long computation cannot hold a loop

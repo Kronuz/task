@@ -24,9 +24,9 @@ it.
 - **Bring your own loop.** A scheduler is anything with `post(handle)` and `now()`; the
   library owns no run queue. `inline_scheduler` is deterministic for tests, and
   `asio_scheduler` runs on an Asio executor.
-- **One timer wheel per loop.** `timer_wheel` arms in O(1) with no allocation, 32 bytes inside
-  the owner, and takes arms from other threads through a striped inbox; deadlines run on it,
-  on a manual clock in tests.
+- **Deadlines on one timer wheel per loop.** Each scheduler owns a
+  [Kronuz/wheel](https://github.com/Kronuz/wheel) timer wheel, and a deadline's entry lives in
+  its cancel state, so arming allocates nothing. Tests run deadlines on a manual clock.
 - **Time-slice budgets.** `co_await budget.checkpoint()` costs one cycle-counter read
   while the slice lasts, and requeues the coroutine as demoted once it is spent.
 - **Cancellation.** A `cancel_token` carries a reason and callbacks; sources link to a parent,
@@ -69,7 +69,8 @@ int main() {
 
 ## 📦 Installation
 
-Requires a C++20 compiler, threads, and CMake 3.14 or newer. The `task::asio` target
+Requires a C++20 compiler, threads, and CMake 3.14 or newer. CMake fetches
+[Kronuz/wheel](https://github.com/Kronuz/wheel), header-only, at a pinned commit. The `task::asio` target
 fetches standalone [Asio](https://github.com/chriskohlhoff/asio) 1.36.0, or uses the one
 `-DASIO_INCLUDE_DIR=` points at; `-DTASK_ASIO=OFF` leaves it out. CI builds and tests it
 with GCC and Clang on Linux (x86_64, arm64), macOS (arm64, x86_64), and FreeBSD, plus
@@ -159,6 +160,8 @@ cmake --build build --target task_bench
   its cancellation, the resume count and the inline resume.
 - [docs/mechanisms/asio-scheduler-teardown.md](docs/mechanisms/asio-scheduler-teardown.md): the
   four teardown phases and the zero-live-frames check.
+- [docs/mechanisms/deadlines.md](docs/mechanisms/deadlines.md): deadlines on each scheduler's
+  Kronuz/wheel, and the wheel's rules task keeps.
 - [docs/mechanisms/transfers.md](docs/mechanisms/transfers.md): symmetric transfer, the
   trampoline, and the trampoline each `running_on` scope owns.
 - [AGENTS.md](AGENTS.md): repository map, invariants, and how to verify a change.
