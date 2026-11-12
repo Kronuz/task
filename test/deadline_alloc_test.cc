@@ -1,5 +1,5 @@
-// No allocation per arm, re-arm, cancel, remote arm or fire on task::timer_wheel, near or far,
-// nor per deadline on inline_scheduler once the frame pool is warm: a counting operator new.
+// No allocation per deadline on inline_scheduler's wheel once the frame pool is warm: a counting
+// operator new (Kronuz/wheel's own test covers the wheel's arm, cancel and fire).
 // TSan's runtime replaces operator new itself, so its build only runs the operations.
 #include "task.hh"
 
@@ -8,9 +8,6 @@
 #include <cstdlib>
 #include <memory>
 #include <new>
-#include <random>
-#include <thread>
-#include <vector>
 
 #if defined(__SANITIZE_THREAD__)
 #define COUNTS 0
@@ -46,30 +43,6 @@ namespace {
 using u64 = std::uint64_t;
 constexpr u64 ms = 1'000'000;
 
-void wheel() {
-	constexpr std::size_t n = 1000;
-	std::vector<task::timer_entry> entries(n);
-	auto w = std::make_unique<task::timer_wheel>(0);
-	std::mt19937_64 random(5);
-	w->arm_remote(entries[0], 50 * ms);  // this thread's stripe, chosen on first use
-	CHECK(w->expire(1 * ms, [](task::timer_entry&) {}) == 0 && w->size() == 1);
-	w->cancel(entries[0]);
-	const std::size_t before = allocations.load();
-	std::size_t fired = 0;
-	for (int rep = 0; rep < 20; ++rep) {
-		const u64 base = u64(rep) * 100'000 * ms;
-		for (auto& e : entries) { w->arm(e, base + 1 + random() % (2'000 * ms)); }       // arm
-		for (auto& e : entries) { w->arm(e, base + 1 + random() % (90'000 * ms)); }      // re-arm, some far
-		for (std::size_t i = 0; i < n; i += 2) { w->cancel(entries[i]); }                 // cancel
-		for (std::size_t i = 0; i < n; i += 2) { w->arm_remote(entries[i], base + 5 * ms); }  // remote arm
-		for (u64 t = base; t <= base + 99'000 * ms; t += ms) { fired += w->expire(t, [](task::timer_entry&) {}); }  // fire
-	}
-	const std::size_t during = allocations.load() - before;
-	CHECK(fired == 20 * n && w->size() == 0);
-	CHECK(!COUNTS || during == 0);
-	std::printf("wheel ops=%zu allocations=%zu ok\n", std::size_t(20 * n * 5), during);
-}
-
 void deadlines() {
 	using tp = task::inline_scheduler::clock::time_point;
 	task::inline_scheduler s;
@@ -92,8 +65,7 @@ void deadlines() {
 }  // namespace
 
 int main() {
-	wheel();
 	deadlines();
-	std::printf("wheel_alloc_test: ok (counting=%d)\n", COUNTS);
+	std::printf("deadline_alloc_test: ok (counting=%d)\n", COUNTS);
 	return 0;
 }

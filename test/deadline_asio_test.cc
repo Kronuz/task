@@ -123,6 +123,6 @@ int main() {
 	teardown();
 	idle();
 	CHECK(task::detail::live_frames() == baseline);
-	std::printf("wheel_asio_test: ok\n");
+	std::printf("deadline_asio_test: ok\n");
 	return 0;
 }

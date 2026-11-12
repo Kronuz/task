@@ -131,7 +131,7 @@ public:
 
 	// The loop's timers, on the executor's thread: one asio::steady_timer wakes the loop at the
 	// wheel's next(). Made on first use.
-	timer_wheel& wheel() { return timers().wheel; }
+	wheel::timer_wheel& wheel() { return timers().wheel; }
 
 	// Files task::deadline's entry on the wheel at `at`; it fires on the executor at most 1 ms
 	// late. On the executor's thread it is filed at once; from another thread the filing is
@@ -157,9 +157,9 @@ private:
 	friend class detail::wheel_timer<asio_scheduler>;
 
 	struct timer_loop {
-		timer_wheel wheel;
+		wheel::timer_wheel wheel;
 		asio::steady_timer wake;
-		std::uint64_t wake_at = timer_wheel::never;  // when `wake` is set for
+		std::uint64_t wake_at = wheel::timer_wheel::never;  // when `wake` is set for
 		explicit timer_loop(asio_scheduler& s) : wheel(s.now()), wake(s.executor_) {}
 	};
 	timer_loop& timers() {
@@ -174,7 +174,7 @@ private:
 		}
 		timer_loop& t = timers();
 		t.wheel.arm(*s, s->deadline);
-		wake_by((s->deadline / timer_wheel::tick + 1) * timer_wheel::tick);  // the end of its slot
+		wake_by((s->deadline / wheel::timer_wheel::tick + 1) * wheel::timer_wheel::tick);  // the end of its slot
 	}
 	// On the executor's thread: takes the entry off the wheel, releasing the wheel's reference.
 	void unfile(detail::timed_cancel_state* s) noexcept {
@@ -182,8 +182,8 @@ private:
 		timer_loop& t = *timers_;
 		t.wheel.cancel(*s);
 		s->release();
-		if (!t.wheel.size() && t.wake_at != timer_wheel::never) {  // nothing armed: run() may return
-			t.wake_at = timer_wheel::never;
+		if (!t.wheel.size() && t.wake_at != wheel::timer_wheel::never) {  // nothing armed: run() may return
+			t.wake_at = wheel::timer_wheel::never;
 			t.wake.cancel();
 		}
 	}
@@ -208,9 +208,9 @@ private:
 	}
 	void on_wake() {
 		timer_loop& t = *timers_;
-		t.wake_at = timer_wheel::never;
+		t.wake_at = wheel::timer_wheel::never;
 		t.wheel.expire(now());
-		if (const std::uint64_t n = t.wheel.next(); n != timer_wheel::never) { wake_by(n); }
+		if (const std::uint64_t n = t.wheel.next(); n != wheel::timer_wheel::never) { wake_by(n); }
 	}
 
 	void drain() {
