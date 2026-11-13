@@ -13,7 +13,7 @@ explains how each piece works.
   sanitizers). When a task finishes on a different scheduler than its awaiter's, the
   awaiter is posted back to its own scheduler (executor affinity).
 - Schedulers: anything with `post(handle)` and `now()`, optionally
-  `post_demoted(handle)`. The library owns no run queue; the host's loop is the
+  `post_demoted(handle)` and `post_heavy(handle)` (the heavy lane, [lanes.md](lanes.md)). The library owns no run queue; the host's loop is the
   queue. `inline_scheduler` is a deterministic one for tests and simulation, with a manual
   clock whose `advance(ns)` fires the timers it passes, and `asio_scheduler` runs on an Asio
   executor that runs on one thread: an `io_context` run by one thread, not a strand over a
@@ -30,6 +30,11 @@ explains how each piece works.
   for more than one slice. The slice is one resume: time spent suspended does not count,
   and a task resumed after an event, a lock or an Asio completion starts a fresh slice.
   Checkpoints also observe a `cancel_token` and throw `task::cancelled`.
+  `budget(slice, token, light_slices)` opts into the heavy lane ([lanes.md](lanes.md)): the
+  scope runs `light_slices` slices light, then every resumption of what it captures waits in
+  the scheduler's heavy lane. `spent()` counts spent slices; `rearm_light(allowance)` and
+  `task::enter_light()` make the scope light again. `scheduler_ref::heavy()` reads the lane.
+  The default, 0, is the policy above.
 - `cancel_source` / `cancel_token`: `request(reason)` is first-wins and sets a
   `cancel_reason` (`requested`, `deadline`, `shutdown`, or a library's own from `user`);
   `requested()` is one acquire load, and an empty token allocates nothing: a thread that sees
@@ -68,12 +73,13 @@ explains how each piece works.
   up to four such resumes nest, then one is posted); any other completion resumes it through
   the scheduler.
 - Optional scheduler members, found by detection and forwarded by wrappers: `runs_here()`,
-  `post_call(fn, arg)` (a cross-thread cancel's emit) and `roots()` (where `spawn` links roots).
-- Teardown (`asio_scheduler`): `close()` makes `post`, `post_demoted` and `post_call` drop and
+  `post_call(fn, arg)` (a cross-thread cancel's emit), `roots()` (where `spawn` links roots) and
+  `post_heavy(handle)`. `asio_scheduler::post_demoted` and `post_heavy` work from any thread.
+- Teardown (`asio_scheduler`): `close()` makes `post`, `post_demoted`, `post_heavy` and `post_call` drop and
   `spawn` destroy its task unrun; `destroy_roots()` destroys every root, with every `io_context`
   alive; both are idempotent and the owner's, after every loop has stopped and joined (Debug
   asserts they do not run on a loop thread); the destructor repeats them. The `io_context` is not
-  run again after `destroy_roots()`. `asio_scheduler::demoted()` counts the handles in its demoted queue.
+  run again after `destroy_roots()`. `asio_scheduler::demoted()` counts the handles in its demoted queue, heavy ones included.
 - At teardown a frame suspended on any primitive may be destroyed: a granted, unresumed lock
   waiter unlocks, an `event` waiter unlinks, and an `event` destroyed first orphans its waiters
   (`detail::orphaned_waiters()` counts them in Debug). `async_mutex`'s destructor asserts in

@@ -50,9 +50,11 @@ namespace task {
 // Runs handles on an Asio executor that runs on one thread: an io_context run by one thread,
 // not a strand over a multi-threaded one (the timers' wheel has one owner thread). Demoted
 // handles wait in a local queue that a self-reposting drainer empties one handle per pass, so
-// ordinary posts that arrive meanwhile run first. All calls happen on the executor's thread
-// except post(), post_call(), demoted(), and the teardown calls. Spawned tasks are roots until
-// they end.
+// ordinary posts that arrive meanwhile run first. That queue is also the heavy lane: a handle
+// posted heavy resumes in a heavy scope (docs/lanes.md). All calls happen on the executor's
+// thread except post(), post_demoted(), post_heavy(), post_call(), demoted(), and the teardown
+// calls; post_demoted() and post_heavy() from another thread need an io_context's executor.
+// Spawned tasks are roots until they end.
 //
 // Teardown, across every scheduler and pool a root may be suspended on: (1) stop and join
 // every loop; (2) close() every scheduler; (3) destroy_roots() on every one, with every
@@ -80,15 +82,9 @@ public:
 		});
 	}
 
-	void post_demoted(std::coroutine_handle<> h) {
-		if (closed()) { return; }
-		demoted_.push_back(h);
-		demoted_count_.fetch_add(1, std::memory_order_relaxed);
-		if (!draining_) {
-			draining_ = true;
-			asio::post(executor_, [this] { drain(); });
-		}
-	}
+	void post_demoted(std::coroutine_handle<> h) { demote({h, false}); }
+	// Queues h as demoted, to resume in a heavy scope: what it captures stays heavy.
+	void post_heavy(std::coroutine_handle<> h) { demote({h, true}); }
 
 	// Runs fn(arg) on the executor; dropped when closed, destroyed unrun with a stopped loop.
 	void post_call(void (*fn)(void*), void* arg) {
@@ -105,7 +101,7 @@ public:
 
 	root_list* roots() noexcept { return &roots_; }
 
-	// Phase 2: post, post_demoted and post_call drop what they are given; spawn destroys its task.
+	// Phase 2: post, post_demoted, post_heavy and post_call drop what they are given; spawn destroys its task.
 	// The wheel is released: what it still holds, it drops when the scheduler is destroyed.
 	void close() noexcept {
 		assert(!runs_here());  // phases 2 and 3 run after the loops joined
@@ -126,7 +122,8 @@ public:
 		return std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
 	}
 
-	// Handles waiting in the demoted queue; readable from any thread (admission, metrics).
+	// Handles waiting in the demoted queue, heavy ones included, once they reach the loop; readable
+	// from any thread (admission, metrics).
 	std::size_t demoted() const noexcept { return demoted_count_.load(std::memory_order_relaxed); }
 
 	using clock = std::chrono::steady_clock;
@@ -229,17 +226,37 @@ private:
 		if (const std::uint64_t n = t.wheel.next(); n != wheel::timer_wheel::never) { wake_by(n); }
 	}
 
+	struct demoted_entry {
+		std::coroutine_handle<> h;
+		bool heavy;
+	};
+
+	void demote(demoted_entry e) {
+		if (closed()) { return; }
+		if (io_ && !io_->running_in_this_thread()) {  // from another thread: queue it from the loop
+			asio::post(executor_, [this, e] { demote(e); });
+			return;
+		}
+		assert((io_ || !current() || current() == scheduler_ref::of(*this)) && "post_demoted from another thread needs an io_context's executor");
+		demoted_.push_back(e);
+		demoted_count_.fetch_add(1, std::memory_order_relaxed);
+		if (!draining_) {
+			draining_ = true;
+			asio::post(executor_, [this] { drain(); });
+		}
+	}
+
 	void drain() {
 		if (demoted_.empty()) {  // destroy_roots() forgot them
 			draining_ = false;
 			return;
 		}
-		auto h = demoted_.front();
+		const demoted_entry e = demoted_.front();
 		demoted_.pop_front();
 		demoted_count_.fetch_sub(1, std::memory_order_relaxed);
 		{
-			running_on scope(scheduler_ref::of(*this));
-			h.resume();
+			running_on scope(scheduler_ref::of(*this).with_heavy(e.heavy));
+			e.h.resume();
 		}
 		if (demoted_.empty()) {
 			draining_ = false;
@@ -251,7 +268,7 @@ private:
 	asio::any_io_executor executor_;
 	const asio::io_context::executor_type* io_;  // into executor_; null for other executor types
 	root_list roots_;
-	std::deque<std::coroutine_handle<>> demoted_;
+	std::deque<demoted_entry> demoted_;
 	std::atomic<std::size_t> demoted_count_{0};
 	bool draining_ = false;
 	std::unique_ptr<timer_loop> timers_;
@@ -290,11 +307,12 @@ struct asio_park {
 	}
 	bool park() noexcept { return count_.fetch_sub(1, std::memory_order_acq_rel) != 1; }
 
-	// Inline at the top level only: on the scheduler's own thread with no scheduler current
-	// (never inside another frame's resume), in its scope (a fresh slice and a trampoline loop
-	// of its own), and fewer than inline_resume_bound inline resumes nested; else posted.
+	// Inline at the top level only: for a light reference, on the scheduler's own thread with no
+	// scheduler current (never inside another frame's resume), in its scope (a fresh slice and a
+	// trampoline loop of its own), and fewer than inline_resume_bound inline resumes nested; else
+	// posted, a heavy one to the heavy lane.
 	static void resume(scheduler_ref s, std::coroutine_handle<> h) {
-		if (inline_resume_depth < inline_resume_bound && s.runs_here() && !current()) {
+		if (!s.heavy() && inline_resume_depth < inline_resume_bound && s.runs_here() && !current()) {
 			struct nest {
 				nest() noexcept { ++inline_resume_depth; }
 				~nest() { --inline_resume_depth; }

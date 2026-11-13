@@ -117,7 +117,8 @@ inline void calibrate() { (void)per_ns(); }
 // Schedulers
 
 // A scheduler runs posted coroutine handles on its own thread(s), and tells time in
-// nanoseconds. post_demoted, when present, queues behind ordinary posts.
+// nanoseconds. post_demoted, when present, queues behind ordinary posts; post_heavy, when
+// present, queues in the heavy lane and resumes in a heavy scope (docs/lanes.md).
 template <typename S>
 concept scheduler = requires(S& s, std::coroutine_handle<> h) {
 	s.post(h);
@@ -129,10 +130,12 @@ class root_list;
 namespace detail {
 
 // What scheduler_ref calls through. post_call, runs_here, roots, arm and cancel are optional:
-// null when the scheduler does not declare them.
+// null when the scheduler does not declare them. post_heavy falls back to post_demoted, and
+// post_demoted to post.
 struct scheduler_vtable {
 	void (*post)(void*, std::coroutine_handle<>);
 	void (*post_demoted)(void*, std::coroutine_handle<>);
+	void (*post_heavy)(void*, std::coroutine_handle<>);
 	std::uint64_t (*now)(void*);
 	void (*post_call)(void*, void (*)(void*), void*);
 	bool (*runs_here)(void*) noexcept;
@@ -149,6 +152,11 @@ constexpr scheduler_vtable make_scheduler_vtable() noexcept {
 		t.post_demoted = [](void* p, std::coroutine_handle<> h) { static_cast<S*>(p)->post_demoted(h); };
 	} else {
 		t.post_demoted = t.post;
+	}
+	if constexpr (requires(S& s) { s.post_heavy(std::coroutine_handle<>{}); }) {
+		t.post_heavy = [](void* p, std::coroutine_handle<> h) { static_cast<S*>(p)->post_heavy(h); };
+	} else {
+		t.post_heavy = t.post_demoted;
 	}
 	t.now = [](void* p) -> std::uint64_t { return static_cast<S*>(p)->now(); };
 	if constexpr (requires(S& s, void (*f)(void*), void* a) { s.post_call(f, a); }) {
@@ -175,8 +183,12 @@ inline constexpr scheduler_vtable scheduler_vtable_of = make_scheduler_vtable<S>
 
 }  // namespace detail
 
-// A type-erased reference to a scheduler: the scheduler and its vtable. Optional members a
-// scheduler (or a wrapper forwarding to one) may declare, found by detection:
+// A type-erased reference to a scheduler: the scheduler, its vtable, and a lane. A reference
+// taken in a heavy scope is heavy: its posts go to post_heavy (docs/lanes.md). Equality
+// ignores the lane. Optional members a scheduler (or a wrapper forwarding to one) may declare,
+// found by detection:
+//   void post_demoted(handle);                     queues behind ordinary posts
+//   void post_heavy(handle);                       queues in the heavy lane, resumed in a heavy scope
 //   bool runs_here() const noexcept;               true on the scheduler's own thread
 //   void post_call(void (*fn)(void*), void* arg);  runs fn(arg) on it; dropped when closed
 //   task::root_list* roots() noexcept;             spawned tasks are roots there (teardown)
@@ -190,40 +202,52 @@ public:
 	static scheduler_ref of(S& s) noexcept {
 		scheduler_ref r;
 		r.self_ = &s;
-		r.vt_ = &detail::scheduler_vtable_of<S>;
+		r.vt_ = reinterpret_cast<std::uintptr_t>(&detail::scheduler_vtable_of<S>);
 		return r;
 	}
 
-	void post(std::coroutine_handle<> h) const { vt_->post(self_, h); }
-	void post_demoted(std::coroutine_handle<> h) const { vt_->post_demoted(self_, h); }
+	void post(std::coroutine_handle<> h) const { (heavy() ? vt()->post_heavy : vt()->post)(self_, h); }
+	void post_demoted(std::coroutine_handle<> h) const { (heavy() ? vt()->post_heavy : vt()->post_demoted)(self_, h); }
+	// The lane: a heavy reference posts to the scheduler's heavy lane.
+	bool heavy() const noexcept { return vt_ & 1; }
+	// The same scheduler, in the heavy lane or the light one.
+	scheduler_ref with_heavy(bool heavy) const noexcept {
+		scheduler_ref r = *this;
+		r.vt_ = (vt_ & ~std::uintptr_t(1)) | std::uintptr_t(heavy);
+		return r;
+	}
 	// The scheduler's clock, in nanoseconds: what arm() takes.
-	std::uint64_t now() const { return vt_->now(self_); }
+	std::uint64_t now() const { return vt()->now(self_); }
 	// Queues fn(arg) on the scheduler; false (nothing queued) when it declares no post_call.
 	bool post_call(void (*fn)(void*), void* arg) const {
-		if (!vt_ || !vt_->post_call) { return false; }
-		vt_->post_call(self_, fn, arg);
+		if (!vt() || !vt()->post_call) { return false; }
+		vt()->post_call(self_, fn, arg);
 		return true;
 	}
 	// True on the scheduler's own thread; false when it cannot tell.
-	bool runs_here() const noexcept { return vt_ && vt_->runs_here && vt_->runs_here(self_); }
+	bool runs_here() const noexcept { return vt() && vt()->runs_here && vt()->runs_here(self_); }
 	// Where spawn links its roots; null when the scheduler owns none.
-	root_list* roots() const noexcept { return vt_ && vt_->roots ? vt_->roots(self_) : nullptr; }
+	root_list* roots() const noexcept { return vt() && vt()->roots ? vt()->roots(self_) : nullptr; }
 	// On the scheduler's thread: files e to fire there at `at` (as now()), waking its loop by
 	// then, or moves it if armed. False (nothing armed) when the scheduler has no timers.
 	bool arm(wheel::timer_entry& e, std::uint64_t at) const {
-		if (!vt_ || !vt_->arm) { return false; }
-		vt_->arm(self_, e, at);
+		if (!vt() || !vt()->arm) { return false; }
+		vt()->arm(self_, e, at);
 		return true;
 	}
 	// On the scheduler's thread: takes e off its timers; true if e was armed there.
-	bool cancel(wheel::timer_entry& e) const noexcept { return vt_ && vt_->cancel && vt_->cancel(self_, e); }
+	bool cancel(wheel::timer_entry& e) const noexcept { return vt() && vt()->cancel && vt()->cancel(self_, e); }
 	explicit operator bool() const noexcept { return self_ != nullptr; }
 	friend bool operator==(const scheduler_ref& a, const scheduler_ref& b) noexcept { return a.self_ == b.self_; }
 
 private:
+	const detail::scheduler_vtable* vt() const noexcept { return reinterpret_cast<const detail::scheduler_vtable*>(vt_ & ~std::uintptr_t(1)); }
+
 	void* self_ = nullptr;
-	const detail::scheduler_vtable* vt_ = nullptr;
+	std::uintptr_t vt_ = 0;  // the vtable's address, whose low bit is free (it is aligned): the lane
 };
+static_assert(alignof(detail::scheduler_vtable) >= 2);
+static_assert(sizeof(scheduler_ref) == 2 * sizeof(void*), "the lane is packed into the vtable pointer");
 
 namespace detail {
 inline thread_local scheduler_ref current_scheduler;
@@ -233,6 +257,9 @@ inline thread_local std::uint64_t slice_start = 0;
 
 // The scheduler running on this thread right now (empty outside any scheduler).
 inline scheduler_ref current() noexcept { return detail::current_scheduler; }
+
+// Marks the current scope light: what it captures from here on resumes in the light lane.
+inline void enter_light() noexcept { detail::current_scheduler = detail::current_scheduler.with_heavy(false); }
 
 // ---------------------------------------------------------------------------------------------
 // Transfers between coroutines
@@ -1314,21 +1341,47 @@ inline void inline_scheduler::drop_timer(detail::timed_cancel_state* s) noexcept
 // On a scheduler the slice is the current resume: time spent suspended does not count,
 // and a task resumed after an event, a lock or a completion starts a fresh slice. Off a
 // scheduler it runs from construction, or from the last demotion.
+//
+// With light_slices N > 0 the budget classes its scope by the slices it spent (docs/lanes.md):
+// it runs N slices light, each spent one requeued at the tail of the ordinary posts; the N-th
+// spent slice, and any spent in a heavy scope, enter the heavy lane, where every resumption of
+// what the scope captures then goes. light_slices 0 demotes every spent slice, as without lanes,
+// and never makes a scope heavy.
 class budget {
 public:
-	explicit budget(std::chrono::nanoseconds slice, cancel_token token = {})
-		: slice_(std::uint64_t(double(slice.count()) * cycles::per_ns())), deadline_(cycles::read() + slice_), token_(std::move(token)) {}
+	explicit budget(std::chrono::nanoseconds slice, cancel_token token = {}, unsigned light_slices = 0)
+		: slice_(std::uint64_t(double(slice.count()) * cycles::per_ns())), deadline_(cycles::read() + slice_), token_(std::move(token)),
+		  light_(light_slices) {}
 
 	bool exhausted() const noexcept {
 		return cycles::read() >= (current() ? detail::slice_start + slice_ : deadline_);
 	}
 	const cancel_token& token() const noexcept { return token_; }
+	// Slices spent: the checkpoints that found the slice exhausted on a scheduler.
+	unsigned spent() const noexcept { return spent_; }
+	// Marks the scope light and lets it run `allowance` more slices light (light_slices by
+	// default): the allowance-th spent slice enters the heavy lane. Only what the scope starts or
+	// captures after the call is light again.
+	void rearm_light(unsigned allowance = ~0u) noexcept {
+		spent_ = allowance < light_ ? light_ - allowance : 0;
+		enter_light();
+	}
 
 	auto checkpoint() noexcept {
 		struct awaiter {
 			budget& b;
 			bool await_ready() const noexcept { return b.token_.requested() || !b.exhausted() || !current(); }
-			void await_suspend(std::coroutine_handle<> h) const { current().post_demoted(h); }
+			void await_suspend(std::coroutine_handle<> h) const {
+				const scheduler_ref s = current();
+				++b.spent_;
+				if (b.light_ == 0) {
+					s.post_demoted(h);
+				} else if (b.spent_ >= b.light_ || s.heavy()) {
+					s.with_heavy(true).post(h);
+				} else {
+					s.post(h);
+				}
+			}
 			void await_resume() const {
 				if (b.token_.requested()) { throw cancelled{}; }
 				if (b.exhausted()) { b.deadline_ = cycles::read() + b.slice_; }
@@ -1341,6 +1394,8 @@ private:
 	std::uint64_t slice_;
 	std::uint64_t deadline_;
 	cancel_token token_;
+	unsigned light_;
+	unsigned spent_ = 0;
 };
 
 // ---------------------------------------------------------------------------------------------
