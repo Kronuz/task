@@ -88,6 +88,17 @@ struct loop_thread {
 	asio::executor_work_guard<asio::io_context::executor_type> guard{io.get_executor()};
 	task::asio_scheduler s{io.get_executor()};
 	std::thread t{[this] { io.run(); }};
+	std::atomic<int> gate{0};  // 1: the loop waits in hold()'s handler; 2: released
+	// Blocks the loop in a handler, so posts from other threads queue behind it in order.
+	void hold() {
+		gate = 0;
+		asio::post(io, [this] {
+			gate = 1;
+			while (gate.load() != 2) { std::this_thread::yield(); }
+		});
+		while (gate.load() != 1) { std::this_thread::yield(); }
+	}
+	void release() { gate = 2; }
 	void finish() {
 		guard.reset();
 		t.join();
@@ -215,8 +226,10 @@ void heavy_sticky_across_chore() {
 	ph.wait();
 	pl.wait();
 	CHECK(ph.ref.heavy() && !pl.ref.heavy());
+	l.hold();
 	ph.wake();
 	pl.wake();
+	l.release();
 	while (done.load() < 2) { std::this_thread::yield(); }
 	l.finish();
 	CHECK(order == "LH");
@@ -394,8 +407,10 @@ void rearm_light_resumes_light() {
 	task::spawn(task::scheduler_ref::of(l.s), light());
 	ph.wait();
 	pl.wait();
+	l.hold();
 	ph.wake();
 	pl.wake();
+	l.release();
 	while (done.load() < 2) { std::this_thread::yield(); }
 	l.finish();
 	CHECK(heavy_before && !heavy_after_rearm && !resumed_heavy);
@@ -511,7 +526,7 @@ void await_asio_heavy_posts() {
 bool aborts(void (*f)()) {
 	pid_t pid = fork();
 	if (pid == 0) {
-		std::freopen("/dev/null", "w", stderr);
+		if (!std::freopen("/dev/null", "w", stderr)) { _exit(3); }
 		f();
 		_exit(0);
 	}
