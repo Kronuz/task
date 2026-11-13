@@ -242,6 +242,7 @@ void cross_thread_hop() {
 		CHECK(p.ready.load());
 		std::thread([&] { p.ref.with_heavy(true).post(p.h); }).join();
 		CHECK(s.demoted() == 0);  // the hop waits in the loop's queue
+		io.restart();
 		io.poll();
 		CHECK(resumed_heavy);
 		CHECK(s.demoted() == 0);
