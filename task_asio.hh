@@ -233,7 +233,9 @@ private:
 
 	void demote(demoted_entry e) {
 		if (closed()) { return; }
-		if (io_ && !io_->running_in_this_thread()) {  // from another thread: queue it from the loop
+		// Inside this scheduler's own scope it is on the loop (the cheap check, a checkpoint's case);
+		// otherwise the io_context tells. From another thread, queue it from the loop.
+		if (io_ && !(current() == scheduler_ref::of(*this)) && !io_->running_in_this_thread()) {
 			asio::post(executor_, [this, e] { demote(e); });
 			return;
 		}

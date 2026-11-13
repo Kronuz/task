@@ -2,11 +2,12 @@
 # Copyright © 2026 Germán Méndez Bravo (Kronuz)
 # SPDX-License-Identifier: MIT
 """Paired A/B of the resume path (test/resume_bench.cc) with light_slices 0: task at BASE (A)
-against this checkout (B).
+against this checkout (B), beside an A/A of BASE against a second build of itself (A2).
 
 `python3 test/resume_ab.py BASE [ROUNDS]` builds the bench against BASE's and this checkout's
-headers with one compiler and one Asio, runs ROUNDS ABBA blocks (8 by default), and prints, per
-measurement, the B/A ratio of each block, their median, min and max, and each arm's median ns.
+headers with one compiler and one Asio, runs ROUNDS blocks of A B A2 A2 B A (8 by default), and
+prints, per measurement, the B/A and A2/A ratio of each block (the A/A band is the noise), their
+median, min and max, and each arm's median ns.
 """
 
 from __future__ import annotations
@@ -37,7 +38,7 @@ def main() -> int:
     asio_inc = deps / "_deps" / "asio-src" / "asio" / "include"
     wheel_inc = next(p.parent for p in (deps / "_deps" / "wheel-src").rglob("wheel.hh"))
     arms: dict[str, Path] = {}
-    for arm, headers in (("A", base), ("B", ROOT)):
+    for arm, headers in (("A", base), ("A2", base), ("B", ROOT)):
         inc = work / f"inc-{arm}"
         inc.mkdir(parents=True, exist_ok=True)
         for f in ("task.hh", "task_asio.hh"):
@@ -49,28 +50,29 @@ def main() -> int:
             check=True,
         )
         arms[arm] = exe
-    samples: dict[str, list[dict[str, float]]] = {"A": [], "B": []}
-    ratios: dict[str, list[float]] = {}
+    samples: dict[str, list[dict[str, float]]] = {"A": [], "A2": [], "B": []}
+    ratios: dict[str, dict[str, list[float]]] = {"B/A": {}, "A2/A": {}}
     for _ in range(rounds):
-        block: dict[str, list[dict[str, float]]] = {"A": [], "B": []}
-        for arm in ("A", "B", "B", "A"):
+        block: dict[str, list[dict[str, float]]] = {"A": [], "A2": [], "B": []}
+        for arm in ("A", "B", "A2", "A2", "B", "A"):
             block[arm].append(json.loads(run([str(arms[arm])])))
-        for arm in ("A", "B"):
+        for arm in block:
             samples[arm].extend(block[arm])
         for key in block["A"][0]:
             a = statistics.mean(r[key] for r in block["A"])
-            b = statistics.mean(r[key] for r in block["B"])
-            ratios.setdefault(key, []).append(b / a)
+            for pair, arm in (("B/A", "B"), ("A2/A", "A2")):
+                ratios[pair].setdefault(key, []).append(statistics.mean(r[key] for r in block[arm]) / a)
+
+    def band(rs: list[float]) -> dict[str, object]:
+        return {"median": round(statistics.median(rs), 4), "min": round(min(rs), 4), "max": round(max(rs), 4), "each": [round(r, 4) for r in rs]}
+
     report = {
         key: {
-            "ratio_median": round(statistics.median(rs), 4),
-            "ratio_min": round(min(rs), 4),
-            "ratio_max": round(max(rs), 4),
-            "ratios": [round(r, 4) for r in rs],
-            "A_ns_median": round(statistics.median(s[key] for s in samples["A"]), 3),
-            "B_ns_median": round(statistics.median(s[key] for s in samples["B"]), 3),
+            "B/A": band(ratios["B/A"][key]),
+            "A2/A": band(ratios["A2/A"][key]),
+            **{f"{arm}_ns_median": round(statistics.median(s[key] for s in samples[arm]), 3) for arm in samples},
         }
-        for key, rs in ratios.items()
+        for key in ratios["B/A"]
     }
     out = json.dumps({"base": str(base), "rounds": rounds, "results": report}, indent=1)
     (work / "ab.json").write_text(out)

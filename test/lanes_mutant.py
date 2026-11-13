@@ -45,7 +45,7 @@ MUTANTS: dict[str, tuple[str, str, str, str]] = {
     ),
     "no-hop": (
         "task_asio.hh",
-        "\t\tif (io_ && !io_->running_in_this_thread()) {  // from another thread: queue it from the loop\n"
+        "\t\tif (io_ && !(current() == scheduler_ref::of(*this)) && !io_->running_in_this_thread()) {\n"
         "\t\t\tasio::post(executor_, [this, e] { demote(e); });\n\t\t\treturn;\n\t\t}\n",
         "",
         "cross_thread_hop",
