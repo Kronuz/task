@@ -148,6 +148,8 @@ cmake --build build --target task_bench
 
 ## 📚 Documentation
 
+- [A Guest on the Loop](https://kronuz.github.io/blog/task/):
+  the Familiars post on why it exists and how it works.
 - [docs/API.md](docs/API.md): every type and function, and how to run a task from a
   scheduler, a plain thread, or Asio.
 - [ARCHITECTURE.md](ARCHITECTURE.md): tasks, transfers, schedulers, budgets, events and
