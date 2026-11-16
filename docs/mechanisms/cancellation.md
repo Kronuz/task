@@ -68,6 +68,8 @@ destroying the child unlinks it (waiting for a parent request running it on anot
 - A wheel fire that loses to a request still running its callbacks on another thread waits for
   them (`cancel_state::settle`, the `delivering` bit), so whatever they post is queued when the
   fire returns and a driver that then finds its queue empty has really lost its wake.
+  That wait blocks the fire's driver or asio loop for as long as those callbacks run, preemption
+  of the cancelling thread included.
 - `expired()` is `reason == deadline`. A deadline linked to a parent that was requested first
   reports the parent's reason.
 - A timer that cannot start throws from the constructor and frees the state.
