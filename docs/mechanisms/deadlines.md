@@ -26,34 +26,38 @@ state, and arming allocates nothing more. On any other scheduler (one whose `sta
 return a `wheel_timer`), the state carries no entry and links only when there is a parent. The
 wheel holds one reference to the state while the entry is filed:
 
-- `start_timer` takes the reference from the `deadline_fire` it is given (`task.hh:1382`) and
+- `start_timer` takes the reference from the `deadline_fire` it is given (`task.hh:1393`) and
   files the entry with `arm`.
 - The entry's fire, `on_wheel`, requests `cancel_reason::deadline` unless the deadline is
   disarmed, then releases the reference.
-- Destroying the deadline sets the disarm bit, then its `wheel_timer` (`task.hh:1399`) hands the
-  state to the scheduler's `drop_timer`, which unfiles the entry with `cancel` and releases the
-  reference.
+- Destroying the deadline sets the disarm bit, then its `wheel_timer` (`task.hh:1412`) hands the
+  state to the scheduler's static `drop_timer`, which unfiles the entry with `cancel` and releases
+  the reference. On `inline_scheduler` and `blocking_scheduler` it reads the scheduler only while
+  the entry is armed, and their destruction fires every entry off the wheel, so a deadline may
+  outlive them.
 
 ## On each scheduler
 
-- `inline_scheduler` files in place (`task.hh:1443`), so its deadlines are created and destroyed
+- `inline_scheduler` files in place (`task.hh:1456`), so its deadlines are created and destroyed
   on the thread that runs it. `advance(ns)` moves the manual clock and
   expires the wheel, so a five-second deadline fires with no real time passing. `drop_timer`
   cancels an armed entry in place. A fire's callback may `post_call` a hop to the scheduler; it
   runs in the next `run()`, in order with posted resumes.
-- `blocking_scheduler` files in place too (`task.hh:1455`), on its driving thread, and
-  `drive()` expires the wheel on the steady clock whenever its queue is empty. It sleeps toward
-  `next()`, woken early by a `post` or `post_call` from any thread, and never without an armed
-  timer. Destroyed, it releases the wheel's owner binding, so the wheel fires what is still filed
-  `false` on the destroying thread.
+- `blocking_scheduler` files in place too (`task.hh:1470`), on its driving thread (`arm` and
+  `cancel` assert it), and `drive()` expires the wheel on the steady clock after each pass over
+  what was queued when the pass began, so a task re-posting itself cannot hold off a fire. With
+  nothing queued it sleeps while `may_wait()` holds, toward `next()` or, with no timer armed,
+  until a post; a `post` or `post_call` from any thread wakes it early. `drive(done)` waits only
+  while a timer is armed. Destroyed, it releases the wheel's owner binding, so the wheel fires
+  what is still filed `false` on the destroying thread.
 - `asio_scheduler` (`task_asio.hh:161`) files at once on its loop thread and posts the filing from
   any other thread. One `asio::steady_timer` wakes the loop at the wheel's `next()`. Its executor
   runs on one thread, an `io_context` run by one thread: with a strand over a multi-threaded
   `io_context` the posted filings change threads and the wheel's Debug owner check fires. Destroying a
   deadline unfiles it at once on the loop and posts the unfile from elsewhere. An unfile that
   empties the wheel cancels the wake, so `run()` returns. `close()` releases the wheel's owner
-  binding. After it, deadlines neither file nor unfile; `arm` and `cancel` work on teardown's
-  thread, so an entry a driver armed (a group's) unlinks in place in phase 3, after
+  binding. After it, deadlines neither file nor unfile; `cancel` works on teardown's thread
+  (`arm` does not), so an entry a driver armed (a group's) unlinks in place in phase 3, after
   `destroy_roots()`. Destroying the scheduler destroys the wheel, which drops what is still
   filed (teardown phases 2 to 4, `asio-scheduler-teardown.md`).
 
@@ -65,8 +69,9 @@ Kronuz/wheel states three rules for its users. task keeps each one:
    releases the reference. Nothing arms or cancels that entry again. `asio_scheduler`'s wheel
    dies with deadlines' entries filed (their unfiles were posted to a stopped loop, or their
    frames were destroyed by `destroy_roots()`), and the scheduler is closed first, so no deadline
-   files or unfiles. `inline_scheduler` and `blocking_scheduler` outlive their deadlines, and
-   each deadline cancels its own entry.
+   files or unfiles. On `inline_scheduler` and `blocking_scheduler` a deadline cancels its own
+   entry while the scheduler lives; one outliving it finds its entry fired `false` and touches
+   nothing of the scheduler.
 2. **A fire may destroy its own entry.** When the deadline is already gone, the wheel holds the
    last reference, and the release in `on_wheel` frees the state the entry lives in. The wheel
    never touches an entry after its fire.
@@ -86,8 +91,8 @@ to 2.2 ms late in all (Debug and ASan+UBSan, macOS). On `asio_scheduler` it may 
 destroyed on any thread, before or after its expiry; on `inline_scheduler` and
 `blocking_scheduler`, on the thread that runs it. Once
 destroyed it requests nothing. Its `time_point` is on `S::clock` when the scheduler declares one,
-else on `steady_clock`. Its `wheel_timer` points at the scheduler, so the scheduler outlives the
-deadline.
+else on `steady_clock`. Its `wheel_timer` points at the scheduler: an `asio_scheduler` outlives
+its deadlines; an `inline_scheduler` or `blocking_scheduler` may die first.
 
 ## Tests
 
@@ -108,12 +113,21 @@ deadline.
   through it never fires), `far` (an entry past the clock's range does not spin the loop),
   `loops` (a parent on one loop, linked children made and destroyed on another while it fires),
   `roots` (`destroy_roots()` of frames holding deadlines, then a group's entry cancelled on
-  teardown's thread). `offloop-arm`, not in the default run, cancels off a running loop and must
-  abort on the owner assertion.
+  teardown's thread). `offloop-arm` (a cancel off a running loop) and `closed-arm` (an arm on a
+  closed scheduler), not in the default run, must abort on the scheduler's assertion; each exits
+  0 only without one.
 - `test/blocking_test.cc`: `blocking_scheduler` under the blocking entry's cases: a cross-thread
   cancel wakes a sleep toward a 30 s deadline, a 200 ms deadline fires on the steady clock, a
   lost wake returns at once with or without a live token, 300 cross-thread cancels, and `post`
-  and `post_call` from another thread cut a sleep short.
+  and `post_call` from another thread cut a sleep short. `wakes-unarmed`: with nothing armed and
+  `may_wait()` true, a post wakes it, 5,000 rounds with the post around the decision to sleep;
+  `starve`: a call re-posting itself does not hold off a 20 ms timer; `late`: a deadline outliving
+  its scheduler touches nothing of it. `offthread-cancel`, not in the default run, must abort.
+- `test/wheel_mutant.py NAME` builds a test against one mutant and exits 0 when it is killed:
+  `rearm-fires-early` (wheel.hh; `deadline_test reentry`, `model`), `unarmed-returns`
+  (`wakes-unarmed`), `expire-when-idle` (`starve`), `drop-calls-dead-scheduler` (`late` under
+  ASan), `blocking-cancel-unchecked` (`offthread-cancel`), `closed-arm-allowed`
+  (`deadline_asio_test closed-arm`).
 - `test/deadline_alloc_test.cc`: no allocation per deadline once the pool is warm, on
   `inline_scheduler`, `blocking_scheduler` and `asio_scheduler`.
 - `test/asio_test.cc` and `test/sync_test.cc` run the deadline contract unchanged.

@@ -15,7 +15,9 @@
 //              teardown's thread, a group's entry is cancelled there after them, and the
 //              destroyed scheduler's wheel releases the deadlines' states
 //   offloop-arm   the control, not in `all`: an entry cancelled through scheduler_ref off a
-//              running loop; the owner assertion aborts (Debug)
+//              running loop; the owner assertion aborts (Debug); it exits 0 only without one
+//   closed-arm    the control, not in `all`: an entry armed on a closed scheduler off its
+//              loop; the scheduler's assertion aborts (Debug); it exits 0 only without one
 // Every frame and cancel state is freed at the end (TASK_COUNT_FRAMES).
 #define TASK_COUNT_FRAMES 1
 #include "task_asio.hh"
@@ -308,13 +310,28 @@ int offloop_arm() {
 	std::printf("offloop-arm: no assertion\n");
 	guard.reset();
 	runner.join();
-	return 1;
+	return 0;
+}
+
+int closed_arm() {
+	asio::io_context io;
+	task::asio_scheduler s(io.get_executor());
+	s.close();
+	wheel::timer_entry e;
+	e.fire = [](wheel::timer_entry&, bool) noexcept {};
+	std::printf("closed-arm: arming on a closed scheduler (expected: the assertion aborts)\n");
+	std::fflush(stdout);
+	task::scheduler_ref::of(s).arm(e, s.now() + 60'000'000'000ull);
+	std::printf("closed-arm: no assertion\n");
+	task::scheduler_ref::of(s).cancel(e);
+	return 0;
 }
 }  // namespace
 
 int main(int argc, char** argv) {
 	const std::string_view only = argc > 1 ? argv[1] : "all";
 	if (only == "offloop-arm") { return offloop_arm(); }
+	if (only == "closed-arm") { return closed_arm(); }
 	const auto baseline = task::detail::live_frames();
 	if (only == "all" || only == "offloop") { offloop(); }
 	if (only == "all" || only == "teardown") { teardown(); }

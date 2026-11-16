@@ -40,10 +40,23 @@ executor pass.
 
 `blocking_scheduler` is the blocking entry's: one thread drives it with `drive(done,
 may_wait)`, and `post` and `post_call` are thread-safe (a mutex-guarded queue, signalled under
-the lock so the driver may destroy it as soon as it sees its work). With nothing queued, `drive`
-expires the wheel, checks `done`, and sleeps on a condition variable toward the wheel's `next()`
-only when a timer is armed and `may_wait()` holds; otherwise it returns false at once, so a lost
-wake is reported, never slept through, whatever tokens another thread holds.
+the lock so the driver may destroy it as soon as it sees its work). Each pass runs what was
+queued when it began, then expires the wheel and checks `done`, so a task re-posting itself
+cannot hold off a due timer. With nothing queued and `done` false, it sleeps on a condition
+variable while `may_wait()` holds: toward the wheel's `next()`, or with no timer armed until a
+post. `may_wait()` false returns false at once. `drive(done)` waits only while a timer is armed,
+so a lost wake is reported, never slept through, whatever tokens another thread holds; `arm` and
+`cancel` assert they run on the driving thread.
+
+Its callers choose `may_wait`:
+
+- Xapiand's `engine::BlockingScheduler::drive(done)`, which waits for WorkPool chores to post
+  back with no deadline, is `drive([&] { return done; }, [] { return true; })` inside its
+  `HostScope` (`drive` sets only `running_on`): it returns only when `done`, as today. Its
+  `arm` and `Armed` timers are `arm` and `cancel` on the wheel, on the driving thread, as its
+  frames already are; its `post_demoted` is `post`.
+- Detent's blocking entry (async-drivers D5) passes "an operation deadline is armed", so a
+  consensus group's own timer does not keep it asleep, and reports `false` as a stall.
 
 ## Timers on the wheel
 
@@ -63,8 +76,10 @@ What runs on a loop's wheel, and what stays off it:
   `asio_scheduler`, and every timer a driver arms through `scheduler_ref::arm`, such as a
   consensus group's one entry, re-armed after each step.
 - Next onto it, in their own repositories: Xapiand's `engine::Host` timers (`AsioHost::arm`,
-  one `asio::steady_timer` and three allocations per timer, and `BlockingScheduler::arm`, which
-  becomes `blocking_scheduler`); the call sites arming through `engine::Host` do not change.
+  one `asio::steady_timer` and three allocations per timer, and `BlockingScheduler`, which
+  becomes `blocking_scheduler` driven as above); the call sites arming through `engine::Host` do
+  not change. `AsioHost` arms on its loop; a timer `destroy_roots` destroys on teardown's thread
+  cancels there, which `asio_scheduler::cancel` allows once closed (`arm` it does not).
 - Staying `asio::steady_timer`s until something moves them: Kronuz/reactor's event timers and
   Kronuz/http's. Reactor's lag probe stays off the wheel for good: `next()` wakes at a slot's
   end, up to 1 ms late, which a 1 ms stall measurement would read as lag.

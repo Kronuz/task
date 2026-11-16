@@ -128,21 +128,21 @@ public:
 
 	using clock = std::chrono::steady_clock;
 
-	// On the executor's thread, or teardown's once closed: files e on the loop's timers at `at`
-	// (nanoseconds, as now()), or moves it if armed, and wakes the loop by the end of its 1 ms
-	// slot. Its fire runs on the loop, at most one tick plus the loop's wake latency late. Once
-	// closed, nothing fires: the destroyed scheduler fires what is still armed with expired false.
+	// On the executor's thread: files e on the loop's timers at `at` (nanoseconds, as now()), or
+	// moves it if armed, and wakes the loop by the end of its 1 ms slot. Its fire runs on the
+	// loop, at most one tick plus the loop's wake latency late.
 	void arm(wheel::timer_entry& e, std::uint64_t at) {
-		assert(!io_ || runs_here() || closed());
+		assert((!io_ || runs_here()) && "asio_scheduler::arm off the loop");
 		timer_loop& t = timers();
 		t.wheel.arm(e, at);
 		constexpr std::uint64_t tick = wheel::timer_wheel::tick;
 		wake_by(at > wheel::timer_wheel::never - tick ? at : (at / tick + 1) * tick);
 	}
 	// On the executor's thread, or teardown's once closed: takes e off the timers; true if it was
-	// armed. The last one cancels the wake, so run() may return.
+	// armed. The last one cancels the wake, so run() may return. Once closed, nothing fires: the
+	// destroyed scheduler fires what is still armed with expired false.
 	bool cancel(wheel::timer_entry& e) noexcept {
-		assert(!io_ || runs_here() || closed());
+		assert((!io_ || runs_here() || closed()) && "asio_scheduler::cancel off the loop");
 		if (!e.armed()) { return false; }
 		timer_loop& t = *timers_;
 		t.wheel.cancel(e);
@@ -199,13 +199,14 @@ private:
 	void unfile(detail::timed_cancel_state* s) noexcept {
 		if (cancel(*s)) { s->release(); }
 	}
-	// A deadline's timer died: unfile it on the loop; once closed the wheel drops it.
-	void drop_timer(detail::timed_cancel_state* s) noexcept {
-		if (runs_here()) {
-			unfile(s);
-		} else if (!closed()) {
-			asio::post(executor_, [this, f = detail::deadline_fire(s)] {
-				if (!closed()) { unfile(f.timed()); }
+	// A deadline's timer died, on any thread while the scheduler lives: unfile it on the loop;
+	// once closed the wheel drops it.
+	static void drop_timer(asio_scheduler* self, detail::timed_cancel_state* s) noexcept {
+		if (self->runs_here()) {
+			self->unfile(s);
+		} else if (!self->closed()) {
+			asio::post(self->executor_, [self, f = detail::deadline_fire(s)] {
+				if (!self->closed()) { self->unfile(f.timed()); }
 			});
 		}
 	}

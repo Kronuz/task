@@ -10,7 +10,14 @@
 //                         returned (review R3): a live token does not hold off the stall
 //   rounds                300 cross-thread cancels at 0-2 ms, each cancelled, none dropped
 //   wakes                 post and post_call from another thread cut a sleep toward a far timer
-//                         short; with nothing armed, or may_wait() false, drive() never sleeps
+//                         short; drive(done) with nothing armed, or may_wait() false, never sleeps
+//   wakes-unarmed         with nothing armed and may_wait() true, drive() sleeps until a post
+//                         or post_call from another thread wakes it; 5,000 rounds with the post
+//                         landing around drive()'s decision to sleep, none slept through
+//   starve                a call re-posting itself does not hold off a due timer
+//   late                  a deadline outliving its scheduler is freed without touching it
+//   offthread-cancel      the control, not in `all`: cancel off the driving thread aborts on
+//                         the scheduler's assertion (Debug); it exits 0 only without one
 // Every frame and cancel state is freed at the end (TASK_COUNT_FRAMES). Run under TSan.
 #define TASK_COUNT_FRAMES 1
 #include "task.hh"
@@ -211,10 +218,129 @@ void wakes() {
 		std::printf("wakes may-wait-false ok\n");
 	}
 }
+
+void spin(int n) {
+	for (int i = 0; i < n; ++i) { std::atomic_signal_fence(std::memory_order_seq_cst); }
+}
+
+void flag(void* p) { static_cast<std::atomic<bool>*>(p)->store(true); }
+
+void unarmed() {
+	const auto always = [] { return true; };
+	for (const bool by_call : {false, true}) {  // nothing armed; another thread posts at 20 ms
+		task::blocking_scheduler s;
+		std::atomic<bool> ran{false};
+		const auto start = steady::now();
+		std::thread other([&] {
+			std::this_thread::sleep_for(20ms);
+			if (by_call) {
+				s.post_call(&flag, &ran);
+			} else {
+				task::spawn(task::scheduler_ref::of(s), [](std::atomic<bool>& r) -> task::task<void> {
+					r = true;
+					co_return;
+				}(ran));
+			}
+		});
+		CHECK(s.drive([&] { return ran.load(); }, always));
+		const auto elapsed = steady::now() - start;
+		other.join();
+		CHECK(elapsed >= 20ms && elapsed < 1s && s.armed_timers() == 0);
+		std::printf("wakes-unarmed %s elapsed_ms=%.1f ok\n", by_call ? "post_call" : "post", std::chrono::duration<double, std::milli>(elapsed).count());
+	}
+	// A slept-through post never wakes: the watchdog fails a round stuck for 10 s instead of hanging.
+	constexpr int rounds = 5'000;
+	std::atomic<int> round{0};
+	std::thread watchdog([&] {
+		int seen = -1;
+		auto since = steady::now();
+		while (round.load() < rounds) {
+			std::this_thread::sleep_for(10ms);
+			if (const int now = round.load(); now != seen) {
+				seen = now;
+				since = steady::now();
+			} else if (steady::now() - since > 10s) {
+				std::fprintf(stderr, "FAIL %s:%d: round %d: a drive() slept through a post\n", __FILE__, __LINE__, now);
+				std::_Exit(1);
+			}
+		}
+	});
+	std::mt19937 random(11);
+	for (int r = 0; r < rounds; ++r) {
+		task::blocking_scheduler s;
+		std::atomic<bool> ran{false};
+		const int before_post = int(random() % 2'000), in_window = int(random() % 2'000);
+		std::thread other([&] {
+			spin(before_post);
+			s.post_call(&flag, &ran);
+		});
+		CHECK(s.drive([&] { return ran.load(); }, [&] {
+			spin(in_window);  // between drive()'s check of the queue and its sleep
+			return true;
+		}));
+		other.join();
+		++round;
+	}
+	watchdog.join();
+	std::printf("wakes-unarmed rounds=%d none slept through ok\n", rounds);
+}
+
+// A timer entry whose fire stops a call that keeps re-posting itself.
+struct reposting : wheel::timer_entry {
+	task::blocking_scheduler* s;
+	steady::time_point start = steady::now();
+	bool fired = false;
+	std::size_t runs = 0;
+	static void on_fire(wheel::timer_entry& e, bool) noexcept { static_cast<reposting&>(e).fired = true; }
+	static void again(void* p) {
+		auto* self = static_cast<reposting*>(p);
+		++self->runs;
+		if (self->fired) { return; }
+		CHECK(steady::now() - self->start < 2s);  // the timer is held off
+		self->s->post_call(&again, self);
+	}
+};
+
+void starve() {
+	task::blocking_scheduler s;
+	reposting r;
+	r.s = &s;
+	r.fire = &reposting::on_fire;
+	CHECK(task::scheduler_ref::of(s).arm(r, s.now() + 20'000'000ull));
+	s.post_call(&reposting::again, &r);
+	CHECK(s.drive([&] { return r.fired; }));
+	const auto elapsed = steady::now() - r.start;
+	CHECK(elapsed >= 20ms && elapsed < 1s && s.armed_timers() == 0);
+	std::printf("starve runs=%zu elapsed_ms=%.1f ok\n", r.runs, std::chrono::duration<double, std::milli>(elapsed).count());
+}
+
+void late() {
+	auto s = std::make_unique<task::blocking_scheduler>();
+	std::optional<task::deadline<task::blocking_scheduler>> d;
+	d.emplace(*s, steady::now() + 60s);
+	const task::cancel_token token = d->token();
+	CHECK(s->armed_timers() == 1);
+	s.reset();  // fires the entry off the wheel with expired false
+	d.reset();  // touches nothing of the scheduler
+	CHECK(!token.requested());
+	std::printf("late ok\n");
+}
+
+int offthread_cancel() {
+	task::blocking_scheduler s;
+	wheel::timer_entry e;
+	e.fire = [](wheel::timer_entry&, bool) noexcept {};
+	std::printf("offthread-cancel: cancelling off the driving thread (expected: the assertion aborts)\n");
+	std::fflush(stdout);
+	std::thread([&] { s.cancel(e); }).join();
+	std::printf("offthread-cancel: no assertion\n");
+	return 0;
+}
 }  // namespace
 
 int main(int argc, char** argv) {
 	const std::string_view only = argc > 1 ? argv[1] : "all";
+	if (only == "offthread-cancel") { return offthread_cancel(); }
 	const auto baseline = task::detail::live_frames();
 	if (only == "all" || only == "cancel-thread") { CHECK(report("cancel-thread", blocking(30s, 50'000, true), "cancelled", 50, 1'000)); }
 	if (only == "all" || only == "deadline-steady") { CHECK(report("deadline-steady", blocking(200ms, -1, false), "cancelled", 200, 1'200)); }
@@ -224,6 +350,9 @@ int main(int argc, char** argv) {
 	}
 	if (only == "all" || only == "rounds") { rounds(300); }
 	if (only == "all" || only == "wakes") { wakes(); }
+	if (only == "all" || only == "wakes-unarmed") { unarmed(); }
+	if (only == "all" || only == "starve") { starve(); }
+	if (only == "all" || only == "late") { late(); }
 	CHECK(task::detail::live_frames() == baseline);
 	std::printf("blocking_test: ok\n");
 	return 0;

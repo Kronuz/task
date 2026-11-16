@@ -453,7 +453,7 @@ public:
 
 private:
 	friend class detail::wheel_timer<inline_scheduler>;
-	void drop_timer(detail::timed_cancel_state* s) noexcept;
+	static void drop_timer(inline_scheduler* self, detail::timed_cancel_state* s) noexcept;
 	// The timers advance() fires, made on first use.
 	wheel::timer_wheel& wheel() {
 		if (!wheel_) { wheel_ = std::make_unique<wheel::timer_wheel>(now_); }
@@ -468,9 +468,10 @@ private:
 
 // A scheduler one thread drives with drive(), on a steady clock: post and post_call are
 // thread-safe and wake its wait; its timers are a wheel armed, cancelled and expired on the
-// driving thread. It sleeps only toward an armed timer: with nothing queued and no timer it may
-// wait for, drive() returns false at once, a lost wake (async-drivers D5, step 5). It owns no
-// roots; destroyed, it drops what is queued unrun and fires what is armed with expired false.
+// driving thread. With nothing queued, drive() sleeps while its may_wait() holds, toward the
+// earliest timer or, with none armed, until a post; by default only while a timer is armed, so
+// a lost wake returns false at once (async-drivers D5, step 5). It owns no roots; destroyed, it
+// drops what is queued unrun and fires what is armed with expired false.
 class blocking_scheduler {
 public:
 	using clock = std::chrono::steady_clock;
@@ -494,9 +495,13 @@ public:
 
 	// The driving thread: files e at `at` (nanoseconds, as now()), or moves it if armed; it fires
 	// in drive(), at most one tick late.
-	void arm(wheel::timer_entry& e, std::uint64_t at) { wheel().arm(e, at); }
+	void arm(wheel::timer_entry& e, std::uint64_t at) {
+		assert(runs_here() && "blocking_scheduler::arm off the driving thread");
+		wheel().arm(e, at);
+	}
 	// The driving thread: takes e off the timers; true if it was armed.
 	bool cancel(wheel::timer_entry& e) noexcept {
+		assert(runs_here() && "blocking_scheduler::cancel off the driving thread");
 		if (!e.armed()) { return false; }
 		wheel_->cancel(e);
 		return true;
@@ -506,15 +511,16 @@ public:
 	template <typename F>
 	detail::wheel_timer<blocking_scheduler> start_timer(clock::time_point at, F&& on_fire);
 
-	// Runs queued work and due timers on the calling thread until done() holds, then returns
-	// true. With nothing queued it sleeps toward the earliest timer, cut short by a post, while
-	// may_wait() holds; with no timer armed, or may_wait() false, it returns false at once.
+	// Runs queued work and due timers on the calling thread until done() holds with nothing
+	// queued, then returns true. Each pass runs what was queued when it began, then expires the
+	// wheel. With nothing queued, while may_wait() holds it sleeps toward the earliest timer, or
+	// with none armed until a post; a post cuts either short. may_wait() false returns false.
 	template <typename Done, typename MayWait>
 	bool drive(Done&& done, MayWait&& may_wait) {
 		driver_.store(std::this_thread::get_id(), std::memory_order_relaxed);
 		std::unique_lock lock(mutex_);
 		for (;;) {
-			if (!ready_.empty()) {
+			for (std::size_t n = ready_.size(); n > 0; --n) {  // a task re-posting itself waits for the next pass
 				const detail::queued_call c = ready_.front();
 				ready_.pop_front();
 				lock.unlock();
@@ -523,30 +529,35 @@ public:
 					c();
 				}
 				lock.lock();
-				continue;
 			}
 			lock.unlock();
 			if (wheel_) { wheel_->expire(now()); }
 			const bool finished = done();
+			const bool waits = !finished && may_wait();
 			const std::uint64_t next = wheel_ ? wheel_->next() : wheel::timer_wheel::never;
-			const bool waits = next != wheel::timer_wheel::never && !finished && may_wait();
 			lock.lock();
 			if (!ready_.empty()) { continue; }  // a fire, or another thread, queued work
 			if (finished) { return true; }
 			if (!waits) { return false; }
+			const auto queued = [&] { return !ready_.empty(); };
+			if (next == wheel::timer_wheel::never) {  // nothing to fire: only a post ends the wait
+				wake_.wait(lock, queued);
+				continue;
+			}
 			constexpr std::uint64_t latest = std::uint64_t(std::chrono::nanoseconds::max().count()) / 2;
 			const auto until = next > latest ? clock::now() + std::chrono::hours(24) : clock::time_point(std::chrono::nanoseconds(std::int64_t(next)));
-			wake_.wait_until(lock, until, [&] { return !ready_.empty(); });
+			wake_.wait_until(lock, until, queued);
 		}
 	}
+	// Waits only while a timer is armed (one the clock reaches): with none, a lost wake.
 	template <typename Done>
 	bool drive(Done&& done) {
-		return drive(std::forward<Done>(done), [] { return true; });
+		return drive(std::forward<Done>(done), [this] { return wheel_ && wheel_->next() != wheel::timer_wheel::never; });
 	}
 
 private:
 	friend class detail::wheel_timer<blocking_scheduler>;
-	void drop_timer(detail::timed_cancel_state* s) noexcept;
+	static void drop_timer(blocking_scheduler* self, detail::timed_cancel_state* s) noexcept;
 	void push(detail::queued_call c) {
 		std::lock_guard lock(mutex_);
 		ready_.push_back(c);
@@ -1394,14 +1405,16 @@ struct deadline_fire {
 };
 
 // What start_timer returns on a scheduler with a wheel: destroying it hands the deadline's
-// entry to the scheduler's drop_timer, which unfiles it on the wheel's thread.
+// entry to the scheduler's static drop_timer, which unfiles it on the wheel's thread. On
+// inline_scheduler and blocking_scheduler it touches the scheduler only while the entry is
+// armed, so a deadline may outlive them (their destruction fires every entry off the wheel).
 template <typename S>
 class wheel_timer {
 public:
 	wheel_timer(S& s, timed_cancel_state* st) noexcept : s_(&s), st_(st) {}
 	wheel_timer(const wheel_timer&) = delete;
 	wheel_timer& operator=(const wheel_timer&) = delete;
-	~wheel_timer() { s_->drop_timer(st_); }
+	~wheel_timer() { S::drop_timer(s_, st_); }
 
 private:
 	S* s_;
@@ -1447,8 +1460,10 @@ detail::wheel_timer<inline_scheduler> inline_scheduler::start_timer(clock::time_
 	return {*this, s};
 }
 
-inline void inline_scheduler::drop_timer(detail::timed_cancel_state* s) noexcept {
-	if (cancel(*s)) { s->release(); }
+inline void inline_scheduler::drop_timer(inline_scheduler* self, detail::timed_cancel_state* s) noexcept {
+	if (!s->armed()) { return; }
+	self->wheel_->cancel(*s);
+	s->release();
 }
 
 template <typename F>
@@ -1459,8 +1474,10 @@ detail::wheel_timer<blocking_scheduler> blocking_scheduler::start_timer(clock::t
 	return {*this, s};
 }
 
-inline void blocking_scheduler::drop_timer(detail::timed_cancel_state* s) noexcept {
-	if (cancel(*s)) { s->release(); }
+inline void blocking_scheduler::drop_timer(blocking_scheduler* self, detail::timed_cancel_state* s) noexcept {
+	if (!s->armed()) { return; }
+	self->cancel(*s);
+	s->release();
 }
 
 // A time slice. checkpoint() is free while the slice lasts; once it is spent, it
