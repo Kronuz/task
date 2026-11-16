@@ -1,4 +1,4 @@
-> Status: CURRENT (2026-11-03) how `cancel_source`, `cancel_token`, `cancel_callback`, `deadline` and `budget::checkpoint` work, read from `task.hh` at task:d080786.
+> Status: CURRENT (2026-11-15) how `cancel_source`, `cancel_token`, `cancel_callback`, `deadline` and `budget::checkpoint` work, read from `task.hh` on quest/detent/drivers-task-wheel.
 
 # Cancellation
 
@@ -11,7 +11,7 @@ budget checkpoint throws.
 ## State
 
 ```
-cancel_state  (pooled, refcounted; task.hh:835)
+cancel_state  (pooled, refcounted; task.hh:1053)
   word_     requested | locked (spin) | disarmed | linked bits, reason in the high 32 bits
   head_     intrusive list of cancel_node registrations
   running_, requester_, epoch_   the callback being run, its thread, a counter bumped after each
@@ -25,7 +25,7 @@ default) has no state: it is never requested, has reason `none`, and registers n
 
 - `request(reason)` is first-wins: one compare-exchange sets `requested`, the reason and the
   lock bit together; later calls return false. `none` is stored as `requested`
-  (`task.hh:852`, `:1055`).
+  (`task.hh:1072`, `:1304`).
 - `requested()` and `reason()` are one acquire load of the same word, so a token never reads
   requested with reason `none`. The request is the release: a thread that sees `requested()`
   sees every write made before `request()`.
@@ -35,7 +35,7 @@ default) has no state: it is never requested, has reason `none`, and registers n
 
 ## Callbacks
 
-`cancel_callback cb(token, f)` runs `f()` or `f(reason)` once (`task.hh:1072`).
+`cancel_callback cb(token, f)` runs `f()` or `f(reason)` once (`task.hh:1326`).
 
 - Registered before the request: runs on the requester. After: runs in the constructor. Empty
   token or destroyed registration: never runs. Registering allocates nothing (the node lives in
@@ -49,7 +49,7 @@ default) has no state: it is never requested, has reason `none`, and registers n
 ## Linked sources
 
 `cancel_source(parent_token)` registers a node on the parent whose callback requests the child
-with the parent's reason (`task.hh:958`). A child's request does not reach the parent. A
+with the parent's reason (`task.hh:1191`). A child's request does not reach the parent. A
 child of an already-requested parent is born requested, without a link; one that loses the
 race with a request registers, fails, and requests itself. The child holds its parent's state;
 destroying the child unlinks it (waiting for a parent request running it on another thread).
@@ -57,9 +57,9 @@ destroying the child unlinks it (waiting for a parent request running it on anot
 ## deadline
 
 `deadline<S>(s, at, parent)` is a source linked to `parent` plus a timer from `s.start_timer(at, fire)`
-(`task.hh:1279`). `fire` holds a reference to the state and calls
-`request(deadline, forbid = disarmed_bit)`. On `inline_scheduler` and `asio_scheduler` the state
-carries the wheel entry `start_timer` files (`deadlines.md`).
+(`task.hh:1421`). `fire` holds a reference to the state and calls
+`request(deadline, forbid = disarmed_bit)`. On `inline_scheduler`, `blocking_scheduler` and
+`asio_scheduler` the state carries the wheel entry `start_timer` files (`deadlines.md`).
 
 - `~deadline` sets the `disarmed` bit, then the timer dies. A fire already under way when the
   timer dies holds the state alive, and its request fails on the bit. So a deadline may be
@@ -70,7 +70,7 @@ carries the wheel entry `start_timer` files (`deadlines.md`).
 
 ## budget
 
-`budget(slice, token)` pairs a time slice with a token (`task.hh:1153`).
+`budget(slice, token)` pairs a time slice with a token (`task.hh:1477`).
 `co_await b.checkpoint()` is ready (no suspension) when the token is requested, the slice is
 not spent, or no scheduler is current. `await_resume` throws `cancelled` when the token is
 requested, whether the checkpoint suspended or not; a spent slice on a scheduler requeues the

@@ -22,8 +22,9 @@ it.
 - **Executor affinity.** A task that finishes on another scheduler posts its awaiter
   back to the awaiter's own.
 - **Bring your own loop.** A scheduler is anything with `post(handle)` and `now()`; the
-  library owns no run queue. `inline_scheduler` is deterministic for tests, and
-  `asio_scheduler` runs on an Asio executor.
+  library owns no run queue. `inline_scheduler` is deterministic for tests,
+  `blocking_scheduler` runs a task on the calling thread and reports a lost wake instead of
+  sleeping through it, and `asio_scheduler` runs on an Asio executor.
 - **Deadlines on one timer wheel per loop.** Each scheduler owns a
   [Kronuz/wheel](https://github.com/Kronuz/wheel) timer wheel, and a deadline's entry lives in
   its cancel state, so arming allocates nothing. Tests run deadlines on a manual clock.

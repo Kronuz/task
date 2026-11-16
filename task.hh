@@ -367,6 +367,15 @@ class inline_scheduler;
 namespace detail {
 // The inline_scheduler whose run() is draining on this thread, if any.
 inline thread_local inline_scheduler* draining_scheduler = nullptr;
+
+// A queued resume or post_call: fn(arg), a resume being resume_handle(h.address()).
+struct queued_call {
+	void (*fn)(void*);
+	void* arg;
+	static void resume_handle(void* h) { std::coroutine_handle<>::from_address(h).resume(); }
+	static queued_call of(std::coroutine_handle<> h) noexcept { return {&resume_handle, h.address()}; }
+	void operator()() const { fn(arg); }
+};
 }
 
 // A deterministic single-threaded scheduler: FIFO, demoted handles only when nothing
@@ -384,8 +393,10 @@ public:
 		static constexpr bool is_steady = true;
 	};
 
-	void post(std::coroutine_handle<> h) { ready_.push_back(h); }
+	void post(std::coroutine_handle<> h) { ready_.push_back(detail::queued_call::of(h)); }
 	void post_demoted(std::coroutine_handle<> h) { demoted_.push_back(h); }
+	// On its own thread, as post: queues fn(arg) among the ready handles, in order.
+	void post_call(void (*fn)(void*), void* arg) { ready_.push_back({fn, arg}); }
 	std::uint64_t now() const noexcept { return now_; }
 	// Moves the clock and fires every timer due by then.
 	void advance(std::uint64_t ns) noexcept {
@@ -423,11 +434,16 @@ public:
 		detail::draining_scheduler = this;
 		std::size_t n = 0;
 		while (!stop() && (!ready_.empty() || !demoted_.empty())) {
-			auto& queue = ready_.empty() ? demoted_ : ready_;
-			auto h = queue.front();
-			queue.pop_front();
 			detail::slice_start = cycles::read();  // each resume is its own slice
-			h.resume();
+			if (!ready_.empty()) {
+				const detail::queued_call c = ready_.front();
+				ready_.pop_front();
+				c();
+			} else {
+				const auto h = demoted_.front();
+				demoted_.pop_front();
+				h.resume();
+			}
 			++n;
 		}
 		return n;
@@ -444,9 +460,108 @@ private:
 		return *wheel_;
 	}
 
-	std::deque<std::coroutine_handle<>> ready_, demoted_;
+	std::deque<detail::queued_call> ready_;
+	std::deque<std::coroutine_handle<>> demoted_;
 	std::uint64_t now_ = 0;
 	std::unique_ptr<wheel::timer_wheel> wheel_;
+};
+
+// A scheduler one thread drives with drive(), on a steady clock: post and post_call are
+// thread-safe and wake its wait; its timers are a wheel armed, cancelled and expired on the
+// driving thread. It sleeps only toward an armed timer: with nothing queued and no timer it may
+// wait for, drive() returns false at once, a lost wake (async-drivers D5, step 5). It owns no
+// roots; destroyed, it drops what is queued unrun and fires what is armed with expired false.
+class blocking_scheduler {
+public:
+	using clock = std::chrono::steady_clock;
+
+	blocking_scheduler() = default;
+	blocking_scheduler(const blocking_scheduler&) = delete;
+	blocking_scheduler& operator=(const blocking_scheduler&) = delete;
+	~blocking_scheduler() {
+		if (wheel_) { wheel_->release(); }  // the driver is done: this thread drops what is armed
+	}
+
+	// Any thread. Each signals under the lock: once the driver sees its work it may return and
+	// the scheduler be destroyed, so nothing touches it after the unlock.
+	void post(std::coroutine_handle<> h) { push(detail::queued_call::of(h)); }
+	void post_call(void (*fn)(void*), void* arg) { push({fn, arg}); }
+	// True on the thread that drives it (the constructing thread until a drive()).
+	bool runs_here() const noexcept { return driver_.load(std::memory_order_relaxed) == std::this_thread::get_id(); }
+	std::uint64_t now() const noexcept {
+		return std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now().time_since_epoch()).count());
+	}
+
+	// The driving thread: files e at `at` (nanoseconds, as now()), or moves it if armed; it fires
+	// in drive(), at most one tick late.
+	void arm(wheel::timer_entry& e, std::uint64_t at) { wheel().arm(e, at); }
+	// The driving thread: takes e off the timers; true if it was armed.
+	bool cancel(wheel::timer_entry& e) noexcept {
+		if (!e.armed()) { return false; }
+		wheel_->cancel(e);
+		return true;
+	}
+	std::size_t armed_timers() const noexcept { return wheel_ ? wheel_->size() : 0; }
+	// Files task::deadline's entry at `at`, on the driving thread; destroyed there too.
+	template <typename F>
+	detail::wheel_timer<blocking_scheduler> start_timer(clock::time_point at, F&& on_fire);
+
+	// Runs queued work and due timers on the calling thread until done() holds, then returns
+	// true. With nothing queued it sleeps toward the earliest timer, cut short by a post, while
+	// may_wait() holds; with no timer armed, or may_wait() false, it returns false at once.
+	template <typename Done, typename MayWait>
+	bool drive(Done&& done, MayWait&& may_wait) {
+		driver_.store(std::this_thread::get_id(), std::memory_order_relaxed);
+		std::unique_lock lock(mutex_);
+		for (;;) {
+			if (!ready_.empty()) {
+				const detail::queued_call c = ready_.front();
+				ready_.pop_front();
+				lock.unlock();
+				{
+					running_on scope(scheduler_ref::of(*this));
+					c();
+				}
+				lock.lock();
+				continue;
+			}
+			lock.unlock();
+			if (wheel_) { wheel_->expire(now()); }
+			const bool finished = done();
+			const std::uint64_t next = wheel_ ? wheel_->next() : wheel::timer_wheel::never;
+			const bool waits = next != wheel::timer_wheel::never && !finished && may_wait();
+			lock.lock();
+			if (!ready_.empty()) { continue; }  // a fire, or another thread, queued work
+			if (finished) { return true; }
+			if (!waits) { return false; }
+			constexpr std::uint64_t latest = std::uint64_t(std::chrono::nanoseconds::max().count()) / 2;
+			const auto until = next > latest ? clock::now() + std::chrono::hours(24) : clock::time_point(std::chrono::nanoseconds(std::int64_t(next)));
+			wake_.wait_until(lock, until, [&] { return !ready_.empty(); });
+		}
+	}
+	template <typename Done>
+	bool drive(Done&& done) {
+		return drive(std::forward<Done>(done), [] { return true; });
+	}
+
+private:
+	friend class detail::wheel_timer<blocking_scheduler>;
+	void drop_timer(detail::timed_cancel_state* s) noexcept;
+	void push(detail::queued_call c) {
+		std::lock_guard lock(mutex_);
+		ready_.push_back(c);
+		wake_.notify_one();
+	}
+	wheel::timer_wheel& wheel() {
+		if (!wheel_) { wheel_ = std::make_unique<wheel::timer_wheel>(now()); }
+		return *wheel_;
+	}
+
+	std::atomic<std::thread::id> driver_{std::this_thread::get_id()};
+	std::mutex mutex_;
+	std::condition_variable wake_;
+	std::deque<detail::queued_call> ready_;
+	std::unique_ptr<wheel::timer_wheel> wheel_;  // the driving thread's
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -1298,7 +1413,7 @@ private:
 // A cancel source that a timer requests with cancel_reason::deadline at `at`, linked to
 // `parent`; `at` is on S::clock when S declares one, else on steady_clock. S provides
 // start_timer(time_point, F), which runs F once at the deadline; on a scheduler with a wheel
-// (inline_scheduler, asio_scheduler) the deadline's state carries the entry, so arming
+// (inline_scheduler, blocking_scheduler, asio_scheduler) the deadline's state carries the entry, so arming
 // allocates nothing more; elsewhere it carries none. The timer's callback holds the state and
 // requests only while the deadline is armed, so an expiry already queued when the deadline is
 // destroyed requests nothing.
@@ -1333,6 +1448,18 @@ detail::wheel_timer<inline_scheduler> inline_scheduler::start_timer(clock::time_
 }
 
 inline void inline_scheduler::drop_timer(detail::timed_cancel_state* s) noexcept {
+	if (cancel(*s)) { s->release(); }
+}
+
+template <typename F>
+detail::wheel_timer<blocking_scheduler> blocking_scheduler::start_timer(clock::time_point at, F&& on_fire) {
+	static_assert(std::is_same_v<std::remove_cvref_t<F>, detail::deadline_fire>, "a wheel's start_timer files task::deadline's entry");
+	detail::timed_cancel_state* s = on_fire.take();  // the wheel's reference
+	arm(*s, std::uint64_t(std::max<clock::rep>(0, std::chrono::duration_cast<std::chrono::nanoseconds>(at.time_since_epoch()).count())));
+	return {*this, s};
+}
+
+inline void blocking_scheduler::drop_timer(detail::timed_cancel_state* s) noexcept {
 	if (cancel(*s)) { s->release(); }
 }
 

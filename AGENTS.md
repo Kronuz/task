@@ -3,7 +3,8 @@
 ## Repo map
 
 ```
-task.hh            task<T>, scheduler concept and scheduler_ref, inline_scheduler, frame pool,
+task.hh            task<T>, scheduler concept and scheduler_ref, inline_scheduler,
+                   blocking_scheduler, frame pool,
                    spawn/run/sync_wait, yield/schedule_on, budget, cancellation, event,
                    cancel_token/source/callback, deadline, async_mutex (lock(token)), when_all.
 task_asio.hh       asio_scheduler (demoted, start_timer, roots, close/destroy_roots), await_asio
@@ -13,6 +14,11 @@ test/sync_test.cc  Slice, event, deadline, async_mutex, lock(token) orders, dest
                    event waiters at teardown, destructor asserts.
 test/asio_test.cc  asio_scheduler and await_asio: tokens, wrappers, the teardown phases, sizes.
 test/pool_off_test.cc  TASK_FRAME_POOL=0: every frame is an operator new.
+test/deadline_test.cc  Deadlines and timers on inline_scheduler's wheel: reentry, reference model,
+                   far deadlines, post_call. test/wheel_mutant.py builds it on a mutant wheel.
+test/deadline_asio_test.cc  asio_scheduler's wheel: off-loop deadlines, teardown with roots,
+                   two loops. test/deadline_alloc_test.cc  no allocation per deadline.
+test/blocking_test.cc  blocking_scheduler: cross-thread wakes, lost wakes, the blocking entry.
 bench/bench.cc     No-op task cost and allocations; Asio yield latency; the same two measurements on asio::awaitable.
 docs/API.md        The types and functions, and how to run a task.
 ```

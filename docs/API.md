@@ -17,8 +17,12 @@ explains how each piece works.
   queue. `inline_scheduler` is a deterministic one for tests and simulation, with a manual
   clock whose `advance(ns)` fires the timers it passes, and `asio_scheduler` runs on an Asio
   executor that runs on one thread: an `io_context` run by one thread, not a strand over a
-  multi-threaded one. Both declare a `clock`.
-- Timers: `inline_scheduler` and `asio_scheduler` own a `wheel::timer_wheel` from
+  multi-threaded one. `blocking_scheduler` runs on the thread that calls its
+  `drive(done[, may_wait])`, on the steady clock: `post` and `post_call` work from any thread and
+  wake its wait; it runs queued work and due timers until `done()` holds (returns true), and
+  sleeps only toward an armed timer while `may_wait()` holds, else returns false at once (a lost
+  wake). All three declare a `clock`.
+- Timers: `inline_scheduler`, `blocking_scheduler` and `asio_scheduler` own a `wheel::timer_wheel` from
   [Kronuz/wheel](https://github.com/Kronuz/wheel). On the scheduler's own thread,
   `arm(entry, at)` files a `wheel::timer_entry` to fire there at `at` (nanoseconds, as `now()`),
   or moves it, and wakes the loop by then; `cancel(entry)` unfiles it and returns whether it was
@@ -45,10 +49,10 @@ explains how each piece works.
   `deadline(sched, time_point, parent = {})` is a source its scheduler's timer requests
   with `cancel_reason::deadline`, at most one 1 ms tick late on a wheel, plus the loop's wake
   latency on `asio_scheduler`; `time_point` is on `sched`'s `clock` when it declares one, else
-  `steady_clock`, and `sched` supplies `start_timer` (`inline_scheduler` and `asio_scheduler`
-  file the deadline's own entry on their wheel). On `asio_scheduler` it may be created and
-  destroyed on any thread, before or after the expiry; on `inline_scheduler`, on the thread that
-  runs it. What `start_timer` returns decides what outlives the deadline: on task's schedulers
+  `steady_clock`, and `sched` supplies `start_timer` (task's three schedulers file the
+  deadline's own entry on their wheel). On `asio_scheduler` it may be created and destroyed on
+  any thread, before or after the expiry; on `inline_scheduler` and `blocking_scheduler`, on the
+  thread that runs it. What `start_timer` returns decides what outlives the deadline: on task's schedulers
   the scheduler itself; on a host such as Xapiand's `engine::Host`, what its timers hold (the
   `io_context`, or the blocking scheduler).
 - `event`: a one-shot completion. `co_await e` suspends until `e.set()` (any thread); each
@@ -73,7 +77,8 @@ explains how each piece works.
   up to four such resumes nest, then one is posted); any other completion resumes it through
   the scheduler.
 - Optional scheduler members, found by detection and forwarded by wrappers: `runs_here()`,
-  `post_call(fn, arg)` (a cross-thread cancel's emit), `roots()` (where `spawn` links roots) and
+  `post_call(fn, arg)` (a cross-thread cancel's emit, or a cancel's hop to its loop; same-thread
+  on `inline_scheduler`, any thread on the other two), `roots()` (where `spawn` links roots) and
   `post_heavy(handle)`. `asio_scheduler::post_demoted` and `post_heavy` work from any thread.
 - Teardown (`asio_scheduler`): `close()` makes `post`, `post_demoted`, `post_heavy` and `post_call` drop and
   `spawn` destroy its task unrun; `destroy_roots()` destroys every root, with every `io_context`

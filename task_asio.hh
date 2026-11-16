@@ -128,21 +128,21 @@ public:
 
 	using clock = std::chrono::steady_clock;
 
-	// On the executor's thread: files e on the loop's timers at `at` (nanoseconds, as now()), or
-	// moves it if armed, and wakes the loop by the end of its 1 ms slot. Its fire runs on the
-	// loop, at most one tick plus the loop's wake latency late. Once closed, nothing fires: the
-	// destroyed scheduler fires what is still armed with expired false.
+	// On the executor's thread, or teardown's once closed: files e on the loop's timers at `at`
+	// (nanoseconds, as now()), or moves it if armed, and wakes the loop by the end of its 1 ms
+	// slot. Its fire runs on the loop, at most one tick plus the loop's wake latency late. Once
+	// closed, nothing fires: the destroyed scheduler fires what is still armed with expired false.
 	void arm(wheel::timer_entry& e, std::uint64_t at) {
-		assert(!io_ || runs_here());
+		assert(!io_ || runs_here() || closed());
 		timer_loop& t = timers();
 		t.wheel.arm(e, at);
 		constexpr std::uint64_t tick = wheel::timer_wheel::tick;
 		wake_by(at > wheel::timer_wheel::never - tick ? at : (at / tick + 1) * tick);
 	}
-	// On the executor's thread: takes e off the timers; true if it was armed. The last one
-	// cancels the wake, so run() may return.
+	// On the executor's thread, or teardown's once closed: takes e off the timers; true if it was
+	// armed. The last one cancels the wake, so run() may return.
 	bool cancel(wheel::timer_entry& e) noexcept {
-		assert(!io_ || runs_here());
+		assert(!io_ || runs_here() || closed());
 		if (!e.armed()) { return false; }
 		timer_loop& t = *timers_;
 		t.wheel.cancel(e);

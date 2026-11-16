@@ -32,17 +32,44 @@ never names a concrete scheduler.
 
 `inline_scheduler` keeps a ready queue and a demoted queue and runs demoted handles
 only when nothing is ready: least-attained service, where a task that spent its
-slice waits behind tasks that have not. `asio_scheduler` posts ready handles to its
-executor and keeps demoted handles in a local queue drained one per executor pass.
+slice waits behind tasks that have not. Its ready queue holds `post_call(fn, arg)` calls in
+order with resumes (one 16-byte `fn(arg)` per entry, a resume being one such call), all on its
+own thread, so a cancel's hop to the scheduler runs in a simulation. `asio_scheduler` posts
+ready handles to its executor and keeps demoted handles in a local queue drained one per
+executor pass.
 
-Each also owns a `wheel::timer_wheel` from Kronuz/wheel, made on first use and kept private
+`blocking_scheduler` is the blocking entry's: one thread drives it with `drive(done,
+may_wait)`, and `post` and `post_call` are thread-safe (a mutex-guarded queue, signalled under
+the lock so the driver may destroy it as soon as it sees its work). With nothing queued, `drive`
+expires the wheel, checks `done`, and sleeps on a condition variable toward the wheel's `next()`
+only when a timer is armed and `may_wait()` holds; otherwise it returns false at once, so a lost
+wake is reported, never slept through, whatever tokens another thread holds.
+
+## Timers on the wheel
+
+Each scheduler owns a `wheel::timer_wheel` from Kronuz/wheel, made on first use and kept private
 (`docs/mechanisms/deadlines.md`). `arm(entry, at)` and `cancel(entry)`, on the scheduler's
 thread, are the one way to file a timer: `asio_scheduler`'s `arm` also wakes its loop by the
 entry's time. A deadline's cancel state carries its wheel entry; `start_timer` files it through
 `arm`, and the wheel holds a reference to the state while it is armed.
-`inline_scheduler::advance` expires the wheel on its manual clock; `asio_scheduler` wakes its
-loop with one `steady_timer` at `next()`, files and unfiles on the loop thread, and posts both
-from any other, so its executor runs on one thread.
+`inline_scheduler::advance` expires the wheel on its manual clock; `blocking_scheduler::drive`
+expires it on the steady clock between runs; `asio_scheduler` wakes its loop with one
+`steady_timer` at `next()`, files and unfiles on the loop thread, and posts both from any
+other, so its executor runs on one thread.
+
+What runs on a loop's wheel, and what stays off it:
+
+- On the wheel: every `task::deadline` on `inline_scheduler`, `blocking_scheduler` and
+  `asio_scheduler`, and every timer a driver arms through `scheduler_ref::arm`, such as a
+  consensus group's one entry, re-armed after each step.
+- Next onto it, in their own repositories: Xapiand's `engine::Host` timers (`AsioHost::arm`,
+  one `asio::steady_timer` and three allocations per timer, and `BlockingScheduler::arm`, which
+  becomes `blocking_scheduler`); the call sites arming through `engine::Host` do not change.
+- Staying `asio::steady_timer`s until something moves them: Kronuz/reactor's event timers and
+  Kronuz/http's. Reactor's lag probe stays off the wheel for good: `next()` wakes at a slot's
+  end, up to 1 ms late, which a 1 ms stall measurement would read as lag.
+- Not loop-bound, so on no loop's wheel: Kronuz/logger's deferred lines, which run on a wheel
+  its LOG thread owns, and its watchdogs, which fire while loops are blocked or stopped.
 
 ## Budgets
 
@@ -127,8 +154,9 @@ runs a handler or an `unlock` against it: the phases run after the join. The `io
 not run again after `destroy_roots()`; the scheduler's posted functions check `closed()` before
 touching a frame, so one that does run drops its work. A `deadline` may be destroyed on any
 thread: its disarm bit is set before the timer dies. On `asio_scheduler` its unfile is posted
-from another thread, `close()` releases the wheel so teardown's thread may destroy it, and the
-destroyed scheduler's wheel drops what is still filed.
+from another thread, `close()` releases the wheel so teardown's thread may cancel an entry a
+driver armed (a group's, unlinked in place after `destroy_roots()`) and destroy the wheel, and
+the destroyed scheduler's wheel drops what is still filed, the deadlines' states included.
 
 ## Frames
 
