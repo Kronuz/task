@@ -1064,6 +1064,7 @@ struct cancel_node {
 class cancel_state : public pooled_frame {
 public:
 	static constexpr std::uint64_t requested_bit = 1, locked_bit = 2, disarmed_bit = 4, linked_bit = 8, timed_bit = 16;
+	static constexpr std::uint64_t delivering_bit = 32;  // a request is running its callbacks
 
 	static cancel_state* make(cancel_state* parent);
 	static timed_cancel_state* make_timed(cancel_state* parent);
@@ -1098,6 +1099,7 @@ public:
 		}
 		retain();  // a callback may drop the last outside reference
 		requester_ = std::this_thread::get_id();
+		word_.fetch_or(delivering_bit, std::memory_order_relaxed);  // under the lock taken with requested_bit
 		while (cancel_node* n = head_) {
 			head_ = n->next;
 			if (head_) { head_->prev = nullptr; }
@@ -1112,9 +1114,24 @@ public:
 			epoch_.notify_all();
 			lock();
 		}
-		unlock();
+		word_.fetch_and(~(locked_bit | delivering_bit), std::memory_order_release);
+		epoch_.fetch_add(1, std::memory_order_release);
+		epoch_.notify_all();
 		release();
 		return true;
+	}
+
+	// Waits until a request running its callbacks on another thread has run them all, so what
+	// they post is queued when this returns. Callbacks never block, so the wait is short.
+	void settle() noexcept {
+		for (;;) {
+			const std::uint32_t e = epoch_.load(std::memory_order_acquire);  // before the check
+			lock();
+			const bool busy = (word_.load(std::memory_order_relaxed) & delivering_bit) && requester_ != std::this_thread::get_id();
+			unlock();
+			if (!busy) { return; }
+			epoch_.wait(e, std::memory_order_relaxed);
+		}
 	}
 
 	// Links n, or returns false when already requested (the caller then runs it).
@@ -1189,12 +1206,14 @@ struct linked_cancel_state : cancel_state, cancel_node {};
 
 // A deadline's state: a linked state (with or without a parent) and the entry a scheduler's
 // wheel files. The wheel holds a reference while the entry is armed; the fire requests the
-// deadline unless it is disarmed, and releases that reference.
+// deadline unless it is disarmed, and releases that reference. A fire that loses to a request
+// still running callbacks on another thread waits for them, so a driver that finds its queue
+// empty after expiring sees the hop a cross-thread cancel posts.
 struct timed_cancel_state final : wheel::timer_entry, linked_cancel_state {
 	timed_cancel_state() noexcept { fire = &on_wheel; }
 	static void on_wheel(wheel::timer_entry& e, bool expired) noexcept {
 		auto& s = static_cast<timed_cancel_state&>(e);
-		if (expired) { s.request(cancel_reason::deadline, disarmed_bit); }
+		if (expired && !s.request(cancel_reason::deadline, disarmed_bit)) { s.settle(); }
 		s.release();
 	}
 };

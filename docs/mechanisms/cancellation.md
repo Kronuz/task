@@ -57,20 +57,24 @@ destroying the child unlinks it (waiting for a parent request running it on anot
 ## deadline
 
 `deadline<S>(s, at, parent)` is a source linked to `parent` plus a timer from `s.start_timer(at, fire)`
-(`task.hh:1434`). `fire` holds a reference to the state and calls
+(`task.hh:1453`). `fire` holds a reference to the state and calls
 `request(deadline, forbid = disarmed_bit)`. On `inline_scheduler`, `blocking_scheduler` and
 `asio_scheduler` the state carries the wheel entry `start_timer` files (`deadlines.md`).
 
 - `~deadline` sets the `disarmed` bit, then the timer dies. A fire already under way when the
-  timer dies holds the state alive, and its request fails on the bit. So a deadline may be
-  destroyed on any thread, before or after its expiry, and never requests afterwards.
+  timer dies holds the state alive, and its request fails on the bit. So a deadline never
+  requests once destroyed, before or after its expiry; it may be destroyed on any thread on
+  `asio_scheduler`, and on the driving thread on `inline_scheduler` and `blocking_scheduler`.
+- A wheel fire that loses to a request still running its callbacks on another thread waits for
+  them (`cancel_state::settle`, the `delivering` bit), so whatever they post is queued when the
+  fire returns and a driver that then finds its queue empty has really lost its wake.
 - `expired()` is `reason == deadline`. A deadline linked to a parent that was requested first
   reports the parent's reason.
 - A timer that cannot start throws from the constructor and frees the state.
 
 ## budget
 
-`budget(slice, token)` pairs a time slice with a token (`task.hh:1477`).
+`budget(slice, token)` pairs a time slice with a token (`task.hh:1513`).
 `co_await b.checkpoint()` is ready (no suspension) when the token is requested, the slice is
 not spent, or no scheduler is current. `await_resume` throws `cancelled` when the token is
 requested, whether the checkpoint suspended or not; a spent slice on a scheduler requeues the

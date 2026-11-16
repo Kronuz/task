@@ -32,6 +32,9 @@ class Mutant:
     cases: tuple[str, ...]
     killed: int = 1
     flags: str = ""  # CMAKE_CXX_FLAGS and linker flags
+    also: tuple[
+        tuple[str, str], ...
+    ] = ()  # further (original, mutant) edits to the same header
 
 
 ARM = "\t[[gnu::always_inline]] void arm(timer_entry& e, std::uint64_t deadline) noexcept {\n\t\towner_check();\n"
@@ -62,6 +65,28 @@ MUTANTS: dict[str, Mutant] = {
         "while (!ready_.empty()) {",
         "task_blocking_test",
         ("starve",),
+    ),
+    # F1: a deadline's fire that loses to an in-flight cross-thread cancel does not wait for its hop.
+    "fire-skips-settle": Mutant(
+        "task.hh",
+        "if (expired && !s.request(cancel_reason::deadline, disarmed_bit)) { s.settle(); }",
+        "if (expired) { s.request(cancel_reason::deadline, disarmed_bit); }",
+        "task_blocking_test",
+        ("race-forced",),
+    ),
+    # F2: neither the recheck after the fires nor the wait's predicate sees a post made meanwhile.
+    "blocking-lost-wake": Mutant(
+        "task.hh",
+        "\t\t\tif (!ready_.empty()) { continue; }  // a fire, or another thread, queued work\n",
+        "",
+        "task_blocking_test",
+        ("window-forced",),
+        also=(
+            (
+                "wake_.wait_until(lock, until, queued);",
+                "wake_.wait_until(lock, until);",
+            ),
+        ),
     ),
     # X4: a dying deadline calls into its destroyed scheduler (ASan reports the read).
     "drop-calls-dead-scheduler": Mutant(
@@ -99,13 +124,15 @@ def run(cmd: list[str]) -> bool:
 
 def apply(path: Path, name: str, m: Mutant) -> bool:
     text = path.read_text()
-    if text.count(m.original) != 1:
-        print(
-            f"mutant {name}: the original text occurs {text.count(m.original)} times in {m.header}",
-            file=sys.stderr,
-        )
-        return False
-    path.write_text(text.replace(m.original, m.mutant))
+    for original, mutant in ((m.original, m.mutant), *m.also):
+        if text.count(original) != 1:
+            print(
+                f"mutant {name}: the original text occurs {text.count(original)} times in {m.header}",
+                file=sys.stderr,
+            )
+            return False
+        text = text.replace(original, mutant)
+    path.write_text(text)
     return True
 
 

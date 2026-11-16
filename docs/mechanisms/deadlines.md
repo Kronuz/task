@@ -21,16 +21,18 @@ armed by a driver and a deadline's entry wake the loop alike.
 ## The entry and its references
 
 On a scheduler with a wheel, a deadline's cancel state is a `detail::timed_cancel_state`
-(`task.hh:1182`). It derives from `wheel::timer_entry`, so the entry is 32 bytes inside a pooled
+(`task.hh:1212`). It derives from `wheel::timer_entry`, so the entry is 32 bytes inside a pooled
 state, and arming allocates nothing more. On any other scheduler (one whose `start_timer` does not
 return a `wheel_timer`), the state carries no entry and links only when there is a parent. The
 wheel holds one reference to the state while the entry is filed:
 
-- `start_timer` takes the reference from the `deadline_fire` it is given (`task.hh:1393`) and
+- `start_timer` takes the reference from the `deadline_fire` it is given (`task.hh:1412`) and
   files the entry with `arm`.
 - The entry's fire, `on_wheel`, requests `cancel_reason::deadline` unless the deadline is
-  disarmed, then releases the reference.
-- Destroying the deadline sets the disarm bit, then its `wheel_timer` (`task.hh:1412`) hands the
+  disarmed, then releases the reference. When the request loses to one another thread is still
+  delivering (a cross-thread cancel between its claim and its hop), the fire waits for its
+  callbacks (`settle`), so `blocking_scheduler::drive` sees the hop before deciding it stalled.
+- Destroying the deadline sets the disarm bit, then its `wheel_timer` (`task.hh:1431`) hands the
   state to the scheduler's static `drop_timer`, which unfiles the entry with `cancel` and releases
   the reference. On `inline_scheduler` and `blocking_scheduler` it reads the scheduler only while
   the entry is armed, and their destruction fires every entry off the wheel, so a deadline may
@@ -38,12 +40,12 @@ wheel holds one reference to the state while the entry is filed:
 
 ## On each scheduler
 
-- `inline_scheduler` files in place (`task.hh:1456`), so its deadlines are created and destroyed
+- `inline_scheduler` files in place (`task.hh:1475`), so its deadlines are created and destroyed
   on the thread that runs it. `advance(ns)` moves the manual clock and
   expires the wheel, so a five-second deadline fires with no real time passing. `drop_timer`
   cancels an armed entry in place. A fire's callback may `post_call` a hop to the scheduler; it
   runs in the next `run()`, in order with posted resumes.
-- `blocking_scheduler` files in place too (`task.hh:1470`), on its driving thread (`arm` and
+- `blocking_scheduler` files in place too (`task.hh:1489`), on its driving thread (`arm` and
   `cancel` assert it), and `drive()` expires the wheel on the steady clock after each pass over
   what was queued when the pass began, so a task re-posting itself cannot hold off a fire. With
   nothing queued it sleeps while `may_wait()` holds, toward `next()` or, with no timer armed,
@@ -122,10 +124,15 @@ its deadlines; an `inline_scheduler` or `blocking_scheduler` may die first.
   and `post_call` from another thread cut a sleep short. `wakes-unarmed`: with nothing armed and
   `may_wait()` true, a post wakes it, 5,000 rounds with the post around the decision to sleep;
   `starve`: a call re-posting itself does not hold off a 20 ms timer; `late`: a deadline outliving
-  its scheduler touches nothing of it. `offthread-cancel`, not in the default run, must abort.
+  its scheduler touches nothing of it; `race` (1,000 cross-thread cancels against a deadline
+  firing at the same time) and `race-forced` (the cancel's callback held between its claim and
+  its hop while the deadline fires) end cancelled, never stalled; `window-forced`: a post made
+  between drive's queue check and its sleep runs at once. `offthread-cancel`, not in the default
+  run, must abort.
 - `test/wheel_mutant.py NAME` builds a test against one mutant and exits 0 when it is killed:
   `rearm-fires-early` (wheel.hh; `deadline_test reentry`, `model`), `unarmed-returns`
-  (`wakes-unarmed`), `expire-when-idle` (`starve`), `drop-calls-dead-scheduler` (`late` under
+  (`wakes-unarmed`), `fire-skips-settle` (`race-forced`), `blocking-lost-wake` (no recheck and no
+  wait predicate; `window-forced`), `expire-when-idle` (`starve`), `drop-calls-dead-scheduler` (`late` under
   ASan), `blocking-cancel-unchecked` (`offthread-cancel`), `closed-arm-allowed`
   (`deadline_asio_test closed-arm`).
 - `test/deadline_alloc_test.cc`: no allocation per deadline once the pool is warm, on

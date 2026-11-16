@@ -14,6 +14,12 @@
 //   wakes-unarmed         with nothing armed and may_wait() true, drive() sleeps until a post
 //                         or post_call from another thread wakes it; 5,000 rounds with the post
 //                         landing around drive()'s decision to sleep, none slept through
+//   race                  1,000 rounds of a cross-thread cancel at 0-3 ms against a 0.5-3 ms
+//                         deadline: every drive returns cancelled, never a stall
+//   race-forced           the cancel's callback is held between its claim and its hop while
+//                         the deadline fires: the fire waits for it, drive returns cancelled
+//   window-forced         a post made from inside may_wait(), between drive()'s queue check and
+//                         its sleep, a 3 s timer armed: it runs at once
 //   starve                a call re-posting itself does not hold off a due timer
 //   late                  a deadline outliving its scheduler is freed without touching it
 //   offthread-cancel      the control, not in `all`: cancel off the driving thread aborts on
@@ -51,6 +57,7 @@ struct waiter {
 	std::coroutine_handle<> handle;
 	task::scheduler_ref where;
 	std::atomic<int>* dropped = nullptr;  // hops the scheduler refused
+	std::atomic<bool>* hold = nullptr;    // race-forced: the callback waits on it between claim and hop
 
 	bool claim(outcome o) noexcept {
 		int expected = pending;
@@ -64,6 +71,10 @@ struct waiter {
 		waiter* self;
 		void operator()() noexcept {
 			if (!self->claim(cancelled)) { return; }
+			if (self->hold) {  // the canceller is preempted between its claim and its hop
+				const auto until = steady::now() + 100ms;
+				while (!self->hold->load() && steady::now() < until) { std::this_thread::yield(); }
+			}
 			if (!self->where.post_call(&hop, self)) { ++*self->dropped; }
 		}
 	};
@@ -219,11 +230,78 @@ void wakes() {
 	}
 }
 
+void flag(void* p) { static_cast<std::atomic<bool>*>(p)->store(true); }
+
+// A deadline at 0.5-3 ms raced by a cross-thread cancel at 0-3 ms; with `hold`, the cancel's
+// callback is held between claim and hop. Returns whether drive() ended cancelled.
+bool race_round(steady::duration deadline, steady::duration cancel_at, std::atomic<bool>* hold) {
+	task::blocking_scheduler s;
+	waiter w;
+	std::atomic<int> dropped{0};
+	w.dropped = &dropped;
+	w.hold = hold;
+	task::cancel_source request;
+	std::optional<int> state;
+	task::spawn(task::scheduler_ref::of(s), operation(s, w, request.token(), deadline), [&](std::exception_ptr e, std::optional<int> v) {
+		CHECK(!e);
+		state = v;
+	});
+	std::thread other([&] {
+		std::this_thread::sleep_for(cancel_at);
+		request.request();
+	});
+	const bool done = s.drive([&] { return state.has_value(); });
+	if (hold) { *hold = true; }
+	other.join();
+	if (!done) { CHECK(s.drive([&] { return state.has_value(); })); }  // the hop arrived after the stall
+	CHECK(state == cancelled && dropped == 0 && s.armed_timers() == 0);
+	return done;
+}
+
+void race(int n) {
+	std::mt19937 random(13);
+	int stalls = 0;
+	for (int r = 0; r < n; ++r) {
+		const auto deadline = std::chrono::microseconds(500 + random() % 2'500), cancel_at = std::chrono::microseconds(random() % 3'000);
+		stalls += !race_round(deadline, cancel_at, nullptr);
+	}
+	std::printf("race rounds=%d stalls=%d %s\n", n, stalls, stalls ? "FAILS" : "ok");
+	CHECK(stalls == 0);
+}
+
+void race_forced() {
+	std::atomic<bool> release{false};
+	const auto start = steady::now();
+	const bool done = race_round(5ms, 1ms, &release);
+	const double ms = std::chrono::duration<double, std::milli>(steady::now() - start).count();
+	std::printf("race-forced drive=%s elapsed_ms=%.1f %s\n", done ? "cancelled" : "stalled", ms, done ? "ok" : "FAILS");
+	CHECK(done);
+}
+
+void window_forced() {
+	task::blocking_scheduler s;
+	wheel::timer_entry far;
+	far.fire = [](wheel::timer_entry&, bool) noexcept {};
+	CHECK(task::scheduler_ref::of(s).arm(far, s.now() + 3'000'000'000ull));
+	std::atomic<bool> ran{false};
+	bool posted = false;
+	const auto start = steady::now();
+	CHECK(s.drive([&] { return ran.load(); }, [&] {
+		if (!posted) {  // between the queue check and the sleep, with the lock released
+			posted = true;
+			std::thread([&] { s.post_call(&flag, &ran); }).join();
+		}
+		return true;
+	}));
+	const auto elapsed = steady::now() - start;
+	std::printf("window-forced elapsed_ms=%.1f\n", std::chrono::duration<double, std::milli>(elapsed).count());
+	CHECK(elapsed < 1s);
+	CHECK(s.cancel(far));
+}
+
 void spin(int n) {
 	for (int i = 0; i < n; ++i) { std::atomic_signal_fence(std::memory_order_seq_cst); }
 }
-
-void flag(void* p) { static_cast<std::atomic<bool>*>(p)->store(true); }
 
 void unarmed() {
 	const auto always = [] { return true; };
@@ -351,6 +429,9 @@ int main(int argc, char** argv) {
 	if (only == "all" || only == "rounds") { rounds(300); }
 	if (only == "all" || only == "wakes") { wakes(); }
 	if (only == "all" || only == "wakes-unarmed") { unarmed(); }
+	if (only == "all" || only == "race") { race(1'000); }
+	if (only == "all" || only == "race-forced") { race_forced(); }
+	if (only == "all" || only == "window-forced") { window_forced(); }
 	if (only == "all" || only == "starve") { starve(); }
 	if (only == "all" || only == "late") { late(); }
 	CHECK(task::detail::live_frames() == baseline);
