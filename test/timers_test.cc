@@ -7,7 +7,16 @@
 //             post_call aborts on the assertion (Debug); it exits 1 without one
 //   group     join wakes at zero, a token ends it first, an escaping exception goes to failed
 //   periodic  ticks a period after the previous one ends; a throw ticks again; stop ends it
-//   debounce  quiet, busy and force targets; stop drops pending fires; touch then returns false
+//   debounce  quiet, busy and force targets; stop ends the waits without firing and keeps the
+//             pending keys, which fire_pending() fires; touch then returns false
+//   debounce-flags  a fire gets the OR of its touches' flags; a touch during a fire goes to the next
+//   debounce-throttle  a fired key keeps its entry for `throttle`; a touch meanwhile fires at its
+//             end; then the entry and its watch go, and a stop ends the wait at once
+//   debounce-throw  a throwing fire goes to the group's `failed`; a touch during it still fires, at
+//             the throttle's end, and without one the entry and its watch go at once
+//   debounce-mid-fire  fire_pending() on another thread while the loop fires a key: that key fires
+//             once, and fire_pending() returns only after its fire ended
+//   debounce-after-stop  a touch from another thread while fire_pending() fires returns false
 //   asio      sleep on asio_scheduler's wheel, cancelled from another thread
 // Every frame and cancel state is freed at the end (TASK_COUNT_FRAMES).
 #define TASK_COUNT_FRAMES 1
@@ -24,6 +33,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #define CHECK(c)                                                              \
@@ -234,7 +244,7 @@ void debounce() {
 	task::group g(ref);
 	task::cancel_source stop;
 	std::vector<std::pair<int, u64>> fires;
-	task::debounce<int> d(g, {100ms, 50ms, 1'000ms, 1'000ms}, stop.token(), [&](const int& k) { fires.emplace_back(k, s.now() / ms); });
+	task::debounce<int> d(g, {100ms, 50ms, 1'000ms, 1'000ms}, stop.token(), [&](const int& k, unsigned) { fires.emplace_back(k, s.now() / ms); });
 
 	CHECK(d.touch(1));  // quiet: 100 ms after the first touch
 	step_to(s, 60 * ms);
@@ -252,16 +262,172 @@ void debounce() {
 	step_to(s, 1'500 * ms);  // touches after the forced fire started another: busy past the last, at 1,390
 	CHECK((fires.size() == 3 && fires[2] == std::pair<int, u64>{2, 1'440}));
 
-	// Stop drops what is pending, at once, and touch then returns false.
+	// Stop ends every wait at once without firing; the pending keys wait for fire_pending(), and
+	// touch then returns false.
 	const auto before = fires.size();
 	CHECK(d.touch(3) && d.touch(4));
 	step_to(s, 1'550 * ms);
 	stop.request();
 	s.run();
-	CHECK(g.running() == 0 && s.armed_timers() == 0 && d.pending_keys() == 0);
+	CHECK(g.running() == 0 && s.armed_timers() == 0 && d.pending_keys() == 2);
 	CHECK(!d.touch(3));
 	step_to(s, 3'000 * ms);
 	CHECK(fires.size() == before);
+	CHECK(d.fire_pending() == 2 && d.pending_keys() == 0 && d.fired() == before + 2);
+	CHECK(fires.size() == before + 2 && fires[before].first + fires[before + 1].first == 7 && fires[before].second == 3'000);
+	CHECK(d.fire_pending() == 0 && fires.size() == before + 2);
+}
+
+using fire_log = std::vector<std::tuple<int, u64, unsigned>>;
+
+void debounce_flags() {
+	task::inline_scheduler s;
+	task::group g(task::scheduler_ref::of(s));
+	task::cancel_source stop;
+	fire_log fires;
+	task::debounce<int>* self = nullptr;
+	task::debounce<int> d(g, {100ms, 50ms, 1'000ms, 1'000ms}, stop.token(), [&](const int& k, unsigned f) {
+		fires.emplace_back(k, s.now() / ms, f);
+		if (fires.size() == 1) { CHECK(self->touch(k, 4)); }  // during the fire: the next one's
+	});
+	self = &d;
+	CHECK(d.touch(1, 1));
+	step_to(s, 10 * ms);
+	CHECK(d.touch(1, 2) && d.touch(2));
+	step_to(s, 400 * ms);
+	CHECK((fires == fire_log{{1, 100, 3}, {2, 110, 0}, {1, 200, 4}}));
+	CHECK(d.touch(1));  // the flags reset after each fire
+	step_to(s, 600 * ms);
+	CHECK((fires.size() == 4 && fires[3] == std::tuple<int, u64, unsigned>{1, 500, 0}));
+	stop.request();
+	s.run();
+	CHECK(g.running() == 0);
+}
+
+void debounce_throttle() {
+	task::inline_scheduler s;
+	task::group g(task::scheduler_ref::of(s));
+	task::cancel_source stop;
+	fire_log fires;
+	task::debounce<int> d(g, {100ms, 50ms, 1'000ms, 1'000ms, 500ms}, stop.token(), [&](const int& k, unsigned f) { fires.emplace_back(k, s.now() / ms, f); });
+	CHECK(d.touch(1, 1));
+	step_to(s, 150 * ms);
+	CHECK((fires == fire_log{{1, 100, 1}}));
+	CHECK(d.touch(1, 2));  // quiet would fire it at 250; the throttle holds it to 600
+	CHECK(d.pending_keys() == 1);
+	step_to(s, 599 * ms);
+	CHECK(fires.size() == 1);
+	step_to(s, 600 * ms);
+	CHECK((fires.size() == 2 && fires[1] == std::tuple<int, u64, unsigned>{1, 600, 2}));
+	step_to(s, 1'099 * ms);
+	CHECK(g.running() == 1 && d.pending_keys() == 0);  // the entry stays until 600 + 500
+	step_to(s, 1'100 * ms);
+	CHECK(g.running() == 0 && s.armed_timers() == 0);  // bounded by the keys fired in the last throttle
+	CHECK(d.touch(1));  // past the throttle: quiet again
+	step_to(s, 1'300 * ms);
+	CHECK((fires.size() == 3 && fires[2] == std::tuple<int, u64, unsigned>{1, 1'200, 0}));
+	CHECK(g.running() == 1);
+	stop.request();  // ends the throttle's wait at once
+	s.run();
+	CHECK(g.running() == 0 && s.armed_timers() == 0 && d.pending_keys() == 0 && d.fire_pending() == 0);
+}
+
+void debounce_throw() {
+	task::inline_scheduler s;
+	task::group g(task::scheduler_ref::of(s));
+	int failures = 0;
+	g.failed = [&](std::exception_ptr) { ++failures; };
+	task::cancel_source stop;
+	fire_log fires;
+	task::debounce<int>* self = nullptr;
+	task::debounce<int> d(g, {100ms, 50ms, 1'000ms, 1'000ms, 500ms}, stop.token(), [&](const int& k, unsigned f) {
+		fires.emplace_back(k, s.now() / ms, f);
+		if (fires.size() == 1) { CHECK(self->touch(k, 8)); }
+		if (fires.size() <= 2) { throw std::runtime_error("fire"); }
+	});
+	self = &d;
+	CHECK(d.touch(1));
+	step_to(s, 150 * ms);
+	CHECK(failures == 1 && g.running() == 1 && d.pending_keys() == 1);  // the touch's watch
+	step_to(s, 700 * ms);
+	CHECK((fires == fire_log{{1, 100, 0}, {1, 600, 8}}));  // at the throttle's end
+	CHECK(failures == 2 && g.running() == 0 && s.armed_timers() == 0);  // no touch: the entry went
+	CHECK(d.touch(1));
+	step_to(s, 900 * ms);
+	CHECK((fires.size() == 3 && fires[2] == std::tuple<int, u64, unsigned>{1, 800, 0}));
+	stop.request();
+	s.run();
+	CHECK(g.running() == 0);
+}
+
+std::atomic<bool> g_pending_waits{false};
+
+void debounce_mid_fire() {
+	task::inline_scheduler s;
+	task::group g(task::scheduler_ref::of(s));
+	task::cancel_source stop;
+	fire_log fires;
+	std::atomic<bool> in_fire{false}, fire_ended{false};
+	const auto loop_thread = std::this_thread::get_id();
+	std::vector<std::thread::id> fired_on;
+	task::debounce<int> d(g, {100ms, 50ms, 1'000ms, 1'000ms}, stop.token(), [&](const int& k, unsigned f) {
+		fires.emplace_back(k, s.now() / ms, f);
+		fired_on.push_back(std::this_thread::get_id());
+		if (k == 1) {  // the loop's fire, held until fire_pending() waits for it
+			in_fire.store(true);
+			const auto until = std::chrono::steady_clock::now() + 300ms;
+			while (!g_pending_waits.load() && std::chrono::steady_clock::now() < until) { std::this_thread::yield(); }
+			fire_ended.store(true);
+		}
+	});
+	CHECK(d.touch(1, 1));
+	step_to(s, 50 * ms);
+	CHECK(d.touch(2, 2));
+	std::size_t taken = 0;
+	bool ended_first = false;
+	std::thread other([&] {
+		while (!in_fire.load()) { std::this_thread::yield(); }
+		task::detail::test_hooks::pending_waits = [] { g_pending_waits.store(true); };
+		stop.request();  // the third signal's order: stop, then fire_pending()
+		taken = d.fire_pending();
+		ended_first = fire_ended.load();
+		task::detail::test_hooks::pending_waits = nullptr;
+	});
+	step_to(s, 100 * ms);  // fires key 1 on this thread
+	other.join();
+	s.run();
+	step_to(s, 1'000 * ms);
+	CHECK(taken == 1 && ended_first && g_pending_waits.load());
+	CHECK((fires == fire_log{{1, 100, 1}, {2, 100, 2}}));  // each once
+	CHECK(fired_on[0] == loop_thread && fired_on[1] != loop_thread);
+	CHECK(g.running() == 0 && d.pending_keys() == 0 && d.fired() == 2);
+}
+
+void debounce_after_stop() {
+	task::inline_scheduler s;
+	task::group g(task::scheduler_ref::of(s));
+	task::cancel_source stop;
+	std::atomic<bool> in_fire{false}, touched{false};
+	std::optional<bool> late;
+	std::vector<int> fires;
+	task::debounce<int> d(g, {100ms, 50ms, 1'000ms, 1'000ms}, stop.token(), [&](const int& k, unsigned) {
+		fires.push_back(k);
+		in_fire.store(true);
+		const auto until = std::chrono::steady_clock::now() + 5s;
+		while (!touched.load() && std::chrono::steady_clock::now() < until) { std::this_thread::yield(); }
+	});
+	CHECK(d.touch(1));
+	s.run();
+	stop.request();
+	s.run();
+	CHECK(g.running() == 0 && d.pending_keys() == 1);
+	std::thread other([&] { CHECK(d.fire_pending() == 1); });  // the third signal's thread
+	while (!in_fire.load()) { std::this_thread::yield(); }
+	late = d.touch(5);  // mid fire_pending(), on another thread
+	touched.store(true);
+	other.join();
+	CHECK(late == false && d.pending_keys() == 0 && d.fire_pending() == 0);
+	CHECK((fires == std::vector<int>{1}));
 }
 
 void asio_sleep() {
@@ -306,6 +472,11 @@ int main(int argc, char** argv) {
 	if (only == "all" || only == "group") { group(); }
 	if (only == "all" || only == "periodic") { periodic(); }
 	if (only == "all" || only == "debounce") { debounce(); }
+	if (only == "all" || only == "debounce-flags") { debounce_flags(); }
+	if (only == "all" || only == "debounce-throttle") { debounce_throttle(); }
+	if (only == "all" || only == "debounce-throw") { debounce_throw(); }
+	if (only == "all" || only == "debounce-mid-fire") { debounce_mid_fire(); }
+	if (only == "all" || only == "debounce-after-stop") { debounce_after_stop(); }
 	if (only == "all" || only == "asio") { asio_sleep(); }
 	CHECK(task::detail::live_frames() == baseline);
 	std::printf("timers_test: ok\n");

@@ -761,6 +761,7 @@ inline thread_local void (*asio_registered)() = nullptr; // await_asio(init, tok
 inline thread_local void (*sleep_claimed)() = nullptr;    // a sleep's cancel callback, between its claim and its hop
 inline thread_local void (*signal_loaded)() = nullptr;    // stop_signals' handler, between loading the pipe and writing
 inline thread_local void (*off_loop_start)() = nullptr;   // off_loop, before it starts its thread; may throw
+inline thread_local void (*pending_waits)() = nullptr;    // debounce::fire_pending, before it waits for a fire in progress
 }  // namespace detail::test_hooks
 #define TASK_TEST_HOOK(name) \
 	do { \

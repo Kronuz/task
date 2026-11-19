@@ -26,7 +26,10 @@
 
 #pragma once
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -199,54 +202,96 @@ task<void> periodic(std::chrono::nanoseconds period, cancel_token stop, F tick, 
 	}
 }
 
-// fire(key) runs on the group's scheduler once the key has been quiet for `quiet` after its first
-// touch, later while touches keep coming (`busy` after each), and never later than a random time
-// in [min_force, max_force] after the first touch. A touch moves a key's target, never earlier.
-// One task per pending key sleeps on the wheel. `stop` ends every wait without firing; the owner
-// then joins the group before the debounce dies.
+// fire(key, flags) runs on the group's scheduler once the key has been quiet for `quiet` after its
+// first touch, later while touches keep coming (`busy` after each), and never later than a random
+// time in [min_force, max_force] after the first touch; `flags` ORs every touch's since the last
+// fire. A touch moves a key's target, never earlier. With `throttle`, a fired key keeps its entry
+// until `throttle` passes, and a touch meanwhile fires no earlier than that. One task per key
+// with an entry sleeps on the wheel. `stop` ends every wait without firing and keeps the pending
+// keys for fire_pending(); the owner then joins the group before the debounce dies.
 template <typename Key, typename Hash = std::hash<Key>>
 class debounce {
 public:
 	struct timing {
-		std::chrono::nanoseconds quiet, busy, min_force, max_force;
+		std::chrono::nanoseconds quiet, busy, min_force, max_force, throttle{0};
 	};
 
-	debounce(group& g, timing t, cancel_token stop, std::function<void(const Key&)> fire)
+	debounce(group& g, timing t, cancel_token stop, std::function<void(const Key&, unsigned)> fire)
 		: group_(g), timing_(t), stop_(std::move(stop)), fire_(std::move(fire)), rng_(std::random_device{}()) {}
 	debounce(const debounce&) = delete;
 	debounce& operator=(const debounce&) = delete;
 
-	// Any thread. True when a fire for the key is pending; false once stop is requested: the
-	// caller then runs the call itself.
-	bool touch(const Key& key) {
-		bool fresh = false;
+	// Any thread. True when a fire for the key, with `flags`, is pending; false once stop is
+	// requested: the caller then runs the call itself.
+	bool touch(const Key& key, unsigned flags = 0) {
+		std::uint64_t fresh = 0;
 		{
 			std::lock_guard lock(m_);
 			if (stop_.requested()) { return false; }
 			const std::uint64_t now = group_.scheduler().now();
 			auto [it, inserted] = keys_.try_emplace(key);
-			pending& p = it->second;
-			if (inserted) {
-				p.force = now + force_after();
-				p.target = std::min(now + ns(timing_.quiet), p.force);
-				fresh = true;
+			entry& e = it->second;
+			if (inserted) { fresh = e.gen = ++last_gen_; }
+			if (!e.pending) {  // new, or throttled: its target is the throttle's end
+				e.pending = true;
+				++pending_;
+				e.force = now + force_after();
+				e.target = std::max(e.target, std::min(now + ns(timing_.quiet), e.force));
 			} else {
-				p.target = std::max(p.target, std::min(now + ns(timing_.busy), p.force));
+				e.target = std::max(e.target, std::min(now + ns(timing_.busy), e.force));
+			}
+			e.flags |= flags;
+		}
+		if (fresh) { group_.spawn(watch(key, fresh)); }
+		return true;
+	}
+
+	// Any thread but a fire's own: takes every pending key and fires it on this thread, after a
+	// fire in progress on the loop ends, so every touch before it has fired when it returns. Every
+	// key fires; the first throw is rethrown after. Returns how many it fired.
+	std::size_t fire_pending() {
+		std::vector<std::pair<Key, unsigned>> taken;
+		{
+			std::unique_lock lock(m_);
+			for (auto it = keys_.begin(); it != keys_.end();) {
+				if (it->second.pending) {
+					taken.emplace_back(it->first, it->second.flags);
+					it = keys_.erase(it);  // its watch finds it gone
+				} else {
+					++it;
+				}
+			}
+			pending_ = 0;
+			if (firing_ != 0) {
+				TASK_TEST_HOOK(pending_waits);
+				idle_.wait(lock, [this] { return firing_ == 0; });
 			}
 		}
-		if (fresh) { group_.spawn(watch(key)); }
-		return true;
+		std::exception_ptr first;
+		for (const auto& [key, flags] : taken) {
+			fired_.fetch_add(1, std::memory_order_relaxed);
+			try {
+				fire_(key, flags);
+			} catch (...) {
+				if (!first) { first = std::current_exception(); }
+			}
+		}
+		if (first) { std::rethrow_exception(first); }
+		return taken.size();
 	}
 
 	std::size_t pending_keys() const {
 		std::lock_guard lock(m_);
-		return keys_.size();
+		return pending_;
 	}
 	std::uint64_t fired() const noexcept { return fired_.load(std::memory_order_relaxed); }
 
 private:
-	struct pending {
+	struct entry {
 		std::uint64_t force = 0, target = 0;
+		std::uint64_t gen = 0;  // its watch's
+		unsigned flags = 0;
+		bool pending = false;  // else throttled until target
 	};
 	static std::uint64_t ns(std::chrono::nanoseconds d) noexcept { return std::uint64_t(std::max<std::int64_t>(0, d.count())); }
 	std::uint64_t force_after() {  // under m_
@@ -255,39 +300,86 @@ private:
 		return ns(std::chrono::nanoseconds(std::uniform_int_distribution<std::int64_t>(low, high)(rng_)));
 	}
 
-	task<void> watch(Key key) {
+	task<void> watch(Key key, std::uint64_t gen) {
 		for (;;) {
-			std::uint64_t target;
+			std::uint64_t target = 0;
+			unsigned flags = 0;
 			bool due = false;
 			{
 				std::lock_guard lock(m_);
 				auto it = keys_.find(key);
-				if (it == keys_.end()) { co_return; }
+				if (it == keys_.end() || it->second.gen != gen) { co_return; }
+				entry& e = it->second;
 				if (stop_.requested()) {
-					keys_.erase(it);
+					if (!e.pending) { keys_.erase(it); }  // a pending key waits for fire_pending()
 					co_return;
 				}
-				target = it->second.target;
-				if (target <= group_.scheduler().now()) {
-					keys_.erase(it);  // a touch from here on starts a new fire
+				const std::uint64_t now = group_.scheduler().now();
+				if (e.target <= now && !e.pending) {
+					keys_.erase(it);  // the throttle passed
+					co_return;
+				}
+				if (e.target <= now) {
 					due = true;
+					flags = std::exchange(e.flags, 0u);
+					e.pending = false;  // a touch from here on starts a new fire
+					--pending_;
+					++firing_;
+					if (timing_.throttle.count() > 0) {
+						e.target = now + ns(timing_.throttle);
+					} else {
+						keys_.erase(it);
+					}
+				} else {
+					target = e.target;
 				}
 			}
-			if (due) {
-				fired_.fetch_add(1, std::memory_order_relaxed);
-				fire_(key);
-				co_return;
+			if (!due) {
+				co_await sleep_until(target, stop_);
+				continue;
 			}
-			co_await sleep_until(target, stop_);
+			fired_.fetch_add(1, std::memory_order_relaxed);
+			try {
+				fire_(key, flags);
+			} catch (...) {
+				fire_ended();
+				hand_off(key, gen);
+				throw;  // to the group's `failed`
+			}
+			fire_ended();
+			if (timing_.throttle.count() <= 0) { co_return; }
 		}
+	}
+	void fire_ended() {
+		std::lock_guard lock(m_);
+		if (--firing_ == 0) { idle_.notify_all(); }
+	}
+	// After a throwing fire: drops a throttled entry; a pending one gets a watch of its own.
+	void hand_off(const Key& key, std::uint64_t gen) {
+		std::uint64_t fresh = 0;
+		{
+			std::lock_guard lock(m_);
+			auto it = keys_.find(key);
+			if (it == keys_.end() || it->second.gen != gen) { return; }
+			if (!it->second.pending) {
+				keys_.erase(it);
+			} else if (!stop_.requested()) {
+				fresh = it->second.gen = ++last_gen_;
+			}
+		}
+		if (fresh) { group_.spawn(watch(key, fresh)); }
 	}
 
 	group& group_;
 	timing timing_;
 	cancel_token stop_;
-	std::function<void(const Key&)> fire_;
+	std::function<void(const Key&, unsigned)> fire_;
 	mutable std::mutex m_;
-	std::unordered_map<Key, pending, Hash> keys_;
+	std::condition_variable idle_;  // firing_ reached zero
+	std::unordered_map<Key, entry, Hash> keys_;
+	std::size_t pending_ = 0;  // entries with a fire pending
+	std::size_t firing_ = 0;   // fires in progress on the group's scheduler
+	std::uint64_t last_gen_ = 0;
 	std::mt19937_64 rng_;
 	std::atomic<std::uint64_t> fired_{0};
 };
