@@ -29,11 +29,13 @@
 #pragma once
 
 #include <cerrno>
+#include <algorithm>
 #include <charconv>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -66,7 +68,9 @@ private:
 };
 
 using daemon_ready = std::function<void()>;
-// Fork before constructing any threaded component. Startup errors propagate
+// Fork before constructing any threaded component, and construct the ProcessLock inside `run`: a
+// lock taken before the fork stays held by the detached child while the file names the parent.
+// Startup errors propagate
 // through a pipe; the parent returns 0 only after ready() and throws on an error or timeout.
 // With detach false it runs `run` in place.
 inline int run_daemon(bool detach, const std::filesystem::path& log_path,
@@ -135,6 +139,13 @@ inline int run_daemon(bool detach, const std::filesystem::path& log_path, const 
 	if (!detach) return run([] {});
 	int pipefd[2];
 	if (::pipe(pipefd)) process_detail::fail("startup pipe");
+	// A subprocess `run` execs before ready() must not keep the pipe open past the daemon's end.
+	if (::fcntl(pipefd[0], F_SETFD, FD_CLOEXEC) || ::fcntl(pipefd[1], F_SETFD, FD_CLOEXEC)) {
+		auto error = errno;
+		::close(pipefd[0]); ::close(pipefd[1]);
+		errno = error;
+		process_detail::fail("startup pipe flags");
+	}
 	process_detail::Fd input{process_detail::high_fd(pipefd[0])}, output{process_detail::high_fd(pipefd[1])};
 	if (input.value < 0 || output.value < 0) process_detail::fail("duplicate startup pipe");
 	auto pid = ::fork();
@@ -175,15 +186,17 @@ inline int run_daemon(bool detach, const std::filesystem::path& log_path, const 
 	}
 	::close(output.value); output.value = -1;
 	std::string error;
-	auto deadline = std::chrono::steady_clock::now() + startup_timeout;
+	auto deadline = std::chrono::steady_clock::now() + std::min<std::chrono::seconds>(startup_timeout, std::chrono::hours(24 * 365));
 	for (;;) {
 		auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+		remaining = std::min<long long>(remaining, std::numeric_limits<int>::max());
 		pollfd pfd{input.value, POLLIN, 0};
 		int result = remaining > 0 ? ::poll(&pfd, 1, static_cast<int>(remaining)) : 0;
 		if (result < 0 && errno == EINTR) continue;
 		if (result < 0) process_detail::fail("wait for daemon startup");
 		if (result == 0) {
 			::kill(pid, SIGTERM);
+			(void)::waitpid(pid, nullptr, 0);
 			throw std::runtime_error("daemon startup timed out");
 		}
 		char buffer[512];

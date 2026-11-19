@@ -19,7 +19,11 @@ parent                         child (setsid, stdout/stderr -> log, stdin -> /de
   timeout      -> SIGTERM child, throw "daemon startup timed out"          reporting readiness"
 ```
 
-The pipe ends are moved above fd 2 so the log redirect cannot clobber them. A `run` that returns
+The pipe ends are close-on-exec, so a subprocess `run` execs before `ready()` cannot hold the
+pipe open and hide the daemon's end; they are also moved above fd 2 so the log redirect cannot
+clobber them. At the timeout the parent SIGTERMs the child and reaps it. Construct the
+`ProcessLock` inside `run`: one taken before the fork stays held by the detached child while the
+file names the parent. A `run` that returns
 0 without calling `ready()` is ready when it returns. The log must be a regular file owned by the
 caller with one link, opened `O_NOFOLLOW`.
 
