@@ -243,13 +243,21 @@ public:
 	void fail(std::exception_ptr e) noexcept {
 		{
 			std::lock_guard lock(m_);
-			if (!failure_) { failure_ = std::move(e); }
+			if (!failure_) {
+				failure_ = std::move(e);
+				caused_ = !stop_.requested();
+			}
 		}
 		request_stop();
 	}
 	std::exception_ptr failure() const {
 		std::lock_guard lock(m_);
 		return failure_;
+	}
+	// The first fail() when it came before any other stop request, so it caused the stop.
+	std::exception_ptr cause() const {
+		std::lock_guard lock(m_);
+		return caused_ ? failure_ : nullptr;
 	}
 
 	// Removes its flush when destroyed.
@@ -300,6 +308,7 @@ private:
 	mutable std::mutex m_;
 	std::condition_variable idle_;
 	std::exception_ptr failure_;
+	bool caused_ = false;  // failure_ came before any other stop request
 	std::list<std::pair<std::uint64_t, std::function<void()>>> flushes_;
 	std::size_t running_ = 0;  // run_flushes() calls in progress
 	std::uint64_t last_id_ = 0;
@@ -412,9 +421,10 @@ private:
 	std::thread thread_;
 };
 
-// What a lifecycle reports once every flush returned.
+// What a lifecycle reports once every flush returned. `failure` is the first of: a start or ready
+// error, the fail() that caused the stop, a stop, drain or flush error, a later fail().
 struct stopped {
-	std::exception_ptr failure;           // the first start, ready, stop, drain or flush error, else the source's fail()
+	std::exception_ptr failure;
 	std::string failed;                   // the component whose start threw (components::failed())
 	std::vector<std::string> unfinished;  // what drains left at `abandon`, in drain order
 	bool ready = false;                   // every start returned and ready() ran
@@ -514,6 +524,7 @@ inline task<stopped> run_lifecycle(stop_source& source, stop_timing timing, std:
 		if (r.ready) { co_await sleep_until(never, stop.token()); }
 	}
 	stop.request(cancel_reason::shutdown);
+	if (!r.failure) { r.failure = source.cause(); }
 
 	const auto lead = timing.bound > timing.grace ? timing.bound - timing.grace : std::chrono::nanoseconds(0);
 	cancel_source cancel, abandon, finish;

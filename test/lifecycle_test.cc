@@ -18,6 +18,8 @@
 //   flush-fail  a flush the third signal runs may call fail() on its source
 //   signal-close  ~stop_signals waits for a handler that loaded the pipe before it closes it
 //   tool     a tool's end stops the lifecycle; fail() is reported
+//   cause    the fail() that caused the stop is the failure though a later drain throws; a fail()
+//            after the stop ranks after the drain's throw
 //   asio     service-shape's main on asio_scheduler: io.run() returns only after the flushes
 //   inbox    a post_call landing after run() returned waits in the inbox: queued() counts it, and
 //            the next run() runs it
@@ -460,6 +462,48 @@ void tool() {
 	CHECK((g_log == lines{"start b", "ready @0", "stop b", "drain b", "flush b"}));
 }
 
+// A drain that calls `before`, then throws.
+struct throwing_drain : probe {
+	std::function<void()> before;
+	task::task<lines> drain(const task::stop_bound&) {
+		g_log.push_back("drain " + id);
+		if (before) { before(); }
+		throw std::runtime_error("drain " + id);
+		co_return lines{};
+	}
+};
+static_assert(task::component<throwing_drain>);
+
+std::string what(const std::exception_ptr& e) {
+	try {
+		std::rethrow_exception(e);
+	} catch (const std::exception& x) {
+		return x.what();
+	}
+}
+
+void cause() {
+	{
+		fixture f;  // fail() stops; the drain it leads to throws
+		throwing_drain a{{"a"}};
+		auto r = drive(f.s, task::lifecycle(f.s, f.source, {}, f.ready(), a), [&](u64 t) {
+			if (t == 7) { f.source.fail(std::make_exception_ptr(std::runtime_error("failed"))); }
+		});
+		CHECK(r && r->failure && what(r->failure) == "failed");
+		CHECK(f.source.cause() == f.source.failure());
+	}
+	{
+		fixture f;  // a stop, then fail() during the drain: the drain's throw ranks first
+		throwing_drain a{{"a"}};
+		a.before = [&] { f.source.fail(std::make_exception_ptr(std::runtime_error("failed"))); };
+		auto r = drive(f.s, task::lifecycle(f.s, f.source, {}, f.ready(), a), [&](u64 t) {
+			if (t == 7) { f.source.request_stop(); }
+		});
+		CHECK(r && r->failure && what(r->failure) == "drain a");
+		CHECK(f.source.failure() && !f.source.cause());
+	}
+}
+
 // The child's component writes a byte to the parent at each step.
 struct signal_probe {
 	int fd;
@@ -582,6 +626,7 @@ int main(int argc, char** argv) {
 	if (only == "all" || only == "flush-fail") { flush_fail(); }
 	if (only == "all" || only == "signal-close") { signal_close(); }
 	if (only == "all" || only == "tool") { tool(); }
+	if (only == "all" || only == "cause") { cause(); }
 	if (only == "all" || only == "inbox") { inbox(); }
 #if TASK_LIFECYCLE_ASIO
 	if (only == "all" || only == "asio") { asio_main(); }
