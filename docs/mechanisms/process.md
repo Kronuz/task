@@ -16,12 +16,13 @@ parent                         child (setsid, stdout/stderr -> log, stdin -> /de
   "R"          -> return 0       throw        writes "E<what>" (4096 bytes at most), _exit(1)
   "E<msg>"     -> throw msg      nonzero run  without a ready() throws "daemon startup failed"
   EOF, no "R"  -> throw          exit before ready(): parent throws "daemon exited without
-  timeout      -> SIGTERM child, throw "daemon startup timed out"          reporting readiness"
+  timeout      -> SIGTERM, grace, SIGKILL; throw "daemon startup timed out"          reporting readiness"
 ```
 
 The pipe ends are close-on-exec, so a subprocess `run` execs before `ready()` cannot hold the
 pipe open and hide the daemon's end; they are also moved above fd 2 so the log redirect cannot
-clobber them. At the timeout the parent SIGTERMs the child and reaps it. Construct the
+clobber them. At the timeout the parent SIGTERMs the child, waits up to `term_grace` (1 s) for it, then SIGKILLs
+and reaps it, so a child that ignores SIGTERM cannot hold the parent. Construct the
 `ProcessLock` inside `run`: one taken before the fork stays held by the detached child while the
 file names the parent. A `run` that returns
 0 without calling `ready()` is ready when it returns. The log must be a regular file owned by the

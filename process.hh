@@ -91,6 +91,21 @@ struct Fd {
 	int value;
 	~Fd() { if (value >= 0) ::close(value); }
 };
+
+// How long a child gets to end after SIGTERM before SIGKILL.
+inline constexpr std::chrono::milliseconds term_grace{1000};
+
+// SIGTERM, then a bounded wait; a child still running after term_grace is SIGKILLed. Always reaps.
+inline void terminate_and_reap(pid_t pid) {
+	::kill(pid, SIGTERM);
+	auto until = std::chrono::steady_clock::now() + term_grace;
+	while (std::chrono::steady_clock::now() < until) {
+		if (::waitpid(pid, nullptr, WNOHANG) != 0) return;
+		::usleep(10'000);
+	}
+	::kill(pid, SIGKILL);
+	(void)::waitpid(pid, nullptr, 0);
+}
 }  // namespace process_detail
 
 inline std::optional<pid_t> locked_pid(const std::filesystem::path& path) {
@@ -195,8 +210,7 @@ inline int run_daemon(bool detach, const std::filesystem::path& log_path, const 
 		if (result < 0 && errno == EINTR) continue;
 		if (result < 0) process_detail::fail("wait for daemon startup");
 		if (result == 0) {
-			::kill(pid, SIGTERM);
-			(void)::waitpid(pid, nullptr, 0);
+			process_detail::terminate_and_reap(pid);
 			throw std::runtime_error("daemon startup timed out");
 		}
 		char buffer[512];

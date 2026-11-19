@@ -26,6 +26,7 @@
 //   throws     a throw before ready() reaches the parent with its message
 //   failed     a nonzero result or an exit before ready() is reported by the parent
 //   timeout    a child that never reports is SIGTERMed and reaped, and the parent throws
+//   term       a child that ignores SIGTERM is SIGKILLed after the grace and reaped
 //   exec-child a daemon that execs a long-lived child and fails: the error, not the timeout
 //   lock-in-run a ProcessLock taken in run names the daemon
 //   lock-cloexec the pidfile lock ends when the holder execs
@@ -167,6 +168,29 @@ void timeout() {
 	for (int i = 0; i < 500 && text.empty(); ++i) { text = slurp(pidfile); std::this_thread::sleep_for(10ms); }
 	CHECK(!text.empty());
 	// run_daemon has already reaped the child: no zombie is left to wait for.
+	CHECK(::waitpid(std::stoi(text), nullptr, WNOHANG) == -1 && errno == ECHILD);
+}
+
+// A child that ignores SIGTERM is SIGKILLed after the grace: the parent returns within the timeout,
+// the grace and some slack, with the child reaped.
+void timeout_ignores_term() {
+	auto log = g_dir / "term.log";
+	auto pidfile = g_dir / "term.pid";
+	auto start = clock_type::now();
+	auto msg = thrown([&] {
+		task::run_daemon(true, log, [&](const task::daemon_ready&) {
+			::signal(SIGTERM, SIG_IGN);
+			std::ofstream(pidfile) << ::getpid() << std::flush;
+			std::this_thread::sleep_for(30s);
+			return 0;
+		}, 1s);
+	});
+	auto took = clock_type::now() - start;
+	CHECK(msg == "daemon startup timed out");
+	CHECK(took >= 900ms + task::process_detail::term_grace - 100ms && took < 1s + task::process_detail::term_grace + 2s);
+	std::string text;
+	for (int i = 0; i < 500 && text.empty(); ++i) { text = slurp(pidfile); std::this_thread::sleep_for(10ms); }
+	CHECK(!text.empty());
 	CHECK(::waitpid(std::stoi(text), nullptr, WNOHANG) == -1 && errno == ECHILD);
 }
 
@@ -334,6 +358,7 @@ int main(int argc, char** argv) {
 	if (only == "all" || only == "throws") { throws(); }
 	if (only == "all" || only == "failed") { failed(); }
 	if (only == "all" || only == "timeout") { timeout(); }
+	if (only == "all" || only == "term") { timeout_ignores_term(); }
 	if (only == "all" || only == "exec-child") { exec_child(); }
 	if (only == "all" || only == "lock-in-run") { lock_in_run(); }
 	if (only == "all" || only == "in-place") { in_place(); }
