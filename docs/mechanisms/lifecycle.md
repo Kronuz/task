@@ -70,6 +70,7 @@ grace)` on a source linked to the hurry, then requests `b.cancel`, sleeps `grace
 and runs every `flush()` on a thread of its own (`off_loop`), which resumes the driver through
 `post_call`; `inline_scheduler` takes a `post_call` from another thread into an inbox that each
 step moves behind the ready handles, before any demoted one. When the thread cannot start
-(`std::system_error`), the flushes run inline on the loop, so every path still ends with them. The flushes are also registered with the stop source for the third signal, and
+(`std::system_error`), the flushes run inline on the loop, so every path still ends with them; a
+`flush()` must therefore never wait on the loop, or that path deadlocks. The flushes are also registered with the stop source for the third signal, and
 removed when the driver returns. `lifecycle` holds the loop's work guard when the loop has one
 (`asio_scheduler::work_guard()`), so `io.run()` returns only after the lifecycle.

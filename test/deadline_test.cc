@@ -11,9 +11,11 @@
 //             re-posting itself, demoted or ready
 //   owner     a second thread drives the scheduler after the first: the first's post_call is
 //             taken under the inbox's lock, before and while the second drives (run under TSan)
+//   two-drivers  a second thread's run() while one drives asserts, in a child process
 // The timers are armed through scheduler_ref and fired by advance(), as a simulator drives them.
 // Every frame and cancel state is freed at the end (TASK_COUNT_FRAMES).
 #define TASK_COUNT_FRAMES 1
+#undef NDEBUG  // two-drivers needs the Debug assert; this test is its own program
 #include "task.hh"
 
 #include <atomic>
@@ -30,6 +32,10 @@
 #include <string_view>
 #include <thread>
 #include <vector>
+
+#include <csignal>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #define CHECK(c)                                                                     \
 	do {                                                                             \
@@ -417,6 +423,33 @@ void owner() {
 	CHECK(ran == 1'001);
 	std::printf("owner ok\n");
 }
+// A demoted loop that spins on one thread until `stop`, after setting `inside`.
+task::task<void> holder(task::inline_scheduler* s, std::atomic<bool>* inside, std::atomic<bool>* stop) {
+	inside->store(true);
+	while (!stop->load()) { co_await repost{s, true}; }
+}
+
+void two_drivers() {
+	std::fflush(nullptr);
+	const pid_t pid = fork();
+	CHECK(pid >= 0);
+	if (pid == 0) {
+		alarm(10);
+		task::inline_scheduler s;
+		std::atomic<bool> inside{false}, stop{false};
+		task::spawn(task::scheduler_ref::of(s), holder(&s, &inside, &stop));
+		std::thread first([&] { s.run(); });
+		while (!inside.load()) { std::this_thread::yield(); }
+		s.run_until([] { return true; });  // a second driver: it asserts before touching a queue
+		stop.store(true);
+		first.join();
+		_exit(0);
+	}
+	int status = 0;
+	CHECK(waitpid(pid, &status, 0) == pid);
+	CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+	std::printf("two-drivers ok\n");
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -431,6 +464,7 @@ int main(int argc, char** argv) {
 	if (only == "all" || only == "post_call") { post_call(); }
 	if (only == "all" || only == "inbox") { inbox(); }
 	if (only == "all" || only == "owner") { owner(); }
+	if (only == "all" || only == "two-drivers") { two_drivers(); }
 	CHECK(task::detail::live_frames() == baseline);
 	std::printf("deadline_test: ok\n");
 	return 0;

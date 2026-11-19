@@ -441,6 +441,18 @@ public:
 	// Like run(), but stops as soon as stop() is true, checked before each handle.
 	template <typename P>
 	std::size_t run_until(P&& stop) {
+#ifndef NDEBUG
+		struct driving {
+			std::atomic<std::thread::id>& driver;
+			bool took;
+			~driving() {
+				if (took) { driver.store({}, std::memory_order_release); }
+			}
+		};
+		std::thread::id idle{};
+		driving guard{driver_, driver_.compare_exchange_strong(idle, std::this_thread::get_id(), std::memory_order_acq_rel)};
+		assert((guard.took || idle == std::this_thread::get_id()) && "one thread drives an inline_scheduler at a time");
+#endif
 		running_on scope(scheduler_ref::of(*this));
 		struct mark {
 			inline_scheduler* previous = detail::draining_scheduler;
@@ -496,6 +508,9 @@ private:
 	std::unique_ptr<wheel::timer_wheel> wheel_;
 	std::mutex inbox_mutex_;
 	std::thread::id owner_ = std::this_thread::get_id();  // the thread that drives it; under inbox_mutex_
+#ifndef NDEBUG
+	std::atomic<std::thread::id> driver_{};  // the thread inside run_until, if any
+#endif
 	std::vector<detail::queued_call> inbox_;  // post_call from other threads
 	std::atomic<bool> inbox_waiting_{false};
 };

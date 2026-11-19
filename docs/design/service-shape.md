@@ -201,7 +201,8 @@ signal 3                -> the signal thread runs every flush(), then SIG_DFL an
    later components, so those only `flush()`. `main` then exits `EX_TEMPFAIL`
    without teardown, as Xapiand does (`manager.cc:1188-1195`).
 5. Every path ends with each started component's `flush()`, in reverse, on a thread of its own
-   (D11) that `lifecycle` awaits before it returns: a
+   (D11) that `lifecycle` awaits before it returns, or inline on the loop when that thread cannot
+   start, so a `flush()` must never wait on the loop: a
    normal stop, a start that throws, a drain that throws (later drains still run), and an
    unfinished drain. Xapiand's WAL join on a normal stop is that `flush()`.
 
@@ -264,7 +265,7 @@ sleep still armed at teardown is cancelled when phase 3 destroys its frame (D10)
 | D13 | No wait inside a drain takes the stop token | Pacing loops would spin; the agent's terminal checks would never run |
 | D14 | One time shape, `now()` nanoseconds; step 1 moves `deadline` to it (5 call sites outside task) | `time_point` for `deadline` alone; `scheduler_ref` has no clock type |
 | D15 | The driver is `task::lifecycle` over `component`s; it takes a `stop_source`, of which `stop_signals` is one, and a set of components (`components`) is a component, so lifecycles nest (Xapiand D132) | `serve(loop, stop_signals&, ...)`: only the process's signals could stop a set, and a set could not nest |
-| D16 | Flushes run off the loop: at the end of every path on a thread of their own (D11) that `lifecycle` awaits through `post_call`, and on the signal thread at the third signal; `flush()` is idempotent and thread-safe (Xapiand D140) | Flushes on the loop: the loop may be what is stuck, abandoned work could not move during the flush, a `flush()` that needs the loop would deadlock, and a nested lifecycle's flush would block its parent's loop |
+| D16 | Flushes run off the loop: at the end of every path on a thread of their own (D11) that `lifecycle` awaits through `post_call`, and on the signal thread at the third signal; `flush()` is idempotent and thread-safe (Xapiand D140). When that thread cannot start (`std::system_error`), the flushes run inline on the loop, so a `flush()` must never wait on the loop | Flushes on the loop: the loop may be what is stuck, abandoned work could not move during the flush, a `flush()` that needs the loop would deadlock, and a nested lifecycle's flush would block its parent's loop |
 
 ## Limits
 
