@@ -428,6 +428,7 @@ struct stopped {
 	std::string failed;                   // the component whose start threw (components::failed())
 	std::vector<std::string> unfinished;  // what drains left at `abandon`, in drain order
 	bool ready = false;                   // every start returned and ready() ran
+	bool abandoned = false;               // the drains were still running at `abandon`
 	std::exception_ptr flushed_inline;    // the thread start's error when the flushes ran on the loop
 };
 
@@ -545,6 +546,7 @@ inline task<stopped> run_lifecycle(stop_source& source, stop_timing timing, std:
 	}
 	finish.request();
 	co_await timer_ended;
+	r.abandoned = abandon.requested();
 	if (!r.failure) { r.failure = d.failure; }
 	off_loop flushes([&set] { set.flush(); });
 	try {

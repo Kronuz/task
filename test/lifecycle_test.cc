@@ -4,6 +4,8 @@
 //   bound    a drain past its bound: cancelled at bound - grace, abandoned grace after; what it
 //            left is reported and the earlier components only flush
 //   hurry    a hurry cancels at once, and abandons grace after
+//   abandoned  stopped.abandoned is set when a drain reached `abandon`, though it left no lines,
+//            and not when every drain ended at `cancel`
 //   failure  a start that throws: the started ones stop, drain and flush in reverse; named
 //   start-token  a start or ready failure requests the start token, so work a started
 //            component runs on it ends and its drain returns
@@ -77,6 +79,7 @@ struct probe {
 	std::string id;
 	mode drains = quick;
 	bool throws = false;
+	bool reports = true;  // an abandoned drain returns its line
 
 	std::string_view name() const { return id; }
 	task::task<void> start(task::cancel_token) {
@@ -94,7 +97,7 @@ struct probe {
 		if (drains == until_abandon) {
 			co_await task::sleep_until(task::never, b.abandon);
 			g_log.push_back("abandon " + id + " " + at());
-			co_return lines{"left " + id};
+			if (reports) { co_return lines{"left " + id}; }
 		}
 		co_return lines{};
 	}
@@ -139,7 +142,7 @@ void order() {
 	auto r = drive(f.s, task::lifecycle(f.s, f.source, {}, f.ready(), a, b, c), [&](u64 t) {
 		if (t == 1'000) { f.source.request_stop(); }
 	});
-	CHECK(r && r->ready && !r->failure && r->unfinished.empty());
+	CHECK(r && r->ready && !r->failure && r->unfinished.empty() && !r->abandoned);
 	CHECK((g_log == lines{"start a", "start b", "start c", "ready @0", "stop c", "stop b", "stop a", "drain c", "drain b", "drain a",
 	                      "flush c", "flush b", "flush a"}));
 	CHECK(f.s.armed_timers() == 0);  // the bound's timers end with the drains
@@ -151,7 +154,7 @@ void bound() {
 	auto r = drive(f.s, task::lifecycle(f.s, f.source, {35s, 5s}, f.ready(), a, b, c), [&](u64 t) {
 		if (t == 1'000) { f.source.request_stop(); }
 	});
-	CHECK(r && r->ready && !r->failure);
+	CHECK(r && r->ready && !r->failure && r->abandoned);
 	CHECK((r->unfinished == lines{"left b"}));
 	// c's drain ends at the cancel, b's at the abandon; a is never drained, only flushed.
 	CHECK((g_log == lines{"start a", "start b", "start c", "ready @0", "stop c", "stop b", "stop a", "drain c", "cancel c @31000", "drain b",
@@ -165,8 +168,29 @@ void hurry() {
 		if (t == 1'000) { f.source.request_stop(); }
 		if (t == 2'000) { f.source.request_hurry(); }
 	});
-	CHECK(r && (r->unfinished == lines{"left a"}));
+	CHECK(r && r->abandoned && (r->unfinished == lines{"left a"}));
 	CHECK((g_log == lines{"start a", "ready @0", "stop a", "drain a", "cancel a @2000", "abandon a @7000", "flush a"}));
+}
+
+void abandoned() {
+	{
+		fixture f;  // a drain that reaches `abandon` and leaves no line
+		probe a{"a", probe::until_abandon, false, false};
+		auto r = drive(f.s, task::lifecycle(f.s, f.source, {2s, 1s}, f.ready(), a), [&](u64 t) {
+			if (t == 10) { f.source.request_stop(); }
+		});
+		CHECK(r && !r->failure && r->unfinished.empty() && r->abandoned);
+		CHECK((g_log == lines{"start a", "ready @0", "stop a", "drain a", "cancel a @1010", "abandon a @2010", "flush a"}));
+	}
+	{
+		fixture f;  // every drain ends at `cancel`: nothing abandoned
+		probe a{"a", probe::until_cancel};
+		auto r = drive(f.s, task::lifecycle(f.s, f.source, {2s, 1s}, f.ready(), a), [&](u64 t) {
+			if (t == 10) { f.source.request_stop(); }
+		});
+		CHECK(r && !r->failure && r->unfinished.empty() && !r->abandoned);
+		CHECK((g_log == lines{"start a", "ready @0", "stop a", "drain a", "cancel a @1010", "flush a"}));
+	}
 }
 
 void failure() {
@@ -616,6 +640,7 @@ int main(int argc, char** argv) {
 	if (only == "all" || only == "order") { order(); }
 	if (only == "all" || only == "bound") { bound(); }
 	if (only == "all" || only == "hurry") { hurry(); }
+	if (only == "all" || only == "abandoned") { abandoned(); }
 	if (only == "all" || only == "failure") { failure(); }
 	if (only == "all" || only == "start-token") { start_token(); }
 	if (only == "all" || only == "stop-throws") { stop_throws(); }
