@@ -107,6 +107,10 @@ explains how each piece works.
   the next tick runs. `debounce<Key>(group, {quiet, busy, min_force, max_force}, stop, fire)`:
   `touch(key)` from any thread, `fire(key)` on the group's scheduler once quiet, never later than
   the force; `stop` drops what is pending and `touch` then returns false.
+- `process.hh` (POSIX; standard library only): `run_daemon(detach, log, run, timeout)` forks and
+  returns 0 at the child's `ready()` or throws its error or the timeout; `ProcessLock(path, system)`
+  holds the pidfile lock (`acquired()`); `locked_pid(path)` names the holder.
+  See [process](mechanisms/process.md).
 - `lifecycle.hh` (POSIX; needs only `task.hh`): `lifecycle(loop, stop, timing, ready,
   components...)` returns `task<stopped>` (`failure`, `failed`, `unfinished`, `ready`). A
   `component` has `start(stop)`, `stop()`, `drain(stop_bound)` returning what it left, `flush()`,
