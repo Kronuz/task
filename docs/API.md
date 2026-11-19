@@ -48,6 +48,11 @@ explains how each piece works.
   published before requesting and read after polling.
   `cancel_source(parent_token)` is requested with its parent. `cancel_callback(token, f)`
   runs `f(reason)` on the requesting thread, with `std::stop_callback`'s lifetime rules.
+  On a deadline, `f` must not wait for the deadline's scheduler or for anything its thread
+  holds while it expires timers (a lock held across `inline_scheduler::advance()`, a post it
+  waits on): a fire that loses to a request running callbacks on another thread waits for
+  them, so that wait and the scheduler deadlock. A callback that posts or sets state never
+  blocks it, and a fire on the delivering thread itself does not wait.
   `deadline(sched, time_point, parent = {})` is a source its scheduler's timer requests
   with `cancel_reason::deadline`, at most one 1 ms tick late on a wheel, plus the loop's wake
   latency on `asio_scheduler`; `time_point` is on `sched`'s `clock` when it declares one, else

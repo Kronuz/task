@@ -560,6 +560,38 @@ void test_deadline() {
 	CHECK(task::detail::live_frames() == base);
 }
 
+// A deadline's callback that advances its own inline_scheduler past the deadline: the wheel's fire
+// loses to the request this thread is delivering, and settle() must not wait for that thread.
+// A watchdog turns the hang a self-wait would be into a failure.
+void test_settle_inline() {
+	using task::cancel_reason;
+	std::atomic<bool> done{false};
+	std::thread watchdog([&] {
+		for (int i = 0; i < 500 && !done.load(); ++i) { std::this_thread::sleep_for(10ms); }
+		if (!done.load()) {
+			std::fprintf(stderr, "%s:%d: settle waits on its own thread\n", __FILE__, __LINE__);
+			std::_Exit(EXIT_FAILURE);
+		}
+	});
+	{
+		task::inline_scheduler s;
+		task::cancel_source parent;
+		task::deadline dl(s, task::inline_scheduler::clock::time_point(5ms), parent.token());
+		int calls = 0;
+		task::cancel_callback on_cancel(dl.token(), [&] {
+			++calls;
+			s.advance(10'000'000);  // the deadline's entry is due: it fires inside this delivery
+			CHECK(s.armed_timers() == 0);
+		});
+		CHECK(s.armed_timers() == 1);
+		CHECK(parent.request(cancel_reason::requested));
+		CHECK(calls == 1 && s.armed_timers() == 0);
+		CHECK(dl.token().reason() == cancel_reason::requested && !dl.expired());
+	}
+	done = true;
+	watchdog.join();
+}
+
 // ---------------------------------------------------------------------------------------------
 // lock(token): both orders of the grant/cancel race, and the await_suspend handshake
 
@@ -1034,6 +1066,7 @@ int main() {
 	test_event();
 	test_mutex();
 	test_deadline();
+	test_settle_inline();
 	test_lock_token();
 	test_lock_destroyed();
 	test_event_teardown();
