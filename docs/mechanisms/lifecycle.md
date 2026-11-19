@@ -34,10 +34,21 @@ token unlinks its waiter under the same lock, so a waiter is resumed by exactly 
 
 `periodic` is a loop over `sleep_for(period, stop)`: the period runs from the end of the previous
 tick, a stop ends the pending sleep at once, and a throwing tick goes to `on_throw`. `debounce`
-keeps a target and a force time per key under a mutex. The first touch spawns one watcher into the
-group, which sleeps until the target, rereads it (touches only move it later) and fires once it
-has passed, erasing the key first so a later touch starts a new fire. A stop cancels each sleep,
-and the watcher erases its key without firing.
+keeps an entry per key under a mutex: a target, a force time, the OR of the touches' flags, and
+whether a fire is pending. A touch that creates an entry spawns one watcher into the group, tagged
+with the entry's generation so a key never has two. The watcher sleeps until the target, rereads
+it (touches only move it later) and, once it has passed, takes the flags and clears `pending`
+before it fires, so a touch from then on starts the next fire. Without a throttle it erases the
+entry; with one it keeps it, throttled until `throttle` after the fire, and a touch meanwhile
+targets no earlier than that end. The watcher stays with the entry and erases it once a throttle
+passes untouched, so entries are bounded by the pending keys and the keys fired in the last
+`throttle`. A throwing fire drops a throttled entry and hands a touched one to a new watcher.
+
+A stop cancels each sleep; the watcher erases a throttled entry and leaves a pending one for
+`fire_pending()`, which takes every pending entry under the mutex, waits for a fire in progress on
+the loop to end (a count of fires and a condition variable), and fires the taken keys on its own
+thread. A key the loop is firing is no longer pending, so it fires once, and every touch before
+`fire_pending()` has fired when it returns: the third signal's flush.
 
 ## Stop sources
 
@@ -69,8 +80,17 @@ grace)` on a source linked to the hurry, then requests `b.cancel`, sleeps `grace
 `stop()` (each throw caught, the first kept), `drain_all`, joins the timer through an `event`,
 and runs every `flush()` on a thread of its own (`off_loop`), which resumes the driver through
 `post_call`; `inline_scheduler` takes a `post_call` from another thread into an inbox that each
-step moves behind the ready handles, before any demoted one. When the thread cannot start
-(`std::system_error`), the flushes run inline on the loop, so every path still ends with them; a
-`flush()` must therefore never wait on the loop, or that path deadlocks. The flushes are also registered with the stop source for the third signal, and
-removed when the driver returns. `lifecycle` holds the loop's work guard when the loop has one
-(`asio_scheduler::work_guard()`), so `io.run()` returns only after the lifecycle.
+step moves behind the ready handles, before any demoted one, and `queued()` counts it. When the
+thread cannot start (`std::system_error`), the flushes run inline on the loop, so every path still
+ends with them, and `stopped.flushed_inline` holds the error; a `flush()` must therefore never
+wait on the loop, or that path deadlocks. The flushes are also registered with the stop source
+for the third signal, and removed when the driver returns. `lifecycle` holds the loop's work
+guard when the loop has one (`asio_scheduler::work_guard()`), so `io.run()` returns only after the
+lifecycle.
+
+`stopped.failure` ranks a start or `ready` error first, then the `fail()` that caused the stop
+(`stop_source` records whether its first `fail()` came before any other stop request, read by
+`cause()` as the teardown begins), then the first `stop()`, drain or flush error, then a later
+`fail()`. `stopped.abandoned` is the `abandon` token's state once the timer ended: the timer
+requests it only while the drains still run, so it flags a drain abandoned at its deadline even
+when it left no lines.
