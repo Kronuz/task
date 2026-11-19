@@ -4,7 +4,15 @@
 #endif
 #include "task.hh"
 #ifdef TASK_LAYOUT_ASIO
-// Expose private members so the probe can tell whether on_loop_ exists.
+// The asio headers first, so only task_asio.hh is opened with private redefined (the probe reads on_loop_).
+#include <asio/any_io_executor.hpp>
+#include <asio/bind_cancellation_slot.hpp>
+#include <asio/cancellation_signal.hpp>
+#include <asio/error.hpp>
+#include <asio/executor_work_guard.hpp>
+#include <asio/io_context.hpp>
+#include <asio/post.hpp>
+#include <asio/steady_timer.hpp>
 #define private public
 #include "task_asio.hh"
 #undef private

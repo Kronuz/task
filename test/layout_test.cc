@@ -1,6 +1,6 @@
-// (A same-size member can hide in padding, so the awaiter also compares whether on_loop_ exists.)
 // inline_scheduler and cancellable_asio_awaiter have one layout whatever NDEBUG is: two translation units, one compiled with
-// NDEBUG and one without, must agree on its size and alignment (an ODR break otherwise).
+// NDEBUG and one without, must agree on its size and alignment (an ODR break otherwise). A same-size member can hide in
+// padding, so the awaiter also compares whether on_loop_ exists.
 #include <cstddef>
 #include <cstdio>
 
