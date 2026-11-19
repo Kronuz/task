@@ -110,6 +110,10 @@ explains how each piece works.
   fires at most once per `throttle`. `stop` ends the waits without firing and `touch` then
   returns false; `fire_pending()` fires the pending keys on the calling thread, after a fire in
   progress on the loop ends.
+- `process.hh` (POSIX; standard library only): `run_daemon(detach, log, run, timeout)` forks and
+  returns 0 at the child's `ready()` or throws its error or the timeout; `ProcessLock(path, system)`
+  holds the pidfile lock (`acquired()`); `locked_pid(path)` names the holder.
+  See [process](mechanisms/process.md).
 - `lifecycle.hh` (POSIX; needs only `task.hh`): `lifecycle(loop, stop, timing, ready,
   components...)` returns `task<stopped>` (`failure`, `failed`, `unfinished`, `ready`, `abandoned`,
   `flushed_inline`). A
