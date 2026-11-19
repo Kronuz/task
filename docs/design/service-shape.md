@@ -80,11 +80,12 @@ template <std::invocable F, std::invocable<std::exception_ptr> E>
 task<void> periodic(std::chrono::nanoseconds period, cancel_token stop, F tick, E on_throw);
 
 template <typename Key, typename Hash = std::hash<Key>>
-class debounce {  // control::Debounce: fire(key) once quiet, never later than a random force
+class debounce {  // control::Debounce: fire(key, flags) once quiet, never later than a random force
 public:
-	struct timing { std::chrono::nanoseconds quiet, busy, min_force, max_force; };
-	debounce(group& g, timing t, cancel_token stop, std::function<void(const Key&)> fire);
-	bool touch(const Key& key);  // any thread; false once stop is requested: run the call now
+	struct timing { std::chrono::nanoseconds quiet, busy, min_force, max_force, throttle{0}; };
+	debounce(group& g, timing t, cancel_token stop, std::function<void(const Key&, unsigned)> fire);
+	bool touch(const Key& key, unsigned flags = 0);  // any thread; false once stop is requested: run the call now
+	std::size_t fire_pending();  // the pending keys, fired on this thread: the third signal's flush
 };
 ```
 
@@ -122,6 +123,7 @@ public:
 	void request_stop() noexcept;              // any thread
 	void request_hurry() noexcept;             // any thread; stops too
 	void fail(std::exception_ptr e) noexcept;  // any thread: keeps the first, then stops
+	std::exception_ptr cause() const;          // the first fail() when it caused the stop
 	flush_registration add_flush(std::function<void()> f);  // removed when the registration dies
 	void run_flushes() noexcept;               // every added flush, last first
 };
@@ -135,10 +137,12 @@ public:
 };
 
 struct stopped {
-	std::exception_ptr failure;           // the first start, ready, stop, drain or flush error, else fail()'s
+	std::exception_ptr failure;           // start or ready error, causing fail(), stop/drain/flush error, later fail()
 	std::string failed;                   // the component whose start threw
 	std::vector<std::string> unfinished;  // what drains left at `abandon`, in drain order
 	bool ready = false;                   // every start returned and ready() ran
+	bool abandoned = false;               // the drains were still running at `abandon`
+	std::exception_ptr flushed_inline;    // the thread start's error when the flushes ran on the loop
 };
 template <scheduler L, component... C>
 task<stopped> lifecycle(L& loop, stop_source& stop, stop_timing t,
