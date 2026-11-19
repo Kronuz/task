@@ -15,7 +15,8 @@ explains how each piece works.
 - Schedulers: anything with `post(handle)` and `now()`, optionally
   `post_demoted(handle)` and `post_heavy(handle)` (the heavy lane, [lanes.md](lanes.md)). The library owns no run queue; the host's loop is the
   queue. `inline_scheduler` is a deterministic one for tests and simulation, with a manual
-  clock whose `advance(ns)` fires the timers it passes, and `asio_scheduler` runs on an Asio
+  clock whose `advance(ns)` fires the timers it passes (its `post_call` from another thread joins
+  the ready handles at its next `run()`), and `asio_scheduler` runs on an Asio
   executor that runs on one thread: an `io_context` run by one thread, not a strand over a
   multi-threaded one. `blocking_scheduler` runs on the thread that calls its
   `drive(done[, may_wait])`, on the steady clock: `post` and `post_call` work from any thread and
@@ -112,7 +113,10 @@ explains how each piece works.
   `stop_bound{cancel, abandon}` and `stop_timing{bound = 35s, grace = 5s}`. Stop sources:
   `stop_source` (`request_stop`, `request_hurry`, `fail`, linked to a parent's tokens) and
   `stop_signals`, one per process, whose first stop signal stops, second hurries and third runs
-  every flush then dies by the signal; dump signals call a function on its thread.
+  every flush then dies by the signal; dump signals call a function on its thread. A start or
+  `ready()` failure requests the components' stop token; a `stop()` that throws is reported and
+  the rest still run; the flushes run on a thread of their own, and the lifecycle holds the
+  loop's work guard (`asio_scheduler::work_guard()`) until it returns. The loop needs `post_call`.
 - `yield()`, `schedule_on{s}`, `when_all(...)` (variadic and vectors), `spawn`, and
   `run` (drive a task to completion on an `inline_scheduler`).
 - Frames come from per-thread size-class pools: after warm-up a task allocates

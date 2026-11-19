@@ -15,8 +15,11 @@ token request (any)  -> CAS waiting->cancelled -> post_call(hop) -> hop on the l
 dying wheel          -> CAS waiting->dead      -> frame stays suspended for teardown
 ```
 
-The loser does nothing, so the frame resumes once. The hop is how a cancel from another thread
-unfiles an entry that only the loop may touch. `sleep_until(never, token)` arms nothing and waits
+The loser does nothing, so the frame resumes once, except that a fire losing to a cancel
+settles the token (`cancel_state::settle`, as a deadline's fire does): it waits until the
+request delivering the callback on another thread has posted the hop, so a driver that finds its
+queue empty after `expire()` never misses it. The hop is how a cancel from another thread
+unfiles an entry that only the loop may touch; a scheduler without `post_call` asserts. `sleep_until(never, token)` arms nothing and waits
 for the token alone. A frame destroyed while sleeping deregisters its callback (which waits for
 one running elsewhere), then cancels its entry.
 
@@ -40,10 +43,14 @@ and the watcher erases its key without firing.
 
 `stop_source` holds two `cancel_source`s, stop and hurry (a hurry also stops), the first
 `fail()`, and the flushes the third signal runs. A nested source links both to its parent's
-tokens. `stop_signals` is a `stop_source` whose `sigaction` handler writes the signal number to a
-non-blocking pipe; its thread reads it: the first stop signal requests stop, the second hurry, the
-third runs every flush under the source's lock, restores `SIG_DFL` and raises the signal. Its
-destructor restores the old handlers and writes a zero byte to end the thread.
+tokens. `run_flushes()` walks the flushes newest first with no lock held while each runs (a
+flush may call `fail()`); a removal waits until no run is in progress, so a lifecycle's set
+outlives its flush. `stop_signals` is a `stop_source` whose `sigaction` handler counts itself in,
+loads the pipe's fd, writes the signal number to the non-blocking pipe, and counts itself out; its
+thread reads it: the first stop signal requests stop, the second hurry, the third runs every
+flush, restores `SIG_DFL` and raises the signal. Its destructor restores the old handlers, stores
+-1 as the fd, waits for the count to reach zero, writes a zero byte to end the thread, and only
+then closes the pipe, so no handler writes to a reused descriptor.
 
 ## lifecycle
 
@@ -54,9 +61,14 @@ whose start threw still counts as started, so its started children unwind in its
 `drain_all` returns lines and the first failure together; a drain that leaves lines ends the
 drains, since what it left may still use the earlier components.
 
-The driver starts the set, calls `ready`, and sleeps on the stop token. At the stop it spawns a
-bound timer: `sleep_until(now + bound - grace)` on a source linked to the hurry, then requests
-`b.cancel`, sleeps `grace` and requests `b.abandon`; a `finish` source ends both sleeps once the
-drains return. It then runs every `stop()`, `drain_all`, joins the timer through an `event`,
-and runs every `flush()`. The flushes are also registered with the stop source for the third
-signal, and removed when the driver returns.
+The driver starts the set on its own stop token, linked to the source's, calls `ready`, and
+sleeps on that token; a start or `ready` failure requests it, so housekeeping a started component
+runs on it ends before its drain. At the stop it spawns a bound timer: `sleep_until(now + bound -
+grace)` on a source linked to the hurry, then requests `b.cancel`, sleeps `grace` and requests
+`b.abandon`; a `finish` source ends both sleeps once the drains return. It then runs every
+`stop()` (each throw caught, the first kept), `drain_all`, joins the timer through an `event`,
+and runs every `flush()` on a thread of its own (`off_loop`), which resumes the driver through
+`post_call`; `inline_scheduler` takes a `post_call` from another thread into an inbox its next
+`run()` drains. The flushes are also registered with the stop source for the third signal, and
+removed when the driver returns. `lifecycle` holds the loop's work guard when the loop has one
+(`asio_scheduler::work_guard()`), so `io.run()` returns only after the lifecycle.

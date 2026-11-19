@@ -31,6 +31,7 @@
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
 #include <asio/error.hpp>
+#include <asio/executor_work_guard.hpp>
 #include <asio/io_context.hpp>
 #include <asio/post.hpp>
 #include <asio/steady_timer.hpp>
@@ -173,6 +174,9 @@ public:
 	}
 
 	const asio::any_io_executor& executor() const noexcept { return executor_; }
+	// Outstanding work while held: the io_context's run() does not return for want of handlers.
+	// A lifecycle holds one until it returns.
+	asio::executor_work_guard<asio::any_io_executor> work_guard() const { return asio::make_work_guard(executor_); }
 
 private:
 	friend class detail::wheel_timer<asio_scheduler>;

@@ -396,8 +396,17 @@ public:
 
 	void post(std::coroutine_handle<> h) { ready_.push_back(detail::queued_call::of(h)); }
 	void post_demoted(std::coroutine_handle<> h) { demoted_.push_back(h); }
-	// On its own thread, as post: queues fn(arg) among the ready handles, in order.
-	void post_call(void (*fn)(void*), void* arg) { ready_.push_back({fn, arg}); }
+	// Queues fn(arg) among the ready handles, in order, on the thread that runs it; from another
+	// thread it joins them once the ready handles run out (a cross-thread cancel, a flush thread).
+	void post_call(void (*fn)(void*), void* arg) {
+		if (owner_.load(std::memory_order_relaxed) == std::this_thread::get_id()) {
+			ready_.push_back({fn, arg});
+			return;
+		}
+		std::lock_guard lock(inbox_mutex_);
+		inbox_.push_back({fn, arg});
+		inbox_waiting_.store(true, std::memory_order_release);
+	}
 	std::uint64_t now() const noexcept { return now_; }
 	// Moves the clock and fires every timer due by then.
 	void advance(std::uint64_t ns) noexcept {
@@ -433,8 +442,9 @@ public:
 			~mark() { detail::draining_scheduler = previous; }
 		} marker;
 		detail::draining_scheduler = this;
+		owner_.store(std::this_thread::get_id(), std::memory_order_relaxed);
 		std::size_t n = 0;
-		while (!stop() && (!ready_.empty() || !demoted_.empty())) {
+		while (!stop() && (!ready_.empty() || !demoted_.empty() || take_inbox())) {
 			detail::slice_start = cycles::read();  // each resume is its own slice
 			if (!ready_.empty()) {
 				const detail::queued_call c = ready_.front();
@@ -455,6 +465,15 @@ public:
 private:
 	friend class detail::wheel_timer<inline_scheduler>;
 	static void drop_timer(inline_scheduler* self, detail::timed_cancel_state* s) noexcept;
+	// Moves what other threads posted into the ready handles; false when there was none.
+	bool take_inbox() {
+		if (!inbox_waiting_.load(std::memory_order_acquire)) { return false; }
+		std::lock_guard lock(inbox_mutex_);
+		for (const auto& c : inbox_) { ready_.push_back(c); }
+		inbox_.clear();
+		inbox_waiting_.store(false, std::memory_order_relaxed);
+		return !ready_.empty();
+	}
 	// The timers advance() fires, made on first use.
 	wheel::timer_wheel& wheel() {
 		if (!wheel_) { wheel_ = std::make_unique<wheel::timer_wheel>(now_); }
@@ -465,6 +484,10 @@ private:
 	std::deque<std::coroutine_handle<>> demoted_;
 	std::uint64_t now_ = 0;
 	std::unique_ptr<wheel::timer_wheel> wheel_;
+	std::atomic<std::thread::id> owner_{std::this_thread::get_id()};  // the thread that runs it
+	std::mutex inbox_mutex_;
+	std::vector<detail::queued_call> inbox_;  // post_call from other threads
+	std::atomic<bool> inbox_waiting_{false};
 };
 
 // A scheduler one thread drives with drive(), on a steady clock: post and post_call are
@@ -704,6 +727,8 @@ inline thread_local void (*after_enqueue)() = nullptr;  // async_mutex::lock(tok
 inline thread_local void (*before_link)() = nullptr;    // cancel_source(parent), before registering on it
 inline thread_local void (*cancel_settled)() = nullptr;  // a lock(token) cancel callback, between settle and wake
 inline thread_local void (*asio_registered)() = nullptr; // await_asio(init, token), between registering and the check
+inline thread_local void (*sleep_claimed)() = nullptr;    // a sleep's cancel callback, between its claim and its hop
+inline thread_local void (*signal_loaded)() = nullptr;    // stop_signals' handler, between loading the pipe and writing
 }  // namespace detail::test_hooks
 #define TASK_TEST_HOOK(name) \
 	do { \
@@ -1276,6 +1301,7 @@ class cancel_token;
 
 namespace detail {
 bool token_empty(const cancel_token& t) noexcept;
+void token_settle(const cancel_token& t) noexcept;
 }
 
 // A view of a source's state: polling is one acquire load, and an empty token (the default)
@@ -1303,6 +1329,7 @@ private:
 	template <typename F>
 	friend class cancel_callback;
 	friend bool detail::token_empty(const cancel_token& t) noexcept;
+	friend void detail::token_settle(const cancel_token& t) noexcept;
 	explicit cancel_token(detail::cancel_state* s) noexcept : s_(s) {
 		if (s_) { s_->retain(); }
 	}
@@ -1311,6 +1338,10 @@ private:
 
 // True for a token no source can request (the default one).
 inline bool detail::token_empty(const cancel_token& t) noexcept { return t.s_ == nullptr; }
+// Waits until a request delivering the token's callbacks on another thread has run them all.
+inline void detail::token_settle(const cancel_token& t) noexcept {
+	if (t.s_) { t.s_->settle(); }
+}
 
 // Requests cancellation; copies share the state. A source built from a parent token is
 // requested, with the parent's reason, when the parent is.
@@ -1504,7 +1535,8 @@ namespace detail {
 
 // A sleep's wait: a wheel entry in the waiting frame, and a cancel callback on its token. One
 // compare-exchange settles it fired or cancelled; the fire resumes through a post, the cancel
-// hops to the scheduler through post_call, unfiles the entry there and posts the resume.
+// hops to the scheduler through post_call, unfiles the entry there and posts the resume. A fire
+// that loses to a cancel settles the token, as a deadline's does, so the hop is queued by then.
 class sleep_awaiter : wheel::timer_entry {
 public:
 	static constexpr std::uint64_t never = wheel::timer_wheel::never;
@@ -1544,7 +1576,9 @@ private:
 		void operator()() noexcept {
 			unsigned char w = waiting;
 			if (self->state_.compare_exchange_strong(w, cancelled, std::memory_order_acq_rel)) {
-				self->sched_.post_call(&hop, self);
+				TASK_TEST_HOOK(sleep_claimed);
+				[[maybe_unused]] const bool posted = self->sched_.post_call(&hop, self);
+				assert(posted && "a cancellable sleep needs a scheduler with post_call");
 			}
 		}
 	};
@@ -1558,8 +1592,10 @@ private:
 		auto* self = static_cast<sleep_awaiter*>(&e);
 		unsigned char w = waiting;
 		// A dying wheel's fire leaves the frame suspended for teardown to destroy.
-		if (self->state_.compare_exchange_strong(w, expired ? fired : dead, std::memory_order_acq_rel) && expired) {
-			self->sched_.post(self->handle_);
+		if (self->state_.compare_exchange_strong(w, expired ? fired : dead, std::memory_order_acq_rel)) {
+			if (expired) { self->sched_.post(self->handle_); }
+		} else if (w == cancelled) {
+			token_settle(self->token_);  // the cancel's hop is queued before expire() returns
 		}
 	}
 

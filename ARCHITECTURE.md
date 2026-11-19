@@ -33,8 +33,9 @@ never names a concrete scheduler.
 `inline_scheduler` keeps a ready queue and a demoted queue and runs demoted handles
 only when nothing is ready: least-attained service, where a task that spent its
 slice waits behind tasks that have not. Its ready queue holds `post_call(fn, arg)` calls in
-order with resumes (one 16-byte `fn(arg)` per entry, a resume being one such call), all on its
-own thread, so a cancel's hop to the scheduler runs in a simulation. `asio_scheduler` posts
+order with resumes (one 16-byte `fn(arg)` per entry, a resume being one such call), so a cancel's
+hop to the scheduler runs in a simulation; a `post_call` from another thread waits in a locked
+inbox that `run()` moves into the ready queue once it is empty. `asio_scheduler` posts
 ready handles to its executor and keeps demoted handles in a local queue drained one per
 executor pass.
 

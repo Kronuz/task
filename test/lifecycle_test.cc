@@ -5,13 +5,29 @@
 //            left is reported and the earlier components only flush
 //   hurry    a hurry cancels at once, and abandons grace after
 //   failure  a start that throws: the started ones stop, drain and flush in reverse; named
+//   start-token  a start or ready failure requests the start token, so work a started
+//            component runs on it ends and its drain returns
+//   stop-throws  a stop() that throws: every other stop, drain and flush runs, the throw is
+//            reported, and the bound's timer ends with the lifecycle
 //   nested   a set of components inside a lifecycle, in its parent's order; a nested failure
-//   parent   a parent component's stop is a nested lifecycle's stop source
+//   parent   a parent component's stop is a nested lifecycle's stop source; its flush()
+//            forwards to the inner set, so the third signal flushes the children
+//   flush-off-loop  the flushes run off the loop: a flush() that needs the loop returns
+//   flush-fail  a flush the third signal runs may call fail() on its source
+//   signal-close  ~stop_signals waits for a handler that loaded the pipe before it closes it
 //   tool     a tool's end stops the lifecycle; fail() is reported
+//   asio     service-shape's main on asio_scheduler: io.run() returns only after the flushes
 // Every frame and cancel state is freed at the end (TASK_COUNT_FRAMES).
 #define TASK_COUNT_FRAMES 1
+#define TASK_TEST_HOOKS 1
 #include "lifecycle.hh"
+#if TASK_LIFECYCLE_ASIO
+#include <asio/io_context.hpp>
 
+#include "task_asio.hh"
+#endif
+
+#include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
@@ -21,9 +37,11 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <poll.h>
+#include <pthread.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -78,7 +96,8 @@ struct probe {
 static_assert(task::component<probe>);
 
 // Runs t on s, calling act(ms) before each simulated millisecond, until it ends or `limit`.
-std::optional<task::stopped> drive(task::inline_scheduler& s, task::task<task::stopped> t, const std::function<void(u64)>& act, u64 limit = 100'000) {
+// With nothing queued or armed it yields, so the flush thread runs.
+std::optional<task::stopped> drive(task::inline_scheduler& s, task::task<task::stopped> t, const std::function<void(u64)>& act, u64 limit = 1'000'000) {
 	std::optional<task::stopped> result;
 	task::spawn(task::scheduler_ref::of(s), std::move(t), [&](std::exception_ptr e, std::optional<task::stopped> r) {
 		CHECK(!e);
@@ -90,6 +109,7 @@ std::optional<task::stopped> drive(task::inline_scheduler& s, task::task<task::s
 		s.run();
 		s.advance(ms);
 		s.run();
+		if (!s.queued() && !s.armed_timers()) { std::this_thread::yield(); }
 	}
 	return result;
 }
@@ -155,6 +175,75 @@ void failure() {
 	CHECK((g_log == lines{"start a", "start b", "stop a", "drain a", "flush a"}));
 }
 
+// A component whose housekeeping runs on the token start(stop) gets; its drain awaits it.
+struct housekeeper {
+	task::event ended;
+	task::task<void> work(task::cancel_token stop) {
+		co_await task::sleep_until(task::never, stop);
+		g_log.push_back("housekeeping ended");
+		ended.set();
+	}
+	task::task<void> start(task::cancel_token stop) {
+		g_log.push_back("start housekeeper");
+		task::spawn(task::current(), work(stop));
+		co_return;
+	}
+	void stop() { g_log.push_back("stop housekeeper"); }
+	task::task<lines> drain(const task::stop_bound&) {
+		co_await ended;
+		co_return lines{};
+	}
+	void flush() { g_log.push_back("flush housekeeper"); }
+};
+
+void start_token() {
+	{
+		fixture f;  // a later start fails
+		housekeeper h;
+		probe b{"b", probe::quick, true};
+		auto r = drive(f.s, task::lifecycle(f.s, f.source, {}, f.ready(), h, b), [](u64) {}, 5'000);
+		CHECK(r && !r->ready && r->failure && r->failed == "b");
+		CHECK((g_log == lines{"start housekeeper", "start b", "stop housekeeper", "housekeeping ended", "flush housekeeper"}));
+	}
+	{
+		fixture f;  // ready() throws
+		housekeeper h;
+		auto r = drive(f.s, task::lifecycle(f.s, f.source, {}, [] { throw std::runtime_error("ready"); }, h), [](u64) {}, 5'000);
+		CHECK(r && !r->ready && r->failure);
+		CHECK((g_log == lines{"start housekeeper", "stop housekeeper", "housekeeping ended", "flush housekeeper"}));
+	}
+}
+
+struct throwing_stop : probe {
+	void stop() {
+		probe::stop();
+		throw std::runtime_error("stop " + id);
+	}
+};
+static_assert(task::component<throwing_stop>);
+
+void stop_throws() {
+	fixture f;
+	probe a{"a"}, c{"c"};
+	throwing_stop b{{"b"}};
+	auto r = drive(f.s, task::lifecycle(f.s, f.source, {}, f.ready(), a, b, c), [&](u64 t) {
+		if (t == 10) { f.source.request_stop(); }
+	});
+	CHECK(r && r->ready && r->failure);
+	try {
+		std::rethrow_exception(r->failure);
+	} catch (const std::runtime_error& e) {
+		CHECK(std::string(e.what()) == "stop b");
+	}
+	CHECK((g_log == lines{"start a", "start b", "start c", "ready @0", "stop c", "stop b", "stop a", "drain c", "drain b", "drain a", "flush c",
+	                      "flush b", "flush a"}));
+	CHECK(f.s.armed_timers() == 0);  // the bound's timer ended with the drains
+	for (int i = 0; i < 40'000; ++i) {  // past bound and grace: nothing of the lifecycle fires
+		f.s.advance(ms);
+		f.s.run();
+	}
+}
+
 void nested() {
 	{
 		fixture f;
@@ -188,9 +277,11 @@ void nested() {
 	}
 }
 
-// A component that runs its own lifecycle over children, its stop as their stop source.
+// A component that runs its own lifecycle over children, its stop as their stop source. It
+// holds the children as one set, so its flush() forwards to them (service-shape's pattern).
 struct parent_component {
 	probe x{"x"}, y{"y"};
+	task::components children{x, y};
 	std::optional<task::stop_source> inner;
 	std::optional<task::stopped> result;
 	task::event ended;
@@ -202,7 +293,7 @@ struct parent_component {
 		co_return;
 	}
 	task::task<void> run() {
-		result = co_await task::lifecycle(*g_sched, *inner, {}, {}, x, y);
+		result = co_await task::lifecycle(*g_sched, *inner, {}, {}, children);
 		ended.set();
 	}
 	void stop() { g_log.push_back("stop parent"); }
@@ -211,19 +302,106 @@ struct parent_component {
 		g_log.push_back("drained parent");
 		co_return result->unfinished;
 	}
-	void flush() { g_log.push_back("flush parent"); }
+	void flush() {
+		g_log.push_back("flush parent");
+		children.flush();
+	}
 };
 
 void parent() {
+	{
+		fixture f;
+		probe a{"a"};
+		parent_component p;
+		auto r = drive(f.s, task::lifecycle(f.s, f.source, {}, f.ready(), a, p), [&](u64 t) {
+			if (t == 10) { f.source.request_stop(); }
+		});
+		CHECK(r && r->ready && !r->failure && p.result && p.result->ready);
+		// The inner lifecycle sees the stop through a hop, so a stops before x and y.
+		CHECK((g_log == lines{"start a", "start parent", "ready @0", "start x", "start y", "stop parent", "stop a", "stop y", "stop x", "drain y",
+		                      "drain x", "flush y", "flush x", "drained parent", "drain a", "flush parent", "flush y", "flush x", "flush a"}));
+	}
+	{
+		fixture f;  // the third signal while the inner drain waits: the children flush too
+		probe a{"a"};
+		parent_component p;
+		p.x.drains = probe::until_abandon;
+		lines at_third;
+		auto r = drive(f.s, task::lifecycle(f.s, f.source, {}, f.ready(), a, p), [&](u64 t) {
+			if (t == 10) { f.source.request_stop(); }
+			if (t == 20) {
+				const auto before = g_log.size();
+				f.source.run_flushes();
+				at_third.assign(g_log.begin() + long(before), g_log.end());
+			}
+		});
+		CHECK(r);
+		CHECK((at_third == lines{"flush parent", "flush y", "flush x", "flush a"}));
+	}
+}
+
+// A flush() that needs the loop: it queues a call there and waits for it to run.
+struct loop_flush : probe {
+	void flush() {
+		probe::flush();
+		std::atomic<bool> ran{false};
+		CHECK(task::scheduler_ref::of(*g_sched).post_call([](void* p) { static_cast<std::atomic<bool>*>(p)->store(true); }, &ran));
+		const auto until = std::chrono::steady_clock::now() + 5s;
+		while (!ran.load() && std::chrono::steady_clock::now() < until) { std::this_thread::yield(); }
+		CHECK(ran.load());  // on the loop it would wait forever
+	}
+};
+static_assert(task::component<loop_flush>);
+
+void flush_off_loop() {
 	fixture f;
-	probe a{"a"};
-	parent_component p;
-	auto r = drive(f.s, task::lifecycle(f.s, f.source, {}, f.ready(), a, p), [&](u64 t) {
+	loop_flush a{{"a"}};
+	auto r = drive(f.s, task::lifecycle(f.s, f.source, {}, f.ready(), a), [&](u64 t) {
 		if (t == 10) { f.source.request_stop(); }
 	});
-	CHECK(r && r->ready && !r->failure && p.result && p.result->ready);
-	CHECK((g_log == lines{"start a", "start parent", "ready @0", "start x", "start y", "stop parent", "stop a", "stop y", "stop x", "drain y",
-	                      "drain x", "flush y", "flush x", "drained parent", "drain a", "flush parent", "flush a"}));
+	CHECK(r && r->ready && !r->failure);
+	CHECK((g_log == lines{"start a", "ready @0", "stop a", "drain a", "flush a"}));
+}
+
+void flush_fail() {
+	task::stop_source source;
+	std::atomic<bool> flushed{false};
+	const auto registration = source.add_flush([&] {
+		source.fail(std::make_exception_ptr(std::runtime_error("flush")));
+		CHECK(source.failure());
+		flushed.store(true);
+	});
+	std::thread([&] { source.run_flushes(); }).detach();  // the third signal's thread
+	const auto until = std::chrono::steady_clock::now() + 5s;
+	while (!flushed.load() && std::chrono::steady_clock::now() < until) { std::this_thread::yield(); }
+	CHECK(flushed.load());  // under the source's lock it would deadlock
+	CHECK(source.stop().requested());
+}
+
+std::atomic<bool> g_loaded{false}, g_closed{false};
+
+void signal_close() {
+	std::optional<task::stop_signals> sig;
+	sig.emplace(std::initializer_list<int>{SIGINT, SIGTERM}, std::initializer_list<int>{SIGUSR1}, [](int) {});
+	std::thread handler([] {  // a handler preempted between loading the pipe and writing to it
+		task::detail::test_hooks::signal_loaded = [] {
+			g_loaded.store(true);
+			const auto until = std::chrono::steady_clock::now() + 300ms;
+			while (!g_closed.load() && std::chrono::steady_clock::now() < until) {}
+		};
+		::pthread_kill(::pthread_self(), SIGUSR1);
+		task::detail::test_hooks::signal_loaded = nullptr;
+	});
+	while (!g_loaded.load()) { std::this_thread::yield(); }
+	sig.reset();  // waits for the handler's write before it closes the pipe
+	int fresh[2];  // the closed descriptors' numbers, reused
+	CHECK(::pipe(fresh) == 0);
+	g_closed.store(true);
+	handler.join();
+	pollfd p{fresh[0], POLLIN, 0};
+	CHECK(::poll(&p, 1, 0) == 0);  // the late write did not land in the new pipe
+	::close(fresh[0]);
+	::close(fresh[1]);
 }
 
 void tool() {
@@ -303,6 +481,40 @@ void signals() {
 	::close(out[0]);
 }
 
+#if TASK_LIFECYCLE_ASIO
+// service-shape's main: io.run() with no work guard of its own, stopped from another thread.
+void asio_main() {
+	asio::io_context io(1);
+	std::atomic<bool> flushed{false};
+	struct quick {
+		std::atomic<bool>* flushed;
+		task::task<void> start(task::cancel_token) { co_return; }
+		void stop() {}
+		task::task<lines> drain(const task::stop_bound&) { co_return lines{}; }
+		void flush() { flushed->store(true); }
+	} a{&flushed};
+	task::stop_source source;
+	bool ended = false;
+	std::thread stopper([&] {
+		std::this_thread::sleep_for(100ms);
+		source.request_stop();
+	});
+	{
+		task::asio_scheduler loop(io.get_executor());
+		task::spawn(task::scheduler_ref::of(loop), task::lifecycle(loop, source, {}, {}, a), [&](std::exception_ptr e, std::optional<task::stopped> r) {
+			CHECK(!e && r && !r->failure);
+			ended = true;
+			io.stop();
+		});
+		io.run();
+		CHECK(ended && flushed.load());  // without the lifecycle's work guard, run() returns at once
+		stopper.join();
+		loop.close();
+		loop.destroy_roots();
+	}
+}
+#endif
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -313,9 +525,17 @@ int main(int argc, char** argv) {
 	if (only == "all" || only == "bound") { bound(); }
 	if (only == "all" || only == "hurry") { hurry(); }
 	if (only == "all" || only == "failure") { failure(); }
+	if (only == "all" || only == "start-token") { start_token(); }
+	if (only == "all" || only == "stop-throws") { stop_throws(); }
 	if (only == "all" || only == "nested") { nested(); }
 	if (only == "all" || only == "parent") { parent(); }
+	if (only == "all" || only == "flush-off-loop") { flush_off_loop(); }
+	if (only == "all" || only == "flush-fail") { flush_fail(); }
+	if (only == "all" || only == "signal-close") { signal_close(); }
 	if (only == "all" || only == "tool") { tool(); }
+#if TASK_LIFECYCLE_ASIO
+	if (only == "all" || only == "asio") { asio_main(); }
+#endif
 	CHECK(task::detail::live_frames() == baseline);
 	std::printf("lifecycle_test: ok\n");
 	return 0;

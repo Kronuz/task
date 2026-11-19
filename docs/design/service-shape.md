@@ -100,7 +100,7 @@ struct stop_timing { std::chrono::nanoseconds bound = 35s, grace = 5s; };
 template <typename C>
 concept component = requires(C& c, cancel_token stop, const stop_bound& b) {
 	{ c.start(stop) } -> std::same_as<task<void>>;  // on the loop; returns once serving, or at stop
-	c.stop();   // any thread, at once, idempotent: refuse new outside work
+	c.stop();   // any thread, at once, idempotent: refuse new outside work; a throw is reported
 	{ c.drain(b) } -> std::same_as<task<std::vector<std::string>>>;  // on the loop; what it left
 	c.flush();  // any thread, blocking, idempotent: acknowledged writes are durable on return
 };  // an optional name() labels a failing start
@@ -135,7 +135,7 @@ public:
 };
 
 struct stopped {
-	std::exception_ptr failure;           // the first start, ready, drain or flush error, else fail()'s
+	std::exception_ptr failure;           // the first start, ready, stop, drain or flush error, else fail()'s
 	std::string failed;                   // the component whose start threw
 	std::vector<std::string> unfinished;  // what drains left at `abandon`, in drain order
 	bool ready = false;                   // every start returned and ready() ran
@@ -159,7 +159,7 @@ task::spawn(task::scheduler_ref::of(loop),
 	            result = r ? std::move(*r) : task::stopped{e};
 	            io.stop();
             });
-io.run();                                 // phase 1 for the control loop
+io.run();                                 // phase 1; the lifecycle holds the loop's work guard
 if (!result.unfinished.empty()) {         // every flush() has returned
 	for (auto& line : result.unfinished) { L_WARNING("{}", line); }
 	Logging::finish(); Logging::join();
@@ -169,8 +169,11 @@ loop.close(); loop.destroy_roots();       // phases 2 and 3; destructors are pha
 return result.failure ? exit_status(result.failure) : 0;
 ```
 
-A nested lifecycle runs inside a component: its `start(stop)` spawns `lifecycle(loop, inner, ...)`
-over a `stop_source inner(stop)`, and its drain awaits that lifecycle's end. A plain set of
+A nested lifecycle runs inside a component: it holds its children as one `task::components
+children(x, y)`, its `start(stop)` spawns `lifecycle(loop, inner, ..., children)` over a
+`stop_source inner(stop)`, its drain awaits that lifecycle's end, and its `flush()` forwards to
+`children.flush()`, so the third signal reaches them (Xapiand D140). The inner lifecycle sees the
+stop through a hop, so the parent's earlier siblings stop before its children. A plain set of
 components nests without one: `task::components inner(b, c)` is passed as one component.
 
 ## Stop and drain order
@@ -185,16 +188,20 @@ signal 3                -> the signal thread runs every flush(), then SIG_DFL an
 1. `lifecycle` adds each component's `flush` to the stop source and awaits its `start(stop.stop())`, in
    order, so a first signal ends a start's wait (detentd's lone-quorum wait, the agent's
    preparation) as it does today. A start that throws, or one a stop ended, becomes `failure`
-   or a stop, and the started ones stop and drain. Then it calls `ready`.
+   or a stop, and the started ones stop and drain. Then it calls `ready`. A start or `ready`
+   failure requests the stop token the components were given, so work a started component runs
+   on it ends before its drain.
 2. At `stop.stop()` it makes `b.cancel`, requested at `now + bound - grace` or at
    `stop.hurry()`, and `b.abandon`, `grace` after `b.cancel`, both on the loop's wheel.
-3. It calls every `stop()` in reverse, then each drain in reverse. In a drain no wait takes the
+3. It calls every `stop()` in reverse (a throw becomes `failure`, and the rest still stop), then
+   each drain in reverse. In a drain no wait takes the
    stop token: requests take `b.cancel`, cancelled work `b.abandon`, and pacing sleeps and
    durable work none.
 4. A drain's throw becomes `failure`. A drain that returns lines leaves threads that may use the
    later components, so those only `flush()`. `main` then exits `EX_TEMPFAIL`
    without teardown, as Xapiand does (`manager.cc:1188-1195`).
-5. Every path ends with each started component's `flush()`, in reverse, before `lifecycle` returns: a
+5. Every path ends with each started component's `flush()`, in reverse, on a thread of its own
+   (D11) that `lifecycle` awaits before it returns: a
    normal stop, a start that throws, a drain that throws (later drains still run), and an
    unfinished drain. Xapiand's WAL join on a normal stop is that `flush()`.
 
@@ -257,7 +264,7 @@ sleep still armed at teardown is cancelled when phase 3 destroys its frame (D10)
 | D13 | No wait inside a drain takes the stop token | Pacing loops would spin; the agent's terminal checks would never run |
 | D14 | One time shape, `now()` nanoseconds; step 1 moves `deadline` to it (5 call sites outside task) | `time_point` for `deadline` alone; `scheduler_ref` has no clock type |
 | D15 | The driver is `task::lifecycle` over `component`s; it takes a `stop_source`, of which `stop_signals` is one, and a set of components (`components`) is a component, so lifecycles nest (Xapiand D132) | `serve(loop, stop_signals&, ...)`: only the process's signals could stop a set, and a set could not nest |
-| D16 | Flushes run on the loop at the end of every path, and on the signal thread at the third signal; `flush()` is idempotent and thread-safe | A flush thread per lifecycle (D11's hop): the fake-clock scheduler is single-threaded, and the loop has no work left to keep moving once the drains returned or were abandoned |
+| D16 | Flushes run off the loop: at the end of every path on a thread of their own (D11) that `lifecycle` awaits through `post_call`, and on the signal thread at the third signal; `flush()` is idempotent and thread-safe (Xapiand D140) | Flushes on the loop: the loop may be what is stuck, abandoned work could not move during the flush, a `flush()` that needs the loop would deadlock, and a nested lifecycle's flush would block its parent's loop |
 
 ## Limits
 

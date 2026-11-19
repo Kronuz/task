@@ -22,7 +22,8 @@ test/deadline_test.cc  Deadlines and timers on inline_scheduler's wheel: reentry
 test/deadline_asio_test.cc  asio_scheduler's wheel: off-loop deadlines, teardown with roots,
                    two loops. test/deadline_alloc_test.cc  no allocation per deadline.
 test/blocking_test.cc  blocking_scheduler: cross-thread wakes, lost wakes, the blocking entry.
-test/timers_test.cc  sleeps, group, periodic and debounce on the manual clock; a sleep on Asio.
+test/timers_test.cc  sleeps, group, periodic and debounce on the manual clock; a sleep on Asio;
+                     a sleep's fire against a held cross-thread cancel.
 test/lifecycle_test.cc  stop order, bound, hurry, start failure, nesting, stop sources, and
                    three SIGTERMs in a child process.
 bench/bench.cc     No-op task cost and allocations; Asio yield latency; the same two measurements on asio::awaitable.

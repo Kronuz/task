@@ -40,7 +40,7 @@ it.
   `debounce`, with no thread and no fixed-interval poll.
 - **One lifecycle per process.** `lifecycle.hh`: `task::lifecycle(loop, stop, timing, ready,
   components...)` starts `component`s in order, and at the stop source's stop runs every `stop()`
-  in reverse, each `drain(bound)` in reverse inside one bound, then every `flush()`. Stop sources
+  in reverse, each `drain(bound)` in reverse inside one bound, then every `flush()` off the loop. Stop sources
   are `stop_source` (tests, admin commands, a parent component, a tool's end) and `stop_signals`
   (stop, hurry, flush then die); `components` nests a set inside a lifecycle.
 

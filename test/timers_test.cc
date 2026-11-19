@@ -1,18 +1,26 @@
 // sleep_until and sleep_for, group, periodic and debounce, on inline_scheduler's manual clock
 // (firing times in simulated milliseconds) and on an asio_scheduler (a cross-thread cancel):
 //   sleep     fires at its time, a token ends it early and unfiles the entry, never waits for the token
+//   sleep-forced  on blocking_scheduler, a cross-thread cancel held between its claim and its hop
+//             while the entry fires: the fire waits for the hop, drive() never stalls
+//   sleep-no-post-call  the control, not in `all`: a cancellable sleep on a scheduler without
+//             post_call aborts on the assertion (Debug); it exits 1 without one
 //   group     join wakes at zero, a token ends it first, an escaping exception goes to failed
 //   periodic  ticks a period after the previous one ends; a throw ticks again; stop ends it
 //   debounce  quiet, busy and force targets; stop drops pending fires; touch then returns false
 //   asio      sleep on asio_scheduler's wheel, cancelled from another thread
 // Every frame and cancel state is freed at the end (TASK_COUNT_FRAMES).
 #define TASK_COUNT_FRAMES 1
+#define TASK_TEST_HOOKS 1
 #include "task_asio.hh"
 #include "task_timers.hh"
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 #include <thread>
@@ -77,6 +85,71 @@ void sleep() {
 	later.request();
 	s.run();
 	CHECK(woke.size() == 4 && woke[3] == std::make_pair(u64(5'000), false));
+}
+
+std::atomic<bool> g_release{false};
+
+void sleep_forced() {
+	task::blocking_scheduler s;
+	task::cancel_source cancel;
+	std::optional<bool> fired;
+	std::atomic<bool> waiting{false};
+	auto sleeper = [&](task::cancel_token t) -> task::task<void> {
+		waiting.store(true);  // its await_suspend registers the callback in this same resume
+		fired = co_await task::sleep_for(50ms, std::move(t));
+	};
+	task::spawn(task::scheduler_ref::of(s), sleeper(cancel.token()));
+	std::thread other([&] {
+		task::detail::test_hooks::sleep_claimed = [] {  // preempted between the claim and the hop
+			const auto until = std::chrono::steady_clock::now() + 300ms;
+			while (!g_release.load() && std::chrono::steady_clock::now() < until) { std::this_thread::yield(); }
+		};
+		while (!waiting.load()) { std::this_thread::yield(); }
+		std::this_thread::sleep_for(5ms);
+		cancel.request();
+		task::detail::test_hooks::sleep_claimed = nullptr;
+	});
+	const bool done = s.drive([&] { return fired.has_value(); });  // the entry fires at 50 ms, mid-hold
+	g_release.store(true);
+	other.join();
+	if (!done) { CHECK(s.drive([&] { return fired.has_value(); }, [] { return true; })); }  // the hop came after the stall
+	std::printf("sleep-forced drive=%s %s\n", done ? "cancelled" : "stalled", done ? "ok" : "FAILS");
+	CHECK(done && fired == false && s.armed_timers() == 0);
+}
+
+// Timers and posts, but no post_call.
+struct no_call_scheduler {
+	std::deque<std::coroutine_handle<>> ready;
+	wheel::timer_wheel wheel{0};
+	void post(std::coroutine_handle<> h) { ready.push_back(h); }
+	std::uint64_t now() const noexcept { return 0; }
+	void arm(wheel::timer_entry& e, std::uint64_t at) { wheel.arm(e, at); }
+	bool cancel(wheel::timer_entry& e) noexcept {
+		if (!e.armed()) { return false; }
+		wheel.cancel(e);
+		return true;
+	}
+	void run() {
+		task::running_on scope(task::scheduler_ref::of(*this));
+		while (!ready.empty()) {
+			const auto h = ready.front();
+			ready.pop_front();
+			h.resume();
+		}
+	}
+};
+
+int sleep_no_post_call() {
+	no_call_scheduler s;
+	task::cancel_source cancel;
+	auto sleeper = [](task::cancel_token t) -> task::task<void> { co_await task::sleep_for(1h, std::move(t)); };
+	task::spawn(task::scheduler_ref::of(s), sleeper(cancel.token()));
+	s.run();
+	std::printf("sleep-no-post-call: cancelling (expected: the assertion aborts)\n");
+	std::fflush(stdout);
+	cancel.request();
+	std::printf("sleep-no-post-call: no assertion, the cancel is lost\n");
+	std::_Exit(1);
 }
 
 void group() {
@@ -226,8 +299,10 @@ void asio_sleep() {
 
 int main(int argc, char** argv) {
 	const std::string_view only = argc > 1 ? argv[1] : "all";
+	if (only == "sleep-no-post-call") { return sleep_no_post_call(); }
 	const auto baseline = task::detail::live_frames();
 	if (only == "all" || only == "sleep") { sleep(); }
+	if (only == "all" || only == "sleep-forced") { sleep_forced(); }
 	if (only == "all" || only == "group") { group(); }
 	if (only == "all" || only == "periodic") { periodic(); }
 	if (only == "all" || only == "debounce") { debounce(); }
