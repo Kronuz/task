@@ -415,9 +415,7 @@ public:
 			init_(handler{this});
 			return park();
 		}
-#ifndef NDEBUG
 		on_loop_ = sched_.runs_here();
-#endif
 		cb_.emplace(token_, on_cancel{this});
 		TASK_TEST_HOOK(asio_registered);
 		if (token_.requested()) {
@@ -501,9 +499,7 @@ private:
 	bool started_ = false;    // the loop's thread only
 	bool pending_ = false;    // the loop's thread only
 	bool completed_ = false;  // the loop's thread only
-#ifndef NDEBUG
-	bool on_loop_ = false;
-#endif
+	bool on_loop_ = false;  // stored in every build so the layout is NDEBUG-independent; checked in Debug
 	std::optional<cancel_callback<on_cancel>> cb_;
 };
 
