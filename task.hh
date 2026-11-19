@@ -483,7 +483,15 @@ public:
 		return n;
 	}
 
-	std::size_t queued() const noexcept { return ready_.size() + demoted_.size(); }
+	// What the next run() resumes, a post_call waiting in the inbox included.
+	std::size_t queued() const noexcept {
+		std::size_t n = ready_.size() + demoted_.size();
+		if (inbox_waiting_.load(std::memory_order_acquire)) {
+			std::lock_guard lock(inbox_mutex_);
+			n += inbox_.size();
+		}
+		return n;
+	}
 
 private:
 	friend class detail::wheel_timer<inline_scheduler>;
@@ -506,7 +514,7 @@ private:
 	std::deque<std::coroutine_handle<>> demoted_;
 	std::uint64_t now_ = 0;
 	std::unique_ptr<wheel::timer_wheel> wheel_;
-	std::mutex inbox_mutex_;
+	mutable std::mutex inbox_mutex_;
 	std::thread::id owner_ = std::this_thread::get_id();  // the thread that drives it; under inbox_mutex_
 	std::atomic<std::thread::id> driver_{};  // the thread inside run_until, if any; in every build, one layout
 	std::vector<detail::queued_call> inbox_;  // post_call from other threads

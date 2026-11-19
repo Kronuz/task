@@ -18,6 +18,8 @@
 //   signal-close  ~stop_signals waits for a handler that loaded the pipe before it closes it
 //   tool     a tool's end stops the lifecycle; fail() is reported
 //   asio     service-shape's main on asio_scheduler: io.run() returns only after the flushes
+//   inbox    a post_call landing after run() returned waits in the inbox: queued() counts it, and
+//            the next run() runs it
 // Every frame and cancel state is freed at the end (TASK_COUNT_FRAMES).
 #define TASK_COUNT_FRAMES 1
 #define TASK_TEST_HOOKS 1
@@ -507,6 +509,20 @@ void signals() {
 	::close(out[0]);
 }
 
+// A loop that runs while queued(), as drive() does, never stops with a post_call pending.
+void inbox() {
+	task::inline_scheduler s;
+	s.run();  // this thread drives it
+	CHECK(s.queued() == 0);
+	std::atomic<int> ran{0};
+	std::thread([&] {
+		CHECK(task::scheduler_ref::of(s).post_call([](void* p) { ++*static_cast<std::atomic<int>*>(p); }, &ran));
+	}).join();
+	CHECK(s.queued() == 1 && ran.load() == 0);
+	CHECK(s.run() == 1);
+	CHECK(ran.load() == 1 && s.queued() == 0);
+}
+
 #if TASK_LIFECYCLE_ASIO
 // service-shape's main: io.run() with no work guard of its own, stopped from another thread.
 void asio_main() {
@@ -560,6 +576,7 @@ int main(int argc, char** argv) {
 	if (only == "all" || only == "flush-fail") { flush_fail(); }
 	if (only == "all" || only == "signal-close") { signal_close(); }
 	if (only == "all" || only == "tool") { tool(); }
+	if (only == "all" || only == "inbox") { inbox(); }
 #if TASK_LIFECYCLE_ASIO
 	if (only == "all" || only == "asio") { asio_main(); }
 #endif
