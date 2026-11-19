@@ -508,7 +508,9 @@ private:
 	std::unique_ptr<wheel::timer_wheel> wheel_;
 	std::mutex inbox_mutex_;
 	std::thread::id owner_ = std::this_thread::get_id();  // the thread that drives it; under inbox_mutex_
-	std::atomic<std::thread::id> driver_{};  // the thread inside run_until, if any; in every build, one layout
+#ifndef NDEBUG
+	std::atomic<std::thread::id> driver_{};  // the thread inside run_until, if any
+#endif
 	std::vector<detail::queued_call> inbox_;  // post_call from other threads
 	std::atomic<bool> inbox_waiting_{false};
 };
