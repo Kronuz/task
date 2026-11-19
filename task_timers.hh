@@ -56,7 +56,7 @@ public:
 	// Any thread: queues t on the group's scheduler.
 	void spawn(task<void> t) {
 		running_.fetch_add(1, std::memory_order_relaxed);
-		task::spawn(sched_, counted(std::move(t), ended{this}));
+		::task::spawn(sched_, counted(std::move(t), ended{this}));
 	}
 
 	struct join_awaiter;
