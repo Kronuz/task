@@ -6,7 +6,10 @@
 task.hh            task<T>, scheduler concept and scheduler_ref, inline_scheduler,
                    blocking_scheduler, frame pool,
                    spawn/run/sync_wait, yield/schedule_on, budget, cancellation, event,
-                   cancel_token/source/callback, deadline, async_mutex (lock(token)), when_all.
+                   cancel_token/source/callback, deadline, sleep_until/sleep_for, async_mutex (lock(token)), when_all.
+task_timers.hh     group, periodic, debounce: housekeeping on the loop's wheel (needs task.hh only).
+lifecycle.hh       component, components, stop_bound/stop_timing, stop_source, stop_signals,
+                   lifecycle (POSIX; needs task.hh only).
 task_asio.hh       asio_scheduler (demoted, start_timer, roots, close/destroy_roots), await_asio
                    with an optional token (target task::asio; fetches Asio 1.36.0).
 test/test.cc       Core tests; argv[1] sets the stress task count.
@@ -19,6 +22,9 @@ test/deadline_test.cc  Deadlines and timers on inline_scheduler's wheel: reentry
 test/deadline_asio_test.cc  asio_scheduler's wheel: off-loop deadlines, teardown with roots,
                    two loops. test/deadline_alloc_test.cc  no allocation per deadline.
 test/blocking_test.cc  blocking_scheduler: cross-thread wakes, lost wakes, the blocking entry.
+test/timers_test.cc  sleeps, group, periodic and debounce on the manual clock; a sleep on Asio.
+test/lifecycle_test.cc  stop order, bound, hurry, start failure, nesting, stop sources, and
+                   three SIGTERMs in a child process.
 bench/bench.cc     No-op task cost and allocations; Asio yield latency; the same two measurements on asio::awaitable.
 docs/API.md        The types and functions, and how to run a task.
 ```

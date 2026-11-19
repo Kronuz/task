@@ -1,8 +1,11 @@
 > Status: DRAFT (2026-11-12), revised for review. Reads task:47d50f3 (`task.hh`, `task_asio.hh`),
 > Asio 1.36.0, Xapiand:000224f5a, Detent:833c118c, prism:e0aea0e, journal:9c87929 and
-> consensus:3d988d1. Line numbers are at those commits. Nothing here is built.
+> consensus:3d988d1. Line numbers are at those commits. Xapiand D132 (2026-11-19) renamed the
+> driver: `serve` is `task::lifecycle`, the `service` concept is `component`, and the driver takes
+> a stop source. The API, the sleeps, `group`, `periodic`, `debounce` and the stop sources are
+> built (`task.hh`, `task_timers.hh`, `lifecycle.hh`); the migrations are not.
 
-# One service and housekeeping shape
+# One lifecycle and housekeeping shape
 
 How Prism, Detent and Xapiand start, run periodic work, and stop, in one shape each migrates to
 in its own quest (Detent D76), with one shutdown behavior (Detent D80, Xapiand D71).
@@ -10,8 +13,9 @@ in its own quest (Detent D76), with one shutdown behavior (Detent D80, Xapiand D
 ## Summary
 
 Each process's main thread runs one control loop. `task::stop_signals` turns the first signal
-into a stop token, the second into a hurry token, and the third into flush-then-die. A service
-has `start()`, `stop()`, `drain(bound)` and `flush()`; `task::serve` starts services in order,
+into a stop token, the second into a hurry token, and the third into flush-then-die; it is one
+stop source of several. A component has `start()`, `stop()`, `drain(bound)` and `flush()`;
+`task::lifecycle` starts components in order,
 then stops them all and drains them in reverse. Requests get one 35 s bound; durable work has
 none. Every wait is a wheel entry armed through the scheduler (D79); no shutdown polls.
 
@@ -40,26 +44,25 @@ Durable work:
 | Today | Where | Becomes |
 | :---- | :---- | :---- |
 | Detent authority: a 1 ms `asio::steady_timer`; `begin_shutdown` ends the runtime, which answers held polls 503 and pending writes `outcome_unknown`, then retires on 1 ms | `detent_authority/service.cc:640-655,2669,2691-2801` | the runtime sleeps `sleep_until(at, stop)`; `stop()` refuses new commands and answers held polls 503, while admitted writes still apply; `drain(b)` awaits them on `b.cancel`, then ends the runtime and joins it with no token; retirement paces on `sleep_for(1ms)`, no token |
-| detentd: a flag polled every 5 ms and 200 ms; `ready()` after the lone-quorum wait | `detentd/main.cc:183-223` | `serve(loop, signals, {}, ready, authority, http)`; the authority's `start()` holds the lone-quorum wait and throws `failure()`; a later failure calls `signals.fail()`; a stop before `ready` when detached stays a failure exit |
+| detentd: a flag polled every 5 ms and 200 ms; `ready()` after the lone-quorum wait | `detentd/main.cc:183-223` | `lifecycle(loop, signals, {}, ready, authority, http)`; the authority's `start()` holds the lone-quorum wait and throws `failure()`; a later failure calls `signals.fail()`; a stop before `ready` when detached stays a failure exit |
 | Detent agent: an `asio::signal_set`, a 20 ms drain poll, and `monitor` on 20 ms, which announces ready and makes a fence or preparation timeout the exit status | `detent_agent/managed_host.cc:28-124,186-227` | `start()` returns at `may_announce_ready`, throwing at the preparation timeout; `stop()` is `coordinator->close()`; `monitor` keeps its 20 ms status read for logs, no token, and calls `signals.fail(cause)` if the coordinator drains unasked; `drain(b)` joins, then runs the terminal checks |
 | Detent relay: an `asio::signal_set`; a 1 ms `tick` until every coordinator drains | `detent_relay/host.cc:276-290,355-375` | the tick paces on `sleep_for(1ms)`, no token; its failure (`:371-372`) calls `signals.fail()` |
-| Prism: `g_stop` polled every 100 ms, then a blocking `service.stop()` | `prism/src/main.cc:238-239,338-349` | a control loop and `serve(loop, signals, {}, ready, http)` |
+| Prism: `g_stop` polled every 100 ms, then a blocking `service.stop()` | `prism/src/main.cc:238-239,338-349` | a control loop and `lifecycle(loop, signals, {}, ready, http)` |
 | Xapiand: `XapiandManager` | `manager.cc` | the "manager.cc" table below |
 
 ## API
 
-`task.hh` gains the primitives. Times are the scheduler's `now()` nanoseconds (D14):
+`task.hh` gains the sleeps. Times are the scheduler's `now()` nanoseconds (D14):
 
 ```cpp
 // On a scheduler with timers: true at `at`, false once `token` is requested first.
+// at = task::never waits for the token alone.
 [[nodiscard]] detail::sleep_awaiter sleep_until(std::uint64_t at, cancel_token token = {});
 [[nodiscard]] detail::sleep_awaiter sleep_for(std::chrono::nanoseconds d, cancel_token token = {});
-// event: true once set(), false when `token` is requested first.
-[[nodiscard]] detail::event_wait_awaiter event::wait(cancel_token token);
 ```
 
-`task_service.hh` (new, so `task.hh` does not include `<functional>`, `<csignal>` or
-`<unordered_map>`) holds Xapiand's `control_plane.h`, generalized, and the process half:
+`task_timers.hh` holds Xapiand's `control_plane.h`, generalized, and needs only `task.hh`, so
+housekeeping is usable without a lifecycle:
 
 ```cpp
 class group {  // control::Tasks: tasks on one scheduler, counted until their frames end
@@ -67,12 +70,12 @@ public:
 	explicit group(scheduler_ref s) noexcept;
 	void spawn(task<void> t);  // any thread; an escaping exception goes to `failed`
 	std::size_t running() const noexcept;
-	[[nodiscard]] detail::join_awaiter join(cancel_token token = {});  // true at running() == 0
+	[[nodiscard]] join_awaiter join(cancel_token token = {});  // true at running() == 0
 	std::function<void(std::exception_ptr)> failed;
 };
 
 // tick() every `period` after the previous tick ends, until `stop`; a throw goes to
-// on_throw, and the next tick runs.
+// on_throw, and the next tick runs. tick may return task<void>.
 template <std::invocable F, std::invocable<std::exception_ptr> E>
 task<void> periodic(std::chrono::nanoseconds period, cancel_token stop, F tick, E on_throw);
 
@@ -83,41 +86,63 @@ public:
 	debounce(group& g, timing t, cancel_token stop, std::function<void(const Key&)> fire);
 	bool touch(const Key& key);  // any thread; false once stop is requested: run the call now
 };
+```
 
+`lifecycle.hh` holds the lifecycle and the stop sources (POSIX; it includes only `task.hh`):
+
+```cpp
 struct stop_bound {
-	cancel_token cancel;   // at bound - grace, or the second signal: cancel requests in flight
+	cancel_token cancel;   // at bound - grace, or the hurry: cancel requests in flight
 	cancel_token abandon;  // grace after cancel: stop waiting for cancelled work
 };
 struct stop_timing { std::chrono::nanoseconds bound = 35s, grace = 5s; };
 
-template <typename S>
-concept service = requires(S& s, cancel_token stop, const stop_bound& b) {
-	{ s.start(stop) } -> std::same_as<task<void>>;  // on the loop; returns once serving, or at stop
-	s.stop();   // any thread, at once, idempotent: refuse new outside work
-	{ s.drain(b) } -> std::same_as<task<std::vector<std::string>>>;  // on the loop; what it left
-	s.flush();  // any thread, blocking, idempotent: acknowledged writes are durable on return
-};
+template <typename C>
+concept component = requires(C& c, cancel_token stop, const stop_bound& b) {
+	{ c.start(stop) } -> std::same_as<task<void>>;  // on the loop; returns once serving, or at stop
+	c.stop();   // any thread, at once, idempotent: refuse new outside work
+	{ c.drain(b) } -> std::same_as<task<std::vector<std::string>>>;  // on the loop; what it left
+	c.flush();  // any thread, blocking, idempotent: acknowledged writes are durable on return
+};  // an optional name() labels a failing start
 
-class stop_signals {  // one per process
+class components {  // a set of components in start order, itself a component: lifecycles nest
 public:
-	explicit stop_signals(std::initializer_list<int> signals = {SIGINT, SIGTERM});
-	~stop_signals();  // joins the signal thread, restores the previous handlers
-	cancel_token stop() const noexcept;   // the first signal, request_stop() or fail()
-	cancel_token hurry() const noexcept;  // the second signal, or request_hurry()
-	void request_stop() noexcept;              // any thread
-	void request_hurry() noexcept;             // any thread
-	void fail(std::exception_ptr e) noexcept;  // any thread: keeps the first, then stops
-	void add_flush(std::function<void()> f);   // the third signal runs these, last first
-	int first_signal() const noexcept;         // 0 when the stop was asked for
+	template <component... C> explicit components(C&... cs);
+	const std::string& failed() const noexcept;  // the failing start: name() or position, "1/0" nested
+	task<drained> drain_all(const stop_bound& b);  // lines and the first failure, both kept
+	// start, stop, drain, flush as the concept
 };
 
-struct served {
-	std::exception_ptr failure;           // the first start, drain or fail() error
-	std::vector<std::string> unfinished;  // what drains left at `abandon`, in drain order
+class stop_source {  // tests, admin QUIT, a parent component, a tool's end
+public:
+	stop_source();
+	explicit stop_source(const cancel_token& parent, const cancel_token& parent_hurry = {});
+	cancel_token stop() const noexcept;   // request_stop(), fail() or the parent
+	cancel_token hurry() const noexcept;  // request_hurry() or the parent's hurry
+	void request_stop() noexcept;              // any thread
+	void request_hurry() noexcept;             // any thread; stops too
+	void fail(std::exception_ptr e) noexcept;  // any thread: keeps the first, then stops
+	flush_registration add_flush(std::function<void()> f);  // removed when the registration dies
+	void run_flushes() noexcept;               // every added flush, last first
 };
-template <typename L, service... S>
-task<served> serve(L& loop, stop_signals& signals, stop_timing t,
-                   std::function<void()> ready, S&... services);
+
+class stop_signals : public stop_source {  // one per process: the signals as a stop source
+public:
+	explicit stop_signals(std::initializer_list<int> stops = {SIGINT, SIGTERM},
+	                      std::initializer_list<int> dumps = {}, std::function<void(int)> dump = {});
+	~stop_signals();  // restores the previous handlers, joins the signal thread
+	int first_signal() const noexcept;  // 0 when the stop was asked for
+};
+
+struct stopped {
+	std::exception_ptr failure;           // the first start, ready, drain or flush error, else fail()'s
+	std::string failed;                   // the component whose start threw
+	std::vector<std::string> unfinished;  // what drains left at `abandon`, in drain order
+	bool ready = false;                   // every start returned and ready() ran
+};
+template <scheduler L, component... C>
+task<stopped> lifecycle(L& loop, stop_source& stop, stop_timing t,
+                        std::function<void()> ready, C&... components);
 ```
 
 Every `main` reads the same:
@@ -127,11 +152,11 @@ task::stop_signals signals;
 asio::io_context io(1);
 task::asio_scheduler loop(io.get_executor());
 Registry registry(...); Autocommit autocommit(registry); Http http(registry, ...);
-task::served result;
+task::stopped result;
 task::spawn(task::scheduler_ref::of(loop),
-            task::serve(loop, signals, {}, ready, registry, autocommit, http),
-            [&](std::exception_ptr e, std::optional<task::served> r) {
-	            result = r ? std::move(*r) : task::served{e, {}};
+            task::lifecycle(loop, signals, {}, ready, registry, autocommit, http),
+            [&](std::exception_ptr e, std::optional<task::stopped> r) {
+	            result = r ? std::move(*r) : task::stopped{e};
 	            io.stop();
             });
 io.run();                                 // phase 1 for the control loop
@@ -144,6 +169,10 @@ loop.close(); loop.destroy_roots();       // phases 2 and 3; destructors are pha
 return result.failure ? exit_status(result.failure) : 0;
 ```
 
+A nested lifecycle runs inside a component: its `start(stop)` spawns `lifecycle(loop, inner, ...)`
+over a `stop_source inner(stop)`, and its drain awaits that lifecycle's end. A plain set of
+components nests without one: `task::components inner(b, c)` is passed as one component.
+
 ## Stop and drain order
 
 ```text
@@ -153,19 +182,19 @@ b.cancel + grace        -> b.abandon: a drain stops waiting and reports what is 
 signal 3                -> the signal thread runs every flush(), then SIG_DFL and raise
 ```
 
-1. `serve` adds each service's `flush` to `signals` and awaits its `start(signals.stop())`, in
+1. `lifecycle` adds each component's `flush` to the stop source and awaits its `start(stop.stop())`, in
    order, so a first signal ends a start's wait (detentd's lone-quorum wait, the agent's
    preparation) as it does today. A start that throws, or one a stop ended, becomes `failure`
    or a stop, and the started ones stop and drain. Then it calls `ready`.
-2. At `signals.stop()` it makes `b.cancel`, a `deadline(loop, now + bound - grace,
-   signals.hurry())`, and `b.abandon`, `grace` after `b.cancel`.
+2. At `stop.stop()` it makes `b.cancel`, requested at `now + bound - grace` or at
+   `stop.hurry()`, and `b.abandon`, `grace` after `b.cancel`, both on the loop's wheel.
 3. It calls every `stop()` in reverse, then each drain in reverse. In a drain no wait takes the
    stop token: requests take `b.cancel`, cancelled work `b.abandon`, and pacing sleeps and
    durable work none.
 4. A drain's throw becomes `failure`. A drain that returns lines leaves threads that may use the
-   later services, so those only `flush()`, on a thread (D11). `main` then exits `EX_TEMPFAIL`
+   later components, so those only `flush()`. `main` then exits `EX_TEMPFAIL`
    without teardown, as Xapiand does (`manager.cc:1188-1195`).
-5. Every path ends with each started service's `flush()`, in reverse, before `serve` returns: a
+5. Every path ends with each started component's `flush()`, in reverse, before `lifecycle` returns: a
    normal stop, a start that throws, a drain that throws (later drains still run), and an
    unfinished drain. Xapiand's WAL join on a normal stop is that `flush()`.
 
@@ -190,20 +219,20 @@ nothing. The Xapiand timers msg-30 found on `AsioHost::arm` move:
 
 A closed `asio_scheduler`'s wheel never fires (`task_asio.hh:111-113,222`). Today Xapiand closes
 the control scheduler (`manager.cc:1119`), then reruns the loop so the registry's timers fire
-(`:1131`). Here the registry drains on the live loop, which closes only after `serve` returns. A
+(`:1131`). Here the registry drains on the live loop, which closes only after `lifecycle` returns. A
 sleep still armed at teardown is cancelled when phase 3 destroys its frame (D10).
 
 ## manager.cc
 
 | Duty | Today | New owner |
 | :---- | :---- | :---- |
-| Ordered stop (D16) | `join()` `:1033-1212`; one deadline `:1045`; `insisted()` `:1042` | `serve(loop, signals, {}, ready, registry, autocommit, http)`. Stop 1, HTTP's drain: requests awaited on `b.cancel`, then a D11 thread runs `HttpAsioService::stop()`, `IndexChores::cancel_all`, `close()`, `destroy_roots()` (`:1090-1102`) and sets the event, awaited on `b.abandon`. Stop 2, autocommit's drain. Stop 3, the registry's, no token: `finish()`, its control tasks joined as its `group` (`pool.cc:670-700`), timers cancelled, indexes committed. Stops 4-5: its `flush()` |
+| Ordered stop (Xapiand phase7c D16) | `join()` `:1033-1212`; one deadline `:1045`; `insisted()` `:1042` | `lifecycle(loop, signals, {}, ready, registry, autocommit, http)`. Stop 1, HTTP's drain: requests awaited on `b.cancel`, then a D11 thread runs `HttpAsioService::stop()`, `IndexChores::cancel_all`, `close()`, `destroy_roots()` (`:1090-1102`) and sets the event, awaited on `b.abandon`. Stop 2, autocommit's drain. Stop 3, the registry's, no token: `finish()`, its control tasks joined as its `group` (`pool.cc:670-700`), timers cancelled, indexes committed. Stops 4-5: its `flush()` |
 | Autocommit debounce | `:301-308`; `schedule_autocommit` `:536` | `task::debounce<Endpoint>` on its own source, requested by its drain, so writes during HTTP's drain still debounce |
 | Housekeeping | `control::Periodic` `:826`; `housekeeping_tick` `:506` | `periodic` owned by the schema cache, whose `on_throw` logs, as today (`control_plane.h:100-102`) |
-| Node identity | `:340-458`; `init` `:762-804`; name checks `:812-821` | free functions of a node module that `main` calls before `serve` |
-| Server wiring | `make_servers` `:895-985`; `set_ready_impl` `:989` | the HTTP service's `start()`; `fsyncher()` (`:984`) moves to the registry's `start()` |
+| Node identity | `:340-458`; `init` `:762-804`; name checks `:812-821` | free functions of a node module that `main` calls before `lifecycle` |
+| Server wiring | `make_servers` `:895-985`; `set_ready_impl` `:989` | the HTTP component's `start()`; `fsyncher()` (`:984`) moves to the registry's `start()` |
 | Index settings resolution | `:1257-1275` | callers use the index resolver (`IndexResolverLRU`) directly |
-| Metrics | `server_metrics_impl` `:1284`; `reactor_lag_metrics` `:1348`; labels `:883` | a function over the services' counters; labels set in `main` |
+| Metrics | `server_metrics_impl` `:1284`; `reactor_lag_metrics` `:1348`; labels `:883` | a function over the components' counters; labels set in `main` |
 | Signals | self-pipe `:186-215`; "you insisted" `:646-662`; `sig_handler` `main.cc:232-262,296` | `stop_signals` (`SA_RESTART`; its thread logs each signal's name); the second signal replaces "you insisted"; a `cancel_callback` on `signals.stop()` points stdin at `/dev/null`; the third signal replaces `exit(EX_SOFTWARE)` once deinited. SIGUSR1 and SIGINFO keep a dump `signal_set` |
 | Shutdown retries | `PeriodicTimer` `:184,708`; `shutdown_checks` `:739` | gone (D80); `PeriodicTimer` leaves Kronuz/reactor |
 | Admin stop | `/_quit`, `/_flush?clients` (`search_views.cc:1534,1551`) | `QUIT` stays behind `--admin-commands` and calls `signals.request_stop()`, the SIGTERM path; `FLUSH?clients` closes idle connections through http's idle close (Detent D81); `FLUSH?databases` unchanged (owner, Xapiand D76) |
@@ -227,6 +256,8 @@ sleep still armed at teardown is cancelled when phase 3 destroys its frame (D10)
 | D12 | A tick that throws goes to `on_throw`; the next tick runs | Ending on a throw: one `schemas->cleanup()` throw would end cleanup until restart |
 | D13 | No wait inside a drain takes the stop token | Pacing loops would spin; the agent's terminal checks would never run |
 | D14 | One time shape, `now()` nanoseconds; step 1 moves `deadline` to it (5 call sites outside task) | `time_point` for `deadline` alone; `scheduler_ref` has no clock type |
+| D15 | The driver is `task::lifecycle` over `component`s; it takes a `stop_source`, of which `stop_signals` is one, and a set of components (`components`) is a component, so lifecycles nest (Xapiand D132) | `serve(loop, stop_signals&, ...)`: only the process's signals could stop a set, and a set could not nest |
+| D16 | Flushes run on the loop at the end of every path, and on the signal thread at the third signal; `flush()` is idempotent and thread-safe | A flush thread per lifecycle (D11's hop): the fake-clock scheduler is single-threaded, and the loop has no work left to keep moving once the drains returned or were abandoned |
 
 ## Limits
 
@@ -254,7 +285,7 @@ each path of step 5, and a signal during `start()` ends it):
    root of another scheduler.
 2. task: `group`, `periodic` (a throwing tick ticks again), `debounce`, and a drain loop on
    `sleep_for(1ms)` that keeps pacing after the stop, on `inline_scheduler`.
-3. task: `stop_signals` and `serve`: three SIGTERMs, with the loop blocked in a drain or in
+3. task: `stop_signals` and `lifecycle`: three SIGTERMs, with the loop blocked in a drain or in
    teardown, kill after the flushes.
 4. Migrations: Prism, then Detent (an open poll stops well under the bound), then Xapiand after
    its Phase 7c gate (a second signal with queued WAL writes, and a restart reads them all back;

@@ -35,6 +35,14 @@ it.
 - **Coroutine primitives.** `event`, a FIFO `async_mutex` with cancellable waits, `when_all`,
   `yield`, `spawn`, `sync_wait`, and `await_asio` for any Asio operation.
 - **No allocation after warm-up.** Frames come from per-thread size-class pools.
+- **Housekeeping on the wheel.** `sleep_until` and `sleep_for` are wheel entries in the
+  waiting frame; `task_timers.hh` adds `group` (tasks joined at zero), `periodic` and a per-key
+  `debounce`, with no thread and no fixed-interval poll.
+- **One lifecycle per process.** `lifecycle.hh`: `task::lifecycle(loop, stop, timing, ready,
+  components...)` starts `component`s in order, and at the stop source's stop runs every `stop()`
+  in reverse, each `drain(bound)` in reverse inside one bound, then every `flush()`. Stop sources
+  are `stop_source` (tests, admin commands, a parent component, a tool's end) and `stop_signals`
+  (stop, hurry, flush then die); `components` nests a set inside a lifecycle.
 
 ## 🚀 Quick start
 
@@ -167,6 +175,10 @@ cmake --build build --target task_bench
   Kronuz/wheel, and the wheel's rules task keeps.
 - [docs/mechanisms/transfers.md](docs/mechanisms/transfers.md): symmetric transfer, the
   trampoline, and the trampoline each `running_on` scope owns.
+- [docs/mechanisms/lifecycle.md](docs/mechanisms/lifecycle.md): sleeps, `group`, `periodic`,
+  `debounce`, the stop sources and the stop order.
+- [docs/design/service-shape.md](docs/design/service-shape.md): the lifecycle's design and how
+  each daemon maps onto it.
 - [AGENTS.md](AGENTS.md): repository map, invariants, and how to verify a change.
 - [Catalog entry](https://github.com/Kronuz/cpp-libraries/blob/main/AGENTS.md#task).
 

@@ -47,6 +47,7 @@
 #include <mutex>
 #include <new>
 #include <optional>
+#include <stdexcept>
 #include <thread>
 #include <tuple>
 #include <type_traits>
@@ -1498,6 +1499,92 @@ inline void blocking_scheduler::drop_timer(blocking_scheduler* self, detail::tim
 	self->cancel(*s);
 	s->release();
 }
+
+namespace detail {
+
+// A sleep's wait: a wheel entry in the waiting frame, and a cancel callback on its token. One
+// compare-exchange settles it fired or cancelled; the fire resumes through a post, the cancel
+// hops to the scheduler through post_call, unfiles the entry there and posts the resume.
+class sleep_awaiter : wheel::timer_entry {
+public:
+	static constexpr std::uint64_t never = wheel::timer_wheel::never;
+
+	sleep_awaiter(std::uint64_t at, cancel_token token) noexcept : at_(at), token_(std::move(token)) { fire = &on_fire; }
+	sleep_awaiter(const sleep_awaiter&) = delete;
+	sleep_awaiter& operator=(const sleep_awaiter&) = delete;
+	// A frame destroyed while sleeping (teardown): deregister, then unfile.
+	~sleep_awaiter() {
+		callback_.reset();
+		if (armed()) { sched_.cancel(*this); }
+	}
+
+	bool await_ready() noexcept {
+		if (token_.requested()) { return true; }
+		if (at_ != never && current() && at_ <= current().now()) {
+			state_.store(fired, std::memory_order_relaxed);
+			return true;
+		}
+		return false;
+	}
+	void await_suspend(std::coroutine_handle<> h) {
+		handle_ = h;
+		sched_ = current();
+		if (!sched_) { throw std::logic_error("task::sleep_until off a scheduler"); }
+		assert((at_ != never || !token_empty(token_)) && "a sleep with no time and no token never ends");
+		if (at_ != never && !sched_.arm(*this, at_)) { throw std::logic_error("task::sleep_until on a scheduler without timers"); }
+		callback_.emplace(token_, on_cancel{this});  // a request now only queues the hop
+	}
+	// True at the time; false once the token was requested first.
+	bool await_resume() const noexcept { return state_.load(std::memory_order_acquire) == fired; }
+
+private:
+	enum : unsigned char { waiting, fired, cancelled, dead };
+	struct on_cancel {
+		sleep_awaiter* self;
+		void operator()() noexcept {
+			unsigned char w = waiting;
+			if (self->state_.compare_exchange_strong(w, cancelled, std::memory_order_acq_rel)) {
+				self->sched_.post_call(&hop, self);
+			}
+		}
+	};
+	// On the scheduler: the entry is unfiled on its own thread, then the frame resumes.
+	static void hop(void* p) {
+		auto* self = static_cast<sleep_awaiter*>(p);
+		if (self->armed()) { self->sched_.cancel(*self); }
+		self->sched_.post(self->handle_);
+	}
+	static void on_fire(wheel::timer_entry& e, bool expired) noexcept {
+		auto* self = static_cast<sleep_awaiter*>(&e);
+		unsigned char w = waiting;
+		// A dying wheel's fire leaves the frame suspended for teardown to destroy.
+		if (self->state_.compare_exchange_strong(w, expired ? fired : dead, std::memory_order_acq_rel) && expired) {
+			self->sched_.post(self->handle_);
+		}
+	}
+
+	std::uint64_t at_;
+	cancel_token token_;
+	std::coroutine_handle<> handle_;
+	scheduler_ref sched_;
+	std::atomic<unsigned char> state_{waiting};
+	std::optional<cancel_callback<on_cancel>> callback_;
+};
+
+}  // namespace detail
+
+// On a scheduler with timers: true at `at` (nanoseconds, as now()), false once `token` is
+// requested first. at = never waits for the token alone. Each sleep is a wheel entry in the
+// waiting frame, so it allocates nothing.
+[[nodiscard]] inline detail::sleep_awaiter sleep_until(std::uint64_t at, cancel_token token = {}) noexcept {
+	return detail::sleep_awaiter(at, std::move(token));
+}
+// As sleep_until(now() + d), on the current scheduler's clock.
+[[nodiscard]] inline detail::sleep_awaiter sleep_for(std::chrono::nanoseconds d, cancel_token token = {}) noexcept {
+	const std::uint64_t now = current() ? current().now() : 0;
+	return detail::sleep_awaiter(now + std::uint64_t(std::max<std::int64_t>(0, d.count())), std::move(token));
+}
+inline constexpr std::uint64_t never = wheel::timer_wheel::never;
 
 // A time slice. checkpoint() is free while the slice lasts; once it is spent, it
 // requeues the coroutine as demoted. Both throw cancelled when the token is set.

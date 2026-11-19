@@ -94,6 +94,25 @@ explains how each piece works.
   must define them the same (ODR); `test/pool_off_test.cc` is its own executable.
 - `cycles::calibrate()` measures the cycle counter once; call it at startup so the first
   budget does not busy-wait 2 ms on an event loop.
+- `sleep_until(at, token)` and `sleep_for(d, token)`: true at the time (nanoseconds, as `now()`),
+  false once the token is requested first; `sleep_until(task::never, token)` waits for the token
+  alone. The entry lives in the waiting frame and is armed through `scheduler_ref::arm`, so it
+  allocates nothing; a cancel from any thread hops to the scheduler through `post_call`.
+- `task_timers.hh` (needs only `task.hh`): `group(scheduler_ref)` counts the tasks it `spawn`s
+  until their frames end, `co_await g.join(token)` is true at zero, and an escaping exception goes
+  to `g.failed`. `periodic(period, stop, tick, on_throw)` runs `tick` (a function or a
+  `task<void>`) a period after the previous one ends until `stop`; a throw goes to `on_throw` and
+  the next tick runs. `debounce<Key>(group, {quiet, busy, min_force, max_force}, stop, fire)`:
+  `touch(key)` from any thread, `fire(key)` on the group's scheduler once quiet, never later than
+  the force; `stop` drops what is pending and `touch` then returns false.
+- `lifecycle.hh` (POSIX; needs only `task.hh`): `lifecycle(loop, stop, timing, ready,
+  components...)` returns `task<stopped>` (`failure`, `failed`, `unfinished`, `ready`). A
+  `component` has `start(stop)`, `stop()`, `drain(stop_bound)` returning what it left, `flush()`,
+  and optionally `name()`. `components(cs...)` is a set that is itself a component.
+  `stop_bound{cancel, abandon}` and `stop_timing{bound = 35s, grace = 5s}`. Stop sources:
+  `stop_source` (`request_stop`, `request_hurry`, `fail`, linked to a parent's tokens) and
+  `stop_signals`, one per process, whose first stop signal stops, second hurries and third runs
+  every flush then dies by the signal; dump signals call a function on its thread.
 - `yield()`, `schedule_on{s}`, `when_all(...)` (variadic and vectors), `spawn`, and
   `run` (drive a task to completion on an `inline_scheduler`).
 - Frames come from per-thread size-class pools: after warm-up a task allocates
