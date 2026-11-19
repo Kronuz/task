@@ -13,7 +13,8 @@
 //   parent   a parent component's stop is a nested lifecycle's stop source; its flush()
 //            forwards to the inner set, so the third signal flushes the children
 //   flush-off-loop  the flushes run off the loop: a flush() that needs the loop returns
-//   flush-inline  with no thread to start, every flush still runs, inline on the loop
+//   flush-inline  with no thread to start, every flush still runs, inline on the loop, and
+//            stopped.flushed_inline holds the start's error
 //   flush-fail  a flush the third signal runs may call fail() on its source
 //   signal-close  ~stop_signals waits for a handler that loaded the pipe before it closes it
 //   tool     a tool's end stops the lifecycle; fail() is reported
@@ -363,7 +364,7 @@ void flush_off_loop() {
 	auto r = drive(f.s, task::lifecycle(f.s, f.source, {}, f.ready(), a), [&](u64 t) {
 		if (t == 10) { f.source.request_stop(); }
 	});
-	CHECK(r && r->ready && !r->failure);
+	CHECK(r && r->ready && !r->failure && !r->flushed_inline);
 	CHECK((g_log == lines{"start a", "ready @0", "stop a", "drain a", "flush a"}));
 }
 
@@ -386,9 +387,14 @@ void flush_inline() {
 		if (t == 10) { f.source.request_stop(); }
 	});
 	task::detail::test_hooks::off_loop_start = nullptr;
-	CHECK(r && r->ready && !r->failure);
+	CHECK(r && r->ready && !r->failure && r->flushed_inline);
 	CHECK((g_log == lines{"start a", "start b", "ready @0", "stop b", "stop a", "drain b", "drain a", "flush b", "flush a"}));
 	CHECK(on_a == std::this_thread::get_id() && on_b == std::this_thread::get_id());
+	try {
+		std::rethrow_exception(r->flushed_inline);
+	} catch (const std::system_error& e) {
+		CHECK(e.code() == std::errc::resource_unavailable_try_again);
+	}
 }
 
 void flush_fail() {

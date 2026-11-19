@@ -418,6 +418,7 @@ struct stopped {
 	std::string failed;                   // the component whose start threw (components::failed())
 	std::vector<std::string> unfinished;  // what drains left at `abandon`, in drain order
 	bool ready = false;                   // every start returned and ready() ran
+	std::exception_ptr flushed_inline;    // the thread start's error when the flushes ran on the loop
 };
 
 namespace detail {
@@ -435,7 +436,7 @@ inline task<void> stop_bound_timer(std::uint64_t cancel_at, std::chrono::nanosec
 
 // Runs f on a thread of its own (service-shape D11), and resumes the waiting frame on its
 // scheduler through post_call, so the loop keeps running while f blocks; f's throw is rethrown.
-// When no thread can start, f runs inline on the loop.
+// When no thread can start, f runs inline on the loop and ran_inline() holds the start's error.
 class off_loop {
 public:
 	explicit off_loop(std::function<void()> f) : f_(std::move(f)) {}
@@ -457,6 +458,7 @@ public:
 				assert(posted && "off_loop needs a scheduler with post_call");
 			});
 		} catch (const std::system_error&) {
+			inline_ = std::current_exception();
 			run();
 			return false;
 		}
@@ -465,6 +467,7 @@ public:
 	void await_resume() const {
 		if (error_) { std::rethrow_exception(error_); }
 	}
+	std::exception_ptr ran_inline() const noexcept { return inline_; }
 
 private:
 	void run() noexcept {
@@ -485,6 +488,7 @@ private:
 	std::coroutine_handle<> handle_;
 	scheduler_ref where_;
 	std::exception_ptr error_;
+	std::exception_ptr inline_;
 };
 
 inline task<stopped> run_lifecycle(stop_source& source, stop_timing timing, std::function<void()> ready, components& set) {
@@ -531,11 +535,13 @@ inline task<stopped> run_lifecycle(stop_source& source, stop_timing timing, std:
 	finish.request();
 	co_await timer_ended;
 	if (!r.failure) { r.failure = d.failure; }
+	off_loop flushes([&set] { set.flush(); });
 	try {
-		co_await off_loop([&set] { set.flush(); });
+		co_await flushes;
 	} catch (...) {
 		if (!r.failure) { r.failure = std::current_exception(); }
 	}
+	r.flushed_inline = flushes.ran_inline();
 	r.unfinished = std::move(d.unfinished);
 	if (!r.failure) { r.failure = source.failure(); }
 	co_return r;
