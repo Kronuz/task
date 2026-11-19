@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -246,10 +247,12 @@ public:
 		return true;
 	}
 
-	// Any thread but a fire's own: takes every pending key and fires it on this thread, after a
-	// fire in progress on the loop ends, so every touch before it has fired when it returns. Every
-	// key fires; the first throw is rethrown after. Returns how many it fired.
+	// Any thread but a fire's own (a Debug assert): takes every pending key and fires it on this
+	// thread, after the fires in progress on the loop at the call end, so every touch before it has
+	// fired when it returns. Before a stop, a later touch of a taken key may fire on the loop while
+	// this fires it. Every key fires; the first throw is rethrown after. Returns how many it fired.
 	std::size_t fire_pending() {
+		assert(!fires_here() && "fire_pending() inside this debounce's fire waits for itself");
 		std::vector<std::pair<Key, unsigned>> taken;
 		{
 			std::unique_lock lock(m_);
@@ -262,9 +265,10 @@ public:
 				}
 			}
 			pending_ = 0;
-			if (firing_ != 0) {
+			if (oldest_) {
+				const std::uint64_t last = tickets_;  // later fires do not hold this call
 				TASK_TEST_HOOK(pending_waits);
-				idle_.wait(lock, [this] { return firing_ == 0; });
+				idle_.wait(lock, [&] { return !oldest_ || oldest_->ticket > last; });
 			}
 		}
 		std::exception_ptr first;
@@ -293,6 +297,14 @@ private:
 		unsigned flags = 0;
 		bool pending = false;  // else throttled until target
 	};
+	// A fire in progress on the loop, in its watch's frame.
+	struct firing {
+		const debounce* owner = nullptr;
+		firing* outer = nullptr;  // this thread's enclosing loop fire
+		std::uint64_t ticket = 0;
+		firing* prev = nullptr;  // under m_: fires in progress, oldest first
+		firing* next = nullptr;
+	};
 	static std::uint64_t ns(std::chrono::nanoseconds d) noexcept { return std::uint64_t(std::max<std::int64_t>(0, d.count())); }
 	std::uint64_t force_after() {  // under m_
 		const auto low = timing_.min_force.count();
@@ -302,6 +314,7 @@ private:
 
 	task<void> watch(Key key, std::uint64_t gen) {
 		for (;;) {
+			firing mark;
 			std::uint64_t target = 0;
 			unsigned flags = 0;
 			bool due = false;
@@ -324,7 +337,7 @@ private:
 					flags = std::exchange(e.flags, 0u);
 					e.pending = false;  // a touch from here on starts a new fire
 					--pending_;
-					++firing_;
+					begin_fire(mark);
 					if (timing_.throttle.count() > 0) {
 						e.target = now + ns(timing_.throttle);
 					} else {
@@ -342,17 +355,35 @@ private:
 			try {
 				fire_(key, flags);
 			} catch (...) {
-				fire_ended();
+				end_fire(mark);
 				hand_off(key, gen);
 				throw;  // to the group's `failed`
 			}
-			fire_ended();
+			end_fire(mark);
 			if (timing_.throttle.count() <= 0) { co_return; }
 		}
 	}
-	void fire_ended() {
+	// Under m_, on the thread about to fire: a ticket, the tail of the list, and this thread's mark.
+	void begin_fire(firing& f) noexcept {
+		f.owner = this;
+		f.ticket = ++tickets_;
+		f.prev = newest_;
+		(newest_ ? newest_->next : oldest_) = &f;
+		newest_ = &f;
+		f.outer = std::exchange(here_, &f);
+	}
+	void end_fire(firing& f) {
+		here_ = f.outer;
 		std::lock_guard lock(m_);
-		if (--firing_ == 0) { idle_.notify_all(); }
+		(f.prev ? f.prev->next : oldest_) = f.next;
+		(f.next ? f.next->prev : newest_) = f.prev;
+		if (!f.prev) { idle_.notify_all(); }  // the oldest ended: a waiter's bound may be met
+	}
+	bool fires_here() const noexcept {
+		for (const firing* f = here_; f; f = f->outer) {
+			if (f->owner == this) { return true; }
+		}
+		return false;
 	}
 	// After a throwing fire: drops a throttled entry; a pending one gets a watch of its own.
 	void hand_off(const Key& key, std::uint64_t gen) {
@@ -375,10 +406,13 @@ private:
 	cancel_token stop_;
 	std::function<void(const Key&, unsigned)> fire_;
 	mutable std::mutex m_;
-	std::condition_variable idle_;  // firing_ reached zero
+	std::condition_variable idle_;  // the oldest fire in progress ended
 	std::unordered_map<Key, entry, Hash> keys_;
 	std::size_t pending_ = 0;  // entries with a fire pending
-	std::size_t firing_ = 0;   // fires in progress on the group's scheduler
+	firing* oldest_ = nullptr;  // fires in progress on the group's scheduler, by ticket
+	firing* newest_ = nullptr;
+	std::uint64_t tickets_ = 0;
+	static inline thread_local firing* here_ = nullptr;  // this thread's innermost loop fire
 	std::uint64_t last_gen_ = 0;
 	std::mt19937_64 rng_;
 	std::atomic<std::uint64_t> fired_{0};
