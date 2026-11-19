@@ -288,7 +288,7 @@ sleep still armed at teardown is cancelled when phase 3 destroys its frame (D10)
 Each step is its own quest with tests that fail without it (among them: `flush()` runs once on
 each path of step 5, and a signal during `start()` ends it):
 
-1. task: sleeps, `event::wait`, D10, D14; under ASan, phase 3 destroying a sleeping root, one a
+1. task: sleeps, D10, D14; under ASan, phase 3 destroying a sleeping root, one a
    root of another scheduler.
 2. task: `group`, `periodic` (a throwing tick ticks again), `debounce`, and a drain loop on
    `sleep_for(1ms)` that keeps pacing after the stop, on `inline_scheduler`.

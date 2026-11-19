@@ -46,6 +46,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -434,6 +435,7 @@ inline task<void> stop_bound_timer(std::uint64_t cancel_at, std::chrono::nanosec
 
 // Runs f on a thread of its own (service-shape D11), and resumes the waiting frame on its
 // scheduler through post_call, so the loop keeps running while f blocks; f's throw is rethrown.
+// When no thread can start, f runs inline on the loop.
 class off_loop {
 public:
 	explicit off_loop(std::function<void()> f) : f_(std::move(f)) {}
@@ -444,24 +446,34 @@ public:
 	}
 
 	bool await_ready() const noexcept { return false; }
-	void await_suspend(std::coroutine_handle<> h) {
+	bool await_suspend(std::coroutine_handle<> h) {
 		handle_ = h;
 		where_ = current();
-		thread_ = std::thread([this] {
-			try {
-				f_();
-			} catch (...) {
-				error_ = std::current_exception();
-			}
-			[[maybe_unused]] const bool posted = where_.post_call(&resume, this);
-			assert(posted && "off_loop needs a scheduler with post_call");
-		});
+		try {
+			TASK_TEST_HOOK(off_loop_start);
+			thread_ = std::thread([this] {
+				run();
+				[[maybe_unused]] const bool posted = where_.post_call(&resume, this);
+				assert(posted && "off_loop needs a scheduler with post_call");
+			});
+		} catch (const std::system_error&) {
+			run();
+			return false;
+		}
+		return true;
 	}
 	void await_resume() const {
 		if (error_) { std::rethrow_exception(error_); }
 	}
 
 private:
+	void run() noexcept {
+		try {
+			f_();
+		} catch (...) {
+			error_ = std::current_exception();
+		}
+	}
 	static void resume(void* p) {
 		auto* self = static_cast<off_loop*>(p);
 		self->thread_.join();  // it only returns from post_call

@@ -7,12 +7,18 @@
 //   model     random arm, cancel and re-arm, from fires too, against a reference model
 //   long      deadlines beyond a 4,096 ms round and up to days: never early, at most a step late
 //   post_call inline_scheduler's same-thread post_call, in order with post, and a cancel's hop
+//   inbox     a post_call from another thread runs at the next step, ahead of a loop that keeps
+//             re-posting itself, demoted or ready
+//   owner     a second thread drives the scheduler after the first: the first's post_call is
+//             taken under the inbox's lock, before and while the second drives (run under TSan)
 // The timers are armed through scheduler_ref and fired by advance(), as a simulator drives them.
 // Every frame and cancel state is freed at the end (TASK_COUNT_FRAMES).
 #define TASK_COUNT_FRAMES 1
 #include "task.hh"
 
+#include <atomic>
 #include <chrono>
+#include <coroutine>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
@@ -22,6 +28,7 @@
 #include <random>
 #include <set>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #define CHECK(c)                                                                     \
@@ -344,6 +351,72 @@ void post_call() {
 	CHECK(reason == int(task::cancel_reason::deadline));
 	std::printf("post_call ok\n");
 }
+// Records the spinner's step at which it ran.
+struct step_call {
+	const int* steps;
+	int at = -1;
+	static void run(void* p) {
+		auto* c = static_cast<step_call*>(p);
+		c->at = *c->steps;
+	}
+};
+
+struct repost {
+	task::inline_scheduler* s;
+	bool demoted;
+	bool await_ready() const noexcept { return false; }
+	void await_suspend(std::coroutine_handle<> h) { demoted ? s->post_demoted(h) : s->post(h); }
+	void await_resume() const noexcept {}
+};
+
+// Re-posts itself `n` times; at step 10 another thread posts `during` and is joined.
+task::task<void> spinner(task::inline_scheduler* s, bool demoted, int n, int* steps, step_call* during) {
+	while (*steps < n) {
+		if (++*steps == 10) {
+			std::thread([&] { s->post_call(&step_call::run, during); }).join();
+		}
+		co_await repost{s, demoted};
+	}
+}
+
+void inbox() {
+	for (const bool demoted : {true, false}) {
+		task::inline_scheduler s;
+		int steps = 0;
+		step_call during{&steps}, between{&steps};
+		task::spawn(task::scheduler_ref::of(s), spinner(&s, demoted, 10'000, &steps, &during));
+		s.run_until([&] { return steps >= 20; });
+		std::thread([&] { s.post_call(&step_call::run, &between); }).join();
+		s.run();
+		CHECK(steps == 10'000);
+		// Taken at the next step: ahead of a demoted loop, behind a ready one by its one repost.
+		CHECK(during.at == (demoted ? 10 : 11));
+		CHECK(between.at == (demoted ? 20 : 21));
+	}
+	std::printf("inbox ok\n");
+}
+
+void owner() {
+	task::inline_scheduler s;  // this thread made it: its owner until another runs it
+	int ran = 0;
+	const auto count = [](void* p) { ++*static_cast<int*>(p); };
+	std::atomic<bool> go{false}, done{false};
+	std::thread driver([&] {
+		while (!go.load(std::memory_order_relaxed)) { std::this_thread::yield(); }
+		while (!done.load(std::memory_order_acquire)) {
+			s.run();
+			std::this_thread::yield();
+		}
+		s.run();
+	});
+	s.post_call(count, &ran);  // still the owner: no lock orders it before the driver's run
+	go.store(true, std::memory_order_relaxed);
+	for (int i = 0; i < 1'000; ++i) { s.post_call(count, &ran); }
+	done.store(true, std::memory_order_release);
+	driver.join();
+	CHECK(ran == 1'001);
+	std::printf("owner ok\n");
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -356,6 +429,8 @@ int main(int argc, char** argv) {
 	if (only == "all" || only == "model") { model(); }
 	if (only == "all" || only == "long") { long_deadlines(); }
 	if (only == "all" || only == "post_call") { post_call(); }
+	if (only == "all" || only == "inbox") { inbox(); }
+	if (only == "all" || only == "owner") { owner(); }
 	CHECK(task::detail::live_frames() == baseline);
 	std::printf("deadline_test: ok\n");
 	return 0;

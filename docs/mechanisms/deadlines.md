@@ -104,7 +104,9 @@ its deadlines; an `inline_scheduler` or `blocking_scheduler` may die first.
   false without timers), `reentry` (a fire cancels or re-arms another due entry, re-arms itself,
   or arms one already due), `model` (20,000 rounds of random arm, cancel and re-arm, from fires
   too, against a reference model), `long` (deadlines from 4,095 ms to 40 days, never early),
-  `post_call` (same-thread `post_call` in order with `post`; a deadline's cancel hops through it).
+  `post_call` (same-thread `post_call` in order with `post`; a deadline's cancel hops through it),
+  `inbox` (a cross-thread `post_call` runs at the next step while a loop keeps re-posting itself,
+  demoted or ready), `owner` (a second thread drives after the first; under TSan).
   `test/wheel_mutant.py rearm-fires-early` builds it against a wheel whose `arm` during an
   `expire` fires the entry in that same `expire`; `reentry` and `model` must fail.
 - `test/deadline_asio_test.cc`: `offloop` (deadlines created and destroyed on and off the loop,

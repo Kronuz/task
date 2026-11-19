@@ -396,14 +396,19 @@ public:
 
 	void post(std::coroutine_handle<> h) { ready_.push_back(detail::queued_call::of(h)); }
 	void post_demoted(std::coroutine_handle<> h) { demoted_.push_back(h); }
-	// Queues fn(arg) among the ready handles, in order, on the thread that runs it; from another
-	// thread it joins them once the ready handles run out (a cross-thread cancel, a flush thread).
+	// Queues fn(arg) among the ready handles, in order, on the thread that drives it (the last to
+	// call run); from another thread it waits in an inbox that the next step moves behind them,
+	// before any demoted handle (a cross-thread cancel, a flush thread).
 	void post_call(void (*fn)(void*), void* arg) {
-		if (owner_.load(std::memory_order_relaxed) == std::this_thread::get_id()) {
+		if (detail::draining_scheduler == this) {
 			ready_.push_back({fn, arg});
 			return;
 		}
-		std::lock_guard lock(inbox_mutex_);
+		std::lock_guard lock(inbox_mutex_);  // a driver takes it to become the owner
+		if (owner_ == std::this_thread::get_id()) {
+			ready_.push_back({fn, arg});
+			return;
+		}
 		inbox_.push_back({fn, arg});
 		inbox_waiting_.store(true, std::memory_order_release);
 	}
@@ -442,18 +447,24 @@ public:
 			~mark() { detail::draining_scheduler = previous; }
 		} marker;
 		detail::draining_scheduler = this;
-		owner_.store(std::this_thread::get_id(), std::memory_order_relaxed);
+		{
+			std::lock_guard lock(inbox_mutex_);
+			owner_ = std::this_thread::get_id();
+		}
 		std::size_t n = 0;
-		while (!stop() && (!ready_.empty() || !demoted_.empty() || take_inbox())) {
+		while (!stop()) {
+			take_inbox();
 			detail::slice_start = cycles::read();  // each resume is its own slice
 			if (!ready_.empty()) {
 				const detail::queued_call c = ready_.front();
 				ready_.pop_front();
 				c();
-			} else {
+			} else if (!demoted_.empty()) {
 				const auto h = demoted_.front();
 				demoted_.pop_front();
 				h.resume();
+			} else {
+				break;
 			}
 			++n;
 		}
@@ -465,14 +476,13 @@ public:
 private:
 	friend class detail::wheel_timer<inline_scheduler>;
 	static void drop_timer(inline_scheduler* self, detail::timed_cancel_state* s) noexcept;
-	// Moves what other threads posted into the ready handles; false when there was none.
-	bool take_inbox() {
-		if (!inbox_waiting_.load(std::memory_order_acquire)) { return false; }
+	// Moves what other threads posted behind the ready handles.
+	void take_inbox() {
+		if (!inbox_waiting_.load(std::memory_order_acquire)) { return; }
 		std::lock_guard lock(inbox_mutex_);
 		for (const auto& c : inbox_) { ready_.push_back(c); }
 		inbox_.clear();
 		inbox_waiting_.store(false, std::memory_order_relaxed);
-		return !ready_.empty();
 	}
 	// The timers advance() fires, made on first use.
 	wheel::timer_wheel& wheel() {
@@ -484,8 +494,8 @@ private:
 	std::deque<std::coroutine_handle<>> demoted_;
 	std::uint64_t now_ = 0;
 	std::unique_ptr<wheel::timer_wheel> wheel_;
-	std::atomic<std::thread::id> owner_{std::this_thread::get_id()};  // the thread that runs it
 	std::mutex inbox_mutex_;
+	std::thread::id owner_ = std::this_thread::get_id();  // the thread that drives it; under inbox_mutex_
 	std::vector<detail::queued_call> inbox_;  // post_call from other threads
 	std::atomic<bool> inbox_waiting_{false};
 };
@@ -729,6 +739,7 @@ inline thread_local void (*cancel_settled)() = nullptr;  // a lock(token) cancel
 inline thread_local void (*asio_registered)() = nullptr; // await_asio(init, token), between registering and the check
 inline thread_local void (*sleep_claimed)() = nullptr;    // a sleep's cancel callback, between its claim and its hop
 inline thread_local void (*signal_loaded)() = nullptr;    // stop_signals' handler, between loading the pipe and writing
+inline thread_local void (*off_loop_start)() = nullptr;   // off_loop, before it starts its thread; may throw
 }  // namespace detail::test_hooks
 #define TASK_TEST_HOOK(name) \
 	do { \

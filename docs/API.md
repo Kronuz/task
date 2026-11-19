@@ -16,7 +16,8 @@ explains how each piece works.
   `post_demoted(handle)` and `post_heavy(handle)` (the heavy lane, [lanes.md](lanes.md)). The library owns no run queue; the host's loop is the
   queue. `inline_scheduler` is a deterministic one for tests and simulation, with a manual
   clock whose `advance(ns)` fires the timers it passes (its `post_call` from another thread joins
-  the ready handles at its next `run()`), and `asio_scheduler` runs on an Asio
+  the ready handles at its next step, ahead of any demoted handle; one thread drives it at a
+  time, and the last to call `run()` is its owner), and `asio_scheduler` runs on an Asio
   executor that runs on one thread: an `io_context` run by one thread, not a strand over a
   multi-threaded one. `blocking_scheduler` runs on the thread that calls its
   `drive(done[, may_wait])`, on the steady clock: `post` and `post_call` work from any thread and

@@ -13,6 +13,7 @@
 //   parent   a parent component's stop is a nested lifecycle's stop source; its flush()
 //            forwards to the inner set, so the third signal flushes the children
 //   flush-off-loop  the flushes run off the loop: a flush() that needs the loop returns
+//   flush-inline  with no thread to start, every flush still runs, inline on the loop
 //   flush-fail  a flush the third signal runs may call fail() on its source
 //   signal-close  ~stop_signals waits for a handler that loaded the pipe before it closes it
 //   tool     a tool's end stops the lifecycle; fail() is reported
@@ -37,6 +38,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -363,6 +365,30 @@ void flush_off_loop() {
 	CHECK((g_log == lines{"start a", "ready @0", "stop a", "drain a", "flush a"}));
 }
 
+// A component whose flush records the thread it ran on.
+struct thread_flush : probe {
+	std::thread::id* flushed_on;
+	void flush() {
+		probe::flush();
+		*flushed_on = std::this_thread::get_id();
+	}
+};
+static_assert(task::component<thread_flush>);
+
+void flush_inline() {
+	fixture f;
+	task::detail::test_hooks::off_loop_start = [] { throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again)); };
+	std::thread::id on_a, on_b;
+	thread_flush a{{"a"}, &on_a}, b{{"b"}, &on_b};
+	auto r = drive(f.s, task::lifecycle(f.s, f.source, {}, f.ready(), a, b), [&](u64 t) {
+		if (t == 10) { f.source.request_stop(); }
+	});
+	task::detail::test_hooks::off_loop_start = nullptr;
+	CHECK(r && r->ready && !r->failure);
+	CHECK((g_log == lines{"start a", "start b", "ready @0", "stop b", "stop a", "drain b", "drain a", "flush b", "flush a"}));
+	CHECK(on_a == std::this_thread::get_id() && on_b == std::this_thread::get_id());
+}
+
 void flush_fail() {
 	task::stop_source source;
 	std::atomic<bool> flushed{false};
@@ -530,6 +556,7 @@ int main(int argc, char** argv) {
 	if (only == "all" || only == "nested") { nested(); }
 	if (only == "all" || only == "parent") { parent(); }
 	if (only == "all" || only == "flush-off-loop") { flush_off_loop(); }
+	if (only == "all" || only == "flush-inline") { flush_inline(); }
 	if (only == "all" || only == "flush-fail") { flush_fail(); }
 	if (only == "all" || only == "signal-close") { signal_close(); }
 	if (only == "all" || only == "tool") { tool(); }
