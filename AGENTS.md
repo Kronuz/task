@@ -8,7 +8,6 @@ task.hh            task<T>, scheduler concept and scheduler_ref, inline_schedule
                    spawn/run/sync_wait, yield/schedule_on, budget, cancellation, event,
                    cancel_token/source/callback, deadline, sleep_until/sleep_for, async_mutex (lock(token)), when_all.
 task_timers.hh     group, periodic, debounce: housekeeping on the loop's wheel (needs task.hh only).
-process.hh         run_daemon, ProcessLock, locked_pid (POSIX; standard library only).
 lifecycle.hh       component, components, stop_bound/stop_timing, stop_source, stop_signals,
                    lifecycle (POSIX; needs task.hh only).
 task_asio.hh       asio_scheduler (demoted, start_timer, roots, close/destroy_roots), await_asio
@@ -25,7 +24,6 @@ test/deadline_asio_test.cc  asio_scheduler's wheel: off-loop deadlines, teardown
 test/blocking_test.cc  blocking_scheduler: cross-thread wakes, lost wakes, the blocking entry.
 test/timers_test.cc  sleeps, group, periodic and debounce on the manual clock; a sleep on Asio;
                      a sleep's fire against a held cross-thread cancel.
-test/process_test.cc  run_daemon's ready, error and timeout reports; ProcessLock and locked_pid.
 test/lifecycle_test.cc  stop order, bound, hurry, start failure, nesting, stop sources, and
                    three SIGTERMs in a child process.
 bench/bench.cc     No-op task cost and allocations; Asio yield latency; the same two measurements on asio::awaitable.
