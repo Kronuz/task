@@ -113,8 +113,9 @@ explains how each piece works.
   fire)`: `touch(key, flags)` from any thread, `fire(key, flags)` on the group's scheduler once
   quiet, never later than the force, with the OR of the touches' flags; with `throttle`, a key
   fires at most once per `throttle`. `stop` ends the waits without firing and `touch` then
-  returns false; `fire_pending()` fires the pending keys on the calling thread, after a fire in
-  progress on the loop ends.
+  returns false; `fire_pending()` fires the pending keys on the calling thread, after the fires in
+  progress on the loop at the call end; called from a fire of the same debounce, it asserts
+  (Debug). Before a stop, a later touch may fire a taken key on the loop meanwhile.
 - `process.hh` (POSIX; standard library only): `run_daemon(detach, log, run, timeout)` forks and
   returns 0 at the child's `ready()` or throws its error or the timeout; `ProcessLock(path, system)`
   holds the pidfile lock (`acquired()`); `locked_pid(path)` names the holder.

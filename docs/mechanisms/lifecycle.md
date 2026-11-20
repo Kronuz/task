@@ -45,10 +45,23 @@ passes untouched, so entries are bounded by the pending keys and the keys fired 
 `throttle`. A throwing fire drops a throttled entry and hands a touched one to a new watcher.
 
 A stop cancels each sleep; the watcher erases a throttled entry and leaves a pending one for
-`fire_pending()`, which takes every pending entry under the mutex, waits for a fire in progress on
-the loop to end (a count of fires and a condition variable), and fires the taken keys on its own
-thread. A key the loop is firing is no longer pending, so it fires once, and every touch before
-`fire_pending()` has fired when it returns: the third signal's flush.
+`fire_pending()`, which takes every pending entry under the mutex, waits for the fires in progress
+on the loop at the call to end, and fires the taken keys on its own thread. A key the loop is
+firing is no longer pending, so it fires once, and every touch before `fire_pending()` has fired
+when it returns: the third signal's flush.
+
+Each loop fire links a node from its watcher's frame into a list in start order, with a ticket
+from a counter, under the mutex; it unlinks the node when the fire ends and notifies the
+condition variable when the node was the oldest. `fire_pending()` notes the last ticket issued and
+waits until the list is empty or its oldest ticket is later, so a fire the loop starts after the
+call never holds it, even before a stop with the loop firing back to back.
+
+The contract, for a call before the stop: a touch after the take creates a new entry, so the loop
+may fire a taken key while `fire_pending()` fires it on its own thread; the planned callers run
+after the stop, where no new fire starts. A fire must not call `fire_pending()` of its own
+debounce: it would wait for its own fire. Each loop fire also pushes its node on a thread-local
+chain, and `fire_pending()` asserts (Debug) that no node on the calling thread's chain is its own;
+another debounce's fire may call it.
 
 ## Stop sources
 
