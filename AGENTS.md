@@ -3,10 +3,9 @@
 ## Repo map
 
 ```
-task.hh            task<T>, scheduler concept and scheduler_ref, inline_scheduler,
-                   blocking_scheduler, frame pool,
-                   spawn/run/sync_wait, yield/schedule_on, budget, cancellation, event,
-                   cancel_token/source/callback, deadline, sleep_until/sleep_for, async_mutex (lock(token)), when_all.
+task.hh            umbrella over task/*.hh (scheduler, drivers, frame_pool, coroutine, cancel, timing,
+                   sync): task<T>, schedulers, spawn/run/sync_wait, cancellation, deadlines, event,
+                   async_mutex, when_all. docs/source-layout.md lists each piece and the split tests.
 task_timers.hh     group, periodic, debounce: housekeeping on the loop's wheel (needs task.hh only).
 process.hh         run_daemon, ProcessLock, locked_pid (POSIX; standard library only).
 lifecycle.hh       component, components, stop_bound/stop_timing, stop_source, stop_signals,
@@ -14,9 +13,9 @@ lifecycle.hh       component, components, stop_bound/stop_timing, stop_source, s
 task_asio.hh       asio_scheduler (demoted, start_timer, roots, close/destroy_roots), await_asio
                    with an optional token (target task::asio; fetches Asio 1.36.0).
 test/test.cc       Core tests; argv[1] sets the stress task count.
-test/sync_test.cc  Slice, event, deadline, async_mutex, lock(token) orders, destroyed waiters,
+test/sync_test*.cc  Slice, event, deadline, async_mutex, lock(token) orders, destroyed waiters,
                    event waiters at teardown, destructor asserts.
-test/asio_test.cc  asio_scheduler and await_asio: tokens, wrappers, the teardown phases, sizes.
+test/asio_test*.cc  asio_scheduler and await_asio: tokens, wrappers, the teardown phases, sizes.
 test/pool_off_test.cc  TASK_FRAME_POOL=0: every frame is an operator new.
 test/deadline_test.cc  Deadlines and timers on inline_scheduler's wheel: reentry, reference model,
                    far deadlines, post_call. test/wheel_mutant.py builds it on a mutant wheel.
