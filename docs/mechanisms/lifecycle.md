@@ -45,23 +45,28 @@ passes untouched, so entries are bounded by the pending keys and the keys fired 
 `throttle`. A throwing fire drops a throttled entry and hands a touched one to a new watcher.
 
 A stop cancels each sleep; the watcher erases a throttled entry and leaves a pending one for
-`fire_pending()`, which takes every pending entry under the mutex, waits for the fires in progress
-on the loop at the call to end, and fires the taken keys on its own thread. A key the loop is
+`fire_pending()`, which takes every pending entry under the mutex, holds them, waits for the fires in
+progress at the call to end (the loop's and earlier calls'), and fires the taken keys on its own thread. A key the loop is
 firing is no longer pending, so it fires once, and every touch before `fire_pending()` has fired
 when it returns: the third signal's flush.
 
-Each loop fire links a node from its watcher's frame into a list in start order, with a ticket
+Each fire in progress, the loop's (a node in its watcher's frame) or a `fire_pending()` call's,
+links a node into a list in start order, with a ticket
 from a counter, under the mutex; it unlinks the node when the fire ends and notifies the
 condition variable when the node was the oldest. `fire_pending()` notes the last ticket issued and
 waits until the list is empty or its oldest ticket is later, so a fire the loop starts after the
 call never holds it, even before a stop with the loop firing back to back.
 
-The contract, for a call before the stop: a touch after the take creates a new entry, so the loop
-may fire a taken key while `fire_pending()` fires it on its own thread; the planned callers run
-after the stop, where no new fire starts. A fire must not call `fire_pending()` of its own
-debounce: it would wait for its own fire. Each loop fire also pushes its node on a thread-local
-chain, and `fire_pending()` asserts (Debug) that no node on the calling thread's chain is its own;
-another debounce's fire may call it.
+A taken entry stays in the map as held: its generation becomes 0, so its watcher ends, and a
+holder count records the calls firing it. A touch meanwhile marks it pending but spawns no
+watcher; when the last holder's fires end, the hand-off that serves a throwing fire gives a
+pending entry a new watcher and erases any other. So no key fires on the loop while a call fires
+it, and two calls taking the same key fire it in ticket order. A fire must not call
+`fire_pending()` of its own debounce, the loop's or a call's: it would wait for its own fire. Each
+fire also pushes its node on a thread-local chain, and `fire_pending()` asserts (Debug) that no
+node on the calling thread's chain is its own; another debounce's fire may call it. Because a call
+waits for earlier calls' fires, never call it on the loop thread while another call's fire waits
+for the loop: the two would wait for each other.
 
 ## Stop sources
 

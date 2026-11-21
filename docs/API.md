@@ -114,8 +114,9 @@ explains how each piece works.
   quiet, never later than the force, with the OR of the touches' flags; with `throttle`, a key
   fires at most once per `throttle`. `stop` ends the waits without firing and `touch` then
   returns false; `fire_pending()` fires the pending keys on the calling thread, after the fires in
-  progress on the loop at the call end; called from a fire of the same debounce, it asserts
-  (Debug). Before a stop, a later touch may fire a taken key on the loop meanwhile.
+  progress at the call end, earlier calls' included; a touch of a taken key meanwhile fires on the
+  loop after it, never at once; called from a fire of the same debounce, it asserts (Debug). Never
+  call it on the loop thread while another call's fire waits for the loop: it waits for that fire.
 - `process.hh` (POSIX; standard library only): `run_daemon(detach, log, run, timeout)` forks and
   returns 0 at the child's `ready()` or throws its error or the timeout; `ProcessLock(path, system)`
   holds the pidfile lock (`acquired()`); `locked_pid(path)` names the holder.
