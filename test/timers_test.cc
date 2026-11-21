@@ -18,8 +18,11 @@
 //             once, and fire_pending() returns only after its fire ended
 //   debounce-overlap  before a stop, fire_pending() waits for the fires in progress at the call,
 //             not for one the loop starts after it
-//   debounce-reentry  fire_pending() inside the loop's fire of the same debounce aborts (Debug);
-//             another debounce's fire may call it
+//   debounce-held  a touch of a key fire_pending() is firing fires on the loop after that fire,
+//             never with it
+//   debounce-held-twice  two fire_pending() calls taking the same key fire it one after the other
+//   debounce-reentry  fire_pending() inside a fire of the same debounce, the loop's or its own,
+//             aborts (Debug); another debounce's fire may call it
 //   debounce-after-stop  a touch from another thread while fire_pending() fires returns false
 //   asio      sleep on asio_scheduler's wheel, cancelled from another thread
 // Every frame and cancel state is freed at the end (TASK_COUNT_FRAMES).
@@ -35,6 +38,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -425,6 +429,10 @@ struct manual_scheduler {
 		ready.push_back(h);
 	}
 	std::uint64_t now() const noexcept { return 0; }
+	std::size_t queued() {
+		std::lock_guard lock(m);
+		return ready.size();
+	}
 	std::coroutine_handle<> take() {
 		std::lock_guard lock(m);
 		CHECK(ready.size() == 1);
@@ -480,6 +488,99 @@ void debounce_overlap() {
 	CHECK(g.running() == 0 && d.pending_keys() == 0);
 }
 
+// Counts the fires running at once; the first is held until `release` (the deadline only turns a
+// wait that never ends into a failure).
+struct overlap_probe {
+	std::atomic<int> active{0}, most{0}, fires{0};
+	std::atomic<bool> in_first{false}, release{false};
+	std::atomic<unsigned> first_flags{0}, last_flags{0};
+	void operator()(const int&, unsigned f) {
+		const int now = ++active;
+		for (int m = most.load(); now > m && !most.compare_exchange_weak(m, now);) {}
+		if (fires++ == 0) {
+			first_flags.store(f);
+			in_first.store(true);
+			const auto until = std::chrono::steady_clock::now() + 10s;
+			while (!release.load() && std::chrono::steady_clock::now() < until) { std::this_thread::yield(); }
+		} else {
+			last_flags.store(f);
+		}
+		--active;
+	}
+};
+
+void debounce_held() {
+	manual_scheduler s;
+	task::group g(task::scheduler_ref::of(s));
+	task::cancel_source stop;
+	overlap_probe p;
+	task::debounce<int> d(g, {0ms, 0ms, 0ms, 0ms}, stop.token(), std::ref(p));
+	CHECK(d.touch(1, 1));
+	const auto watch = s.take();
+	std::size_t taken = 0;
+	std::thread other([&] { taken = d.fire_pending(); });  // no stop: the loop keeps firing
+	while (!p.in_first.load()) { std::this_thread::yield(); }
+	s.resume(watch);  // its key is taken: it ends without firing
+	CHECK(d.touch(1, 2));  // mid fire: pending again
+	const std::size_t early = s.queued();
+	if (early) { s.resume(s.take()); }  // a watch now fires key 1 on the loop, during the held fire
+	p.release.store(true);
+	other.join();
+	if (!early) { s.resume(s.take()); }  // the watch the fire's end handed the key to
+	std::printf("debounce-held: watches before the fire ended %zu, fires at once %d\n", early, p.most.load());
+	CHECK(early == 0 && p.most == 1 && taken == 1 && p.fires == 2 && d.fired() == 2);
+	CHECK(p.first_flags == 1 && p.last_flags == 2);
+	CHECK(g.running() == 0 && d.pending_keys() == 0 && s.queued() == 0);
+}
+
+std::atomic<bool> g_twice_waits{false};
+
+void debounce_held_twice() {
+	manual_scheduler s;
+	task::group g(task::scheduler_ref::of(s));
+	task::cancel_source stop;
+	overlap_probe p;
+	task::debounce<int> d(g, {0ms, 0ms, 0ms, 0ms}, stop.token(), std::ref(p));
+	CHECK(d.touch(1, 1));
+	const auto watch = s.take();
+	std::size_t a = 0, b = 0;
+	std::thread first([&] { a = d.fire_pending(); });
+	while (!p.in_first.load()) { std::this_thread::yield(); }
+	s.resume(watch);
+	CHECK(d.touch(1, 2));
+	std::thread second([&] {
+		task::detail::test_hooks::pending_waits = [] { g_twice_waits.store(true); };
+		b = d.fire_pending();  // takes key 1 again, mid the first call's fire of it
+		task::detail::test_hooks::pending_waits = nullptr;
+	});
+	while (!g_twice_waits.load() && p.fires.load() < 2) { std::this_thread::yield(); }
+	p.release.store(true);
+	first.join();
+	second.join();
+	std::printf("debounce-held-twice: second call waited %d, fires at once %d\n", int(g_twice_waits.load()), p.most.load());
+	CHECK(g_twice_waits.load() && p.most == 1 && a == 1 && b == 1 && p.fires == 2);
+	CHECK(p.first_flags == 1 && p.last_flags == 2);
+	CHECK(g.running() == 0 && d.pending_keys() == 0 && s.queued() == 0);
+}
+
+#if defined(HAVE_FORK) && !defined(NDEBUG)
+// Runs f in a child: true when it aborts (an assert), false when it exits or hangs (SIGALRM).
+template <typename F>
+bool aborts(const char* what, F f) {
+	const pid_t pid = fork();
+	if (pid == 0) {
+		std::freopen("/dev/null", "w", stderr);
+		alarm(10);
+		f();
+		_exit(0);
+	}
+	int status = 0;
+	CHECK(waitpid(pid, &status, 0) == pid);
+	std::printf("debounce-reentry %s: %s\n", what, WIFSIGNALED(status) ? strsignal(WTERMSIG(status)) : "exited");
+	return WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT;
+}
+#endif
+
 void debounce_reentry() {
 	task::inline_scheduler s;
 	task::group g(task::scheduler_ref::of(s));
@@ -497,10 +598,7 @@ void debounce_reentry() {
 	s.run();
 	CHECK(g.running() == 0 && inner.pending_keys() == 0 && outer.pending_keys() == 0);
 #if defined(HAVE_FORK) && !defined(NDEBUG)
-	const pid_t pid = fork();
-	if (pid == 0) {
-		std::freopen("/dev/null", "w", stderr);
-		alarm(10);  // a hang ends on SIGALRM, not SIGABRT
+	auto self_calling = [](bool on_loop) {  // its fire calls fire_pending(): it would wait for itself
 		task::inline_scheduler s2;
 		task::group g2(task::scheduler_ref::of(s2));
 		task::cancel_source stop2;
@@ -508,13 +606,16 @@ void debounce_reentry() {
 		task::debounce<int> d(g2, {10ms, 10ms, 100ms, 100ms}, stop2.token(), [&](const int&, unsigned) { self->fire_pending(); });
 		self = &d;
 		d.touch(1);
-		step_to(s2, 50 * ms);  // the fire calls fire_pending(): it would wait for itself
-		_exit(0);
-	}
-	int status = 0;
-	CHECK(waitpid(pid, &status, 0) == pid);
-	std::printf("debounce-reentry: %s\n", WIFSIGNALED(status) ? strsignal(WTERMSIG(status)) : "exited");
-	CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+		if (on_loop) {
+			step_to(s2, 50 * ms);
+		} else {
+			d.fire_pending();
+		}
+		stop2.request();  // reached only without the assert
+		s2.run();
+	};
+	CHECK(aborts("loop", [&] { self_calling(true); }));
+	CHECK(aborts("fire_pending", [&] { self_calling(false); }));
 #else
 	std::printf("debounce-reentry: the abort is Debug-only (NDEBUG or no fork)\n");
 #endif
@@ -594,6 +695,8 @@ int main(int argc, char** argv) {
 	if (only == "all" || only == "debounce-throw") { debounce_throw(); }
 	if (only == "all" || only == "debounce-mid-fire") { debounce_mid_fire(); }
 	if (only == "all" || only == "debounce-overlap") { debounce_overlap(); }
+	if (only == "all" || only == "debounce-held") { debounce_held(); }
+	if (only == "all" || only == "debounce-held-twice") { debounce_held_twice(); }
 	if (only == "all" || only == "debounce-reentry") { debounce_reentry(); }
 	if (only == "all" || only == "debounce-after-stop") { debounce_after_stop(); }
 	if (only == "all" || only == "asio") { asio_sleep(); }
