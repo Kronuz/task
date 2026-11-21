@@ -21,6 +21,10 @@
 //   debounce-held  a touch of a key fire_pending() is firing fires on the loop after that fire,
 //             never with it
 //   debounce-held-twice  two fire_pending() calls taking the same key fire it one after the other
+//   debounce-cross  two calls on two threads, each call's fire calling the other debounce's
+//             fire_pending(): both return (a deadlock fails after 10 s)
+//   debounce-lock  a call while an earlier call's fire waits for a mutex the caller holds, with
+//             no key in common: it returns (a deadlock fails after 10 s)
 //   debounce-reentry  fire_pending() inside a fire of the same debounce, the loop's or its own,
 //             aborts (Debug); another debounce's fire may call it
 //   debounce-after-stop  a touch from another thread while fire_pending() fires returns false
@@ -433,6 +437,18 @@ struct manual_scheduler {
 		std::lock_guard lock(m);
 		return ready.size();
 	}
+	void drain() {
+		for (;;) {
+			std::coroutine_handle<> h;
+			{
+				std::lock_guard lock(m);
+				if (ready.empty()) { return; }
+				h = ready.front();
+				ready.pop_front();
+			}
+			resume(h);
+		}
+	}
 	std::coroutine_handle<> take() {
 		std::lock_guard lock(m);
 		CHECK(ready.size() == 1);
@@ -561,6 +577,94 @@ void debounce_held_twice() {
 	CHECK(g_twice_waits.load() && p.most == 1 && a == 1 && b == 1 && p.fires == 2);
 	CHECK(p.first_flags == 1 && p.last_flags == 2);
 	CHECK(g.running() == 0 && d.pending_keys() == 0 && s.queued() == 0);
+}
+
+void spin(const std::atomic<bool>& b) {
+	while (!b.load()) { std::this_thread::yield(); }
+}
+
+// Runs f on its own thread; one that never returns fails the test after 10 s rather than hanging.
+template <typename F>
+void returns_within(const char* what, F f) {
+	std::atomic<bool> done{false};
+	std::thread t([&] {
+		f();
+		done.store(true);
+	});
+	const auto until = std::chrono::steady_clock::now() + 10s;
+	while (!done.load() && std::chrono::steady_clock::now() < until) { std::this_thread::sleep_for(1ms); }
+	if (!done.load()) {
+		std::printf("%s: DEADLOCK (no return in 10 s)\n", what);
+		std::fflush(stdout);
+		std::_Exit(1);
+	}
+	t.join();
+}
+
+void debounce_cross() {
+	returns_within("debounce-cross", [] {
+		manual_scheduler s;
+		task::group g(task::scheduler_ref::of(s));
+		task::cancel_source stop;
+		std::atomic<bool> in1{false}, in2{false};
+		std::atomic<std::size_t> nested{0};
+		task::debounce<int>* p1 = nullptr;
+		task::debounce<int>* p2 = nullptr;
+		task::debounce<int> d1(g, {0ms, 0ms, 0ms, 0ms}, stop.token(), [&](const int&, unsigned) {
+			in1.store(true);
+			spin(in2);
+			nested += p2->fire_pending();  // its key is held by d2's call: nothing to take
+		});
+		task::debounce<int> d2(g, {0ms, 0ms, 0ms, 0ms}, stop.token(), [&](const int&, unsigned) {
+			in2.store(true);
+			spin(in1);
+			nested += p1->fire_pending();
+		});
+		p1 = &d1;
+		p2 = &d2;
+		CHECK(d1.touch(1) && d2.touch(1));
+		std::size_t a = 0, b = 0;
+		std::thread t1([&] { a = d1.fire_pending(); });
+		std::thread t2([&] { b = d2.fire_pending(); });
+		t1.join();
+		t2.join();
+		CHECK(a == 1 && b == 1 && nested == 0);
+		stop.request();
+		s.drain();
+		CHECK(g.running() == 0 && d1.pending_keys() == 0 && d2.pending_keys() == 0);
+	});
+	std::printf("debounce-cross: both calls returned\n");
+}
+
+void debounce_lock() {
+	returns_within("debounce-lock", [] {
+		manual_scheduler s;
+		task::group g(task::scheduler_ref::of(s));
+		task::cancel_source stop;
+		std::mutex user;
+		std::atomic<bool> in_fire{false}, locked{false};
+		task::debounce<int> d(g, {0ms, 0ms, 0ms, 0ms}, stop.token(), [&](const int&, unsigned) {
+			in_fire.store(true);
+			spin(locked);
+			std::lock_guard l(user);  // what the later caller holds
+		});
+		CHECK(d.touch(1));
+		std::size_t a = 0, b = 1;
+		std::thread t1([&] { a = d.fire_pending(); });
+		spin(in_fire);
+		std::thread t2([&] {
+			std::lock_guard l(user);
+			locked.store(true);
+			b = d.fire_pending();  // nothing pending: no key in common with the earlier call
+		});
+		t1.join();
+		t2.join();
+		CHECK(a == 1 && b == 0);
+		stop.request();
+		s.drain();
+		CHECK(g.running() == 0 && d.pending_keys() == 0);
+	});
+	std::printf("debounce-lock: both calls returned\n");
 }
 
 #if defined(HAVE_FORK) && !defined(NDEBUG)
@@ -697,6 +801,8 @@ int main(int argc, char** argv) {
 	if (only == "all" || only == "debounce-overlap") { debounce_overlap(); }
 	if (only == "all" || only == "debounce-held") { debounce_held(); }
 	if (only == "all" || only == "debounce-held-twice") { debounce_held_twice(); }
+	if (only == "all" || only == "debounce-cross") { debounce_cross(); }
+	if (only == "all" || only == "debounce-lock") { debounce_lock(); }
 	if (only == "all" || only == "debounce-reentry") { debounce_reentry(); }
 	if (only == "all" || only == "debounce-after-stop") { debounce_after_stop(); }
 	if (only == "all" || only == "asio") { asio_sleep(); }

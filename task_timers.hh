@@ -249,36 +249,45 @@ public:
 	}
 
 	// Any thread but a fire's own (a Debug assert): takes every pending key and fires it on this
-	// thread, after the fires in progress at the call end (the loop's and other calls'), so every
-	// touch before it has fired when it returns. A touch of a taken key meanwhile fires on the loop
-	// once this call's fires end: no key fires twice at once. Every key fires; the first throw is
-	// rethrown after. Returns how many it fired.
+	// thread, after the loop's fires in progress at the call and an earlier call's fires of a key it
+	// took end, so every touch before it has fired, or is firing in an earlier call, when it returns.
+	// A touch of a taken key meanwhile fires after this call's fires, on the loop or in a later call:
+	// no key fires twice at once. Every key fires; the first throw is rethrown after. Returns how
+	// many it fired.
 	std::size_t fire_pending() {
 		assert(!fires_here() && "fire_pending() inside this debounce's fire waits for itself");
 		std::vector<std::pair<Key, unsigned>> taken;
-		firing mark;
+		std::vector<std::pair<const entry*, std::uint64_t>> turns;  // keys an earlier call still holds
 		{
 			std::unique_lock lock(m_);
 			taken.reserve(pending_);
+			turns.reserve(pending_);
 			for (const auto& [key, e] : keys_) {  // copies first: a throw leaves every entry as it was
 				if (e.pending) { taken.emplace_back(key, e.flags); }
 			}
 			for (auto& [key, e] : keys_) {
 				if (!e.pending) { continue; }
+				if (e.served != e.issued) { turns.emplace_back(&e, e.issued); }
 				e.gen = 0;  // held: its watch ends, a touch spawns none
 				e.target = 0;
 				e.flags = 0;
 				e.pending = false;
-				++e.held;
+				++e.issued;
 			}
 			pending_ = 0;
-			const std::uint64_t last = tickets_;  // later fires do not hold this call
-			begin_fire(mark);
-			if (oldest_ != &mark) {
+			const std::uint64_t last = tickets_;  // later loop fires do not hold this call
+			auto ready = [&] {
+				if (oldest_ && oldest_->ticket <= last) { return false; }
+				return std::all_of(turns.begin(), turns.end(), [](const auto& t) { return t.first->served >= t.second; });
+			};
+			if (!ready()) {
 				TASK_TEST_HOOK(pending_waits);
-				idle_.wait(lock, [&] { return oldest_->ticket > last; });
+				idle_.wait(lock, ready);
 			}
 		}
+		firing mark;  // on this thread's chain only, for the assert
+		mark.owner = this;
+		mark.outer = std::exchange(here_, &mark);
 		std::exception_ptr first;
 		for (const auto& [key, flags] : taken) {
 			fired_.fetch_add(1, std::memory_order_relaxed);
@@ -288,7 +297,7 @@ public:
 				if (!first) { first = std::current_exception(); }
 			}
 		}
-		end_fire(mark);
+		here_ = mark.outer;
 		for (const auto& [key, flags] : taken) { hand_off(key, 0); }
 		if (first) { std::rethrow_exception(first); }
 		return taken.size();
@@ -306,9 +315,9 @@ private:
 		std::uint64_t gen = 0;  // its watch's; 0 while held
 		unsigned flags = 0;
 		bool pending = false;  // else throttled until target, or held
-		unsigned held = 0;  // fire_pending() calls firing it
+		std::uint64_t issued = 0, served = 0;  // fire_pending() turns: held while they differ
 	};
-	// A fire in progress: the loop's, in its watch's frame, or a fire_pending() call's.
+	// A fire in progress: the loop's, in its watch's frame and the list, or a fire_pending() call's.
 	struct firing {
 		const debounce* owner = nullptr;
 		firing* outer = nullptr;  // this thread's enclosing fire
@@ -404,7 +413,10 @@ private:
 			std::lock_guard lock(m_);
 			auto it = keys_.find(key);
 			if (it == keys_.end() || it->second.gen != gen) { return; }
-			if (gen == 0 && --it->second.held > 0) { return; }
+			if (gen == 0 && ++it->second.served != it->second.issued) {
+				idle_.notify_all();  // the next call's turn
+				return;
+			}
 			if (!it->second.pending) {
 				keys_.erase(it);
 			} else if (!stop_.requested()) {

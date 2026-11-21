@@ -112,11 +112,12 @@ explains how each piece works.
   the next tick runs. `debounce<Key>(group, {quiet, busy, min_force, max_force, throttle}, stop,
   fire)`: `touch(key, flags)` from any thread, `fire(key, flags)` on the group's scheduler once
   quiet, never later than the force, with the OR of the touches' flags; with `throttle`, a key
-  fires at most once per `throttle`. `stop` ends the waits without firing and `touch` then
-  returns false; `fire_pending()` fires the pending keys on the calling thread, after the fires in
-  progress at the call end, earlier calls' included; a touch of a taken key meanwhile fires on the
-  loop after it, never at once; called from a fire of the same debounce, it asserts (Debug). Never
-  call it on the loop thread while another call's fire waits for the loop: it waits for that fire.
+  fires on the loop at most once per `throttle`. `stop` ends the waits without firing and `touch`
+  then returns false; `fire_pending()` fires the pending keys on the calling thread, after the
+  loop's fires in progress at the call and an earlier call's fires of a key it took end; a touch
+  of a taken key meanwhile fires after it, on the loop or in a later call, never at once; called
+  from a fire of the same debounce, it asserts (Debug), and another debounce's fire may call it.
+  It waits for no call that holds none of its keys.
 - `process.hh` (POSIX; standard library only): `run_daemon(detach, log, run, timeout)` forks and
   returns 0 at the child's `ready()` or throws its error or the timeout; `ProcessLock(path, system)`
   holds the pidfile lock (`acquired()`); `locked_pid(path)` names the holder.
