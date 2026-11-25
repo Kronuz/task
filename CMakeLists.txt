@@ -5,7 +5,7 @@ include(FetchContent)
 find_package(Threads REQUIRED)
 
 # The loops' timers: Kronuz/wheel, header-only, standard library only.
-FetchContent_Declare(wheel GIT_REPOSITORY https://github.com/Kronuz/wheel.git GIT_TAG bfd72bc13395e4a232701e752be97ccd236530fc)
+FetchContent_Declare(wheel GIT_REPOSITORY https://github.com/Kronuz/wheel.git GIT_TAG 075a40a562cd7613b0b84d70f625b9671ca93285)
 FetchContent_MakeAvailable(wheel)
 
 # Header-only: task.hh needs the standard library, threads (sync_wait blocks) and Kronuz/wheel.
